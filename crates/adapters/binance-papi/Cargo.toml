@@ -1,0 +1,64 @@
+[package]
+name = "nautilus-binance-papi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Binance Portfolio Margin execution adapter for the Nautilus trading engine"
+categories.workspace = true
+keywords.workspace = true
+documentation.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "nautilus_binance_papi"
+crate-type = ["rlib"]
+
+[features]
+default = ["high-precision"]
+extension-module = [
+  "nautilus-binance/extension-module",
+  "nautilus-common/extension-module",
+  "nautilus-core/extension-module",
+  "nautilus-execution/extension-module",
+  "nautilus-model/extension-module",
+  "python",
+  "pyo3/extension-module",
+]
+high-precision = [
+  "nautilus-binance/high-precision",
+  "nautilus-model/high-precision",
+]
+python = [
+  "nautilus-common/python",
+  "nautilus-core/python",
+  "nautilus-model/python",
+  "nautilus-system/python",
+  "pyo3",
+  "pyo3-stub-gen",
+]
+
+[dependencies]
+nautilus-binance = { workspace = true }
+nautilus-common = { workspace = true }
+nautilus-core = { workspace = true }
+nautilus-execution = { workspace = true }
+nautilus-model = { workspace = true }
+nautilus-system = { workspace = true, optional = true }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+
+pyo3 = { workspace = true, optional = true }
+pyo3-stub-gen = { workspace = true, optional = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }

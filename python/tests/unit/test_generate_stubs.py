@@ -1376,12 +1376,13 @@ pub const MY_CONSTANT: u64 = 42;
     assert consts[names.index("MY_CONSTANT")].python_type == "int"
 
 
-def test_collect_module_constants_uses_adapter_package_path(tmp_path: Path) -> None:
+@pytest.mark.parametrize("adapter", ["polymarket", "binance-papi"])
+def test_collect_module_constants_uses_adapter_package_path(tmp_path: Path, adapter: str) -> None:
     """
     Test collect module constants uses adapter package path.
     """
     # Arrange
-    mod_rs = tmp_path / "crates" / "adapters" / "polymarket" / "src" / "python" / "mod.rs"
+    mod_rs = tmp_path / "crates" / "adapters" / adapter / "src" / "python" / "mod.rs"
     mod_rs.parent.mkdir(parents=True)
     mod_rs.write_text(
         """
@@ -1394,7 +1395,7 @@ pub fn polymarket(m: &Bound<'_, PyModule>) -> PyResult<()> {
         encoding="utf-8",
     )
 
-    const_rs = tmp_path / "crates" / "adapters" / "polymarket" / "src" / "common" / "consts.rs"
+    const_rs = tmp_path / "crates" / "adapters" / adapter / "src" / "common" / "consts.rs"
     const_rs.parent.mkdir(parents=True, exist_ok=True)
     const_rs.write_text(
         """
@@ -1407,8 +1408,8 @@ pub const POLYMARKET: &str = "POLYMARKET";
     result = generate_stubs.collect_module_constants(tmp_path)
 
     # Assert
-    assert "adapters.polymarket" in result
-    assert "polymarket" not in result
+    assert f"adapters.{adapter.replace('-', '_')}" in result
+    assert adapter not in result
 
 
 def test_remove_stale_top_level_adapter_stubs_deletes_generated_aliases(tmp_path: Path) -> None:

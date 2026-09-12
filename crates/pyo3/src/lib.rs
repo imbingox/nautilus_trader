@@ -41,6 +41,7 @@
 //! - `hypersync`: Enables [`hypersync-client`](https://crates.io/crates/hypersync-client)
 //!   support for the blockchain adapter.
 //! - `mimalloc`: Sets [mimalloc](https://crates.io/crates/mimalloc) as Rust's global allocator.
+//! - `papi` (default): Enables the Binance Portfolio Margin construction skeleton and Python bindings.
 //! - `postgres`: Enables PostgreSQL (sqlx) back-ends in dependent crates.
 //! - `redis`: Enables Redis based infrastructure in dependent crates.
 //! - `tracing-bridge`: Enables the `tracing` subscriber bridge for log integration.
@@ -211,6 +212,14 @@ fn _libnautilus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let submodule = pyo3::wrap_pymodule!(nautilus_binance::python::binance);
     m.add_wrapped(submodule)?;
     sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+
+    #[cfg(feature = "papi")]
+    {
+        let n = "binance_papi";
+        let submodule = pyo3::wrap_pymodule!(nautilus_binance_papi::python::binance_papi);
+        m.add_wrapped(submodule)?;
+        sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+    }
 
     let n = "bitmex";
     let submodule = pyo3::wrap_pymodule!(nautilus_bitmex::python::bitmex);

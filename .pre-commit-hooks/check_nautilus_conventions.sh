@@ -366,6 +366,7 @@ architect_ax nautilus_architect_ax::python::architect_ax
 backtest nautilus_backtest::python::backtest
 betfair nautilus_betfair::python::betfair
 binance nautilus_binance::python::binance
+binance_papi nautilus_binance_papi::python::binance_papi
 bitmex nautilus_bitmex::python::bitmex
 blockchain nautilus_blockchain::python::blockchain
 bybit nautilus_bybit::python::bybit

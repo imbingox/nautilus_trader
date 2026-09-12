@@ -13,22 +13,24 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 """
-Open-source, production-grade, Rust-native engine for multi-asset, multi-venue trading.
+Binance Portfolio Margin construction skeleton (requires the ``papi`` build feature).
 
-NautilusTrader (https://nautilustrader.io) spans research, deterministic simulation, and live
-execution within a single event-driven architecture, with Python serving as the control plane
-for strategy logic, configuration, and orchestration.
+Use ``nautilus_trader.adapters.binance`` for public data and instrument loading.
+Starting or connecting the PAPI execution client raises an error.
 
 """
 
-import importlib.metadata as _metadata
+from nautilus_trader._libnautilus.binance_papi import BINANCE_PAPI
+from nautilus_trader._libnautilus.binance_papi import BINANCE_PAPI_CLIENT_ID
+from nautilus_trader._libnautilus.binance_papi import BINANCE_PAPI_VENUE
+from nautilus_trader._libnautilus.binance_papi import BinancePapiExecutionClientConfig
+from nautilus_trader._libnautilus.binance_papi import BinancePapiExecutionClientFactory
 
-from nautilus_trader._libnautilus import *  # noqa: F403 (undefined-local-with-import-star)
 
-
-# Derive the version from installed distribution metadata so it always matches the built
-# wheel. `_metadata` is underscore-aliased so the star import above cannot shadow it.
-try:
-    __version__ = _metadata.version("nautilus-trader-papi")
-except _metadata.PackageNotFoundError:  # pragma: no cover
-    __version__ = "unknown"
+__all__ = [
+    "BINANCE_PAPI",
+    "BINANCE_PAPI_CLIENT_ID",
+    "BINANCE_PAPI_VENUE",
+    "BinancePapiExecutionClientConfig",
+    "BinancePapiExecutionClientFactory",
+]

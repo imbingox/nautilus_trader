@@ -5543,6 +5543,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "nautilus-binance-papi"
+version = "0.64.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "nautilus-binance",
+ "nautilus-common",
+ "nautilus-core",
+ "nautilus-execution",
+ "nautilus-model",
+ "nautilus-system",
+ "pyo3",
+ "pyo3-stub-gen",
+ "rstest",
+ "serde",
+ "tokio",
+ "toml 1.1.5+spec-1.1.0",
+]
+
+[[package]]
 name = "nautilus-bitmex"
 version = "0.64.0"
 dependencies = [
@@ -6698,6 +6718,7 @@ dependencies = [
  "nautilus-backtest",
  "nautilus-betfair",
  "nautilus-binance",
+ "nautilus-binance-papi",
  "nautilus-bitmex",
  "nautilus-blockchain",
  "nautilus-bybit",

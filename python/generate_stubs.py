@@ -375,6 +375,10 @@ def generate_stubs() -> bool:
     if "nautilus-interactive-brokers/gateway" not in cargo_features:
         cargo_features.append("nautilus-interactive-brokers/gateway")
 
+    # Keep PAPI stubs available for builds with default features disabled
+    if "papi" not in cargo_features:
+        cargo_features.append("papi")
+
     cmd = stub_generator_command(cargo_features)
 
     result = run_command(cmd, cwd=crates_dir, stream_output=True, env=python_libdir_env())
@@ -3055,7 +3059,7 @@ def _derive_module_path(crate_dir: Path, workspace_root: Path) -> str:
 
     """
     relative = crate_dir.relative_to(workspace_root / "crates")
-    return ".".join(relative.parts)
+    return ".".join(part.replace("-", "_") for part in relative.parts)
 
 
 def _infer_constant_python_type(

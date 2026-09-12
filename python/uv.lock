@@ -547,7 +547,7 @@ wheels = [
 ]
 
 [[package]]
-name = "nautilus-trader"
+name = "nautilus-trader-papi"
 version = "2.0.0rc5"
 source = { editable = "." }
 

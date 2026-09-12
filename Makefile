@@ -270,7 +270,7 @@ CORE_CRATES := nautilus-analysis nautilus-backtest nautilus-common nautilus-core
     nautilus-system nautilus-testkit nautilus-trading
 
 # Crates tested in the workspace-compiled adapter lane
-ADAPTER_CRATES := nautilus-architect-ax nautilus-betfair nautilus-binance \
+ADAPTER_CRATES := nautilus-architect-ax nautilus-betfair nautilus-binance nautilus-binance-papi \
     nautilus-bitmex nautilus-blockchain nautilus-bybit nautilus-cli \
     nautilus-coinbase nautilus-databento nautilus-deribit nautilus-derive \
     nautilus-dydx nautilus-hyperliquid nautilus-interactive-brokers \
@@ -311,7 +311,7 @@ sync:  #-- Sync Python dependencies without building the package
 		exit 1; \
 	fi
 	$(info $(M) Syncing Python dependencies...)
-	$Q cd python && VIRTUAL_ENV= uv sync --all-groups --all-extras --no-install-package nautilus-trader $(UV_SYNC_FLAGS)
+	$Q cd python && VIRTUAL_ENV= uv sync --all-groups --all-extras --no-install-package nautilus-trader-papi $(UV_SYNC_FLAGS)
 
 .PHONY: install
 install: build  #-- Install the package in release mode

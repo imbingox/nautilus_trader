@@ -1,5 +1,5 @@
 [project]
-name = "nautilus-trader"
+name = "nautilus-trader-papi"
 version = "2.0.0rc5"
 description = "Production-grade Rust-native trading engine with deterministic event-driven architecture"
 authors = [{ name = "Nautech Systems", email = "info@nautechsystems.io" }]
@@ -72,7 +72,7 @@ exclude-newer-package = { ruff = "2026-09-04T00:00:00Z" }
 # unexpected loss of wheel publishing fails `uv lock` instead of silently
 # building from source. Kept in sync with python/uv.lock by
 # scripts/check-no-build-packages.sh (also a pre-commit hook). The local
-# nautilus-trader package is intentionally absent because it must be built
+# nautilus-trader-papi package is intentionally absent because it must be built
 # by maturin.
 no-build-package = [
   "accessible-pygments",

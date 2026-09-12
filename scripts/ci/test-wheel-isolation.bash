@@ -42,7 +42,7 @@ fi
 
 case "$1" in
   sync)
-    [[ "$*" == "sync --project $3 --python $case_root_native/source/python/.venv/bin/python --frozen --group test --no-install-package nautilus-trader" ]] || exit 82
+    [[ "$*" == "sync --project $3 --python $case_root_native/source/python/.venv/bin/python --frozen --group test --no-install-package nautilus-trader-papi" ]] || exit 82
     mkdir -p "$environment"
     ;;
   pip)
