@@ -13,18 +13,22 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Configuration for Binance Portfolio Margin node construction.
+//! Configuration for Portfolio Margin construction and scoped read-only reports.
 
-use std::any::Any;
+use std::{any::Any, collections::BTreeSet};
 
 use nautilus_common::factories::ClientConfig;
-use nautilus_model::identifiers::AccountId;
+use nautilus_model::identifiers::{AccountId, InstrumentId};
 use serde::{Deserialize, Serialize};
 
-/// Configuration for the Binance Portfolio Margin execution skeleton.
+use crate::read_only::BinancePapiReadOnlyConfig;
+
+/// Configuration for scoped Binance Portfolio Margin execution reports.
 ///
-/// Only node construction is supported. No credentials are read and no account state
-/// or trading capability is available at this stage.
+/// The default supports node construction without credentials. Supplying `read_only`
+/// and explicit instrument IDs enables the Rust execution client's report methods.
+/// Instruments must already exist in the node cache. LiveNode startup remains unavailable
+/// until the native account balance mapping is accepted; trading is unsupported.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
@@ -38,13 +42,56 @@ use serde::{Deserialize, Serialize};
 pub struct BinancePapiExecutionClientConfig {
     /// The account ID for this client.
     pub account_id: AccountId,
+    /// Explicit credentials and request bounds; no environment fallback is used.
+    pub read_only: Option<BinancePapiReadOnlyConfig>,
+    /// Complete report scope, including instruments with only historical activity.
+    pub instrument_ids: Vec<InstrumentId>,
 }
 
 impl Default for BinancePapiExecutionClientConfig {
     fn default() -> Self {
         Self {
             account_id: AccountId::from("BINANCE-PAPI-001"),
+            read_only: None,
+            instrument_ids: Vec::new(),
         }
+    }
+}
+
+impl BinancePapiExecutionClientConfig {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.account_id.get_issuer().as_str() == "BINANCE",
+            "PAPI account issuer must be BINANCE"
+        );
+
+        if let Some(read_only) = &self.read_only {
+            read_only.validate()?;
+            anyhow::ensure!(
+                read_only.account_id == self.account_id,
+                "PAPI execution and read-only account IDs must match"
+            );
+            anyhow::ensure!(
+                (1..=256).contains(&self.instrument_ids.len()),
+                "PAPI read-only reports require 1 to 256 explicit instrument IDs"
+            );
+        } else {
+            anyhow::ensure!(
+                self.instrument_ids.is_empty(),
+                "PAPI instrument scope requires read-only configuration"
+            );
+        }
+
+        let unique: BTreeSet<_> = self.instrument_ids.iter().collect();
+        anyhow::ensure!(
+            unique.len() == self.instrument_ids.len()
+                && self
+                    .instrument_ids
+                    .iter()
+                    .all(|id| id.venue.as_str() == "BINANCE"),
+            "PAPI instrument IDs must be unique and use the BINANCE venue"
+        );
+        Ok(())
     }
 }
 
@@ -80,6 +127,7 @@ mod tests {
             config.account_id.get_issuer(),
             *crate::consts::BINANCE_PAPI_VENUE
         );
+        config.validate().unwrap();
     }
 
     #[rstest]
@@ -88,5 +136,52 @@ mod tests {
     #[case("account_id = 'invalid'")]
     fn test_config_rejects_unsupported_or_invalid_fields(#[case] value: &str) {
         assert!(toml::from_str::<BinancePapiExecutionClientConfig>(value).is_err());
+    }
+
+    #[rstest]
+    fn test_read_only_config_round_trip_and_redaction() {
+        let config = BinancePapiExecutionClientConfig {
+            read_only: Some(crate::testing::config("http://127.0.0.1:12345")),
+            instrument_ids: vec![InstrumentId::from("BTCUSDT-PERP.BINANCE")],
+            ..Default::default()
+        };
+        let restored: BinancePapiExecutionClientConfig =
+            toml::Value::try_from(&config).unwrap().try_into().unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored.instrument_ids, config.instrument_ids);
+        let read_only = restored.read_only.as_ref().unwrap();
+        assert_eq!(read_only.account_id, config.account_id);
+        assert_eq!(read_only.api_key.expose_secret(), crate::testing::API_KEY);
+        assert_eq!(read_only.max_requests, 256);
+        let rendered = format!("{restored:?}");
+        assert!(!rendered.contains(crate::testing::API_KEY));
+        assert!(!rendered.contains(crate::testing::API_SECRET));
+        assert!(!rendered.contains("127.0.0.1"));
+    }
+
+    #[rstest]
+    #[case("missing_scope")]
+    #[case("duplicate_scope")]
+    #[case("wrong_venue")]
+    #[case("wrong_account")]
+    #[case("missing_credentials")]
+    fn test_read_only_config_rejects_ambiguous_scope(#[case] invalid: &str) {
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let mut config = BinancePapiExecutionClientConfig {
+            read_only: Some(crate::testing::config("http://127.0.0.1:12345")),
+            instrument_ids: vec![instrument_id],
+            ..Default::default()
+        };
+
+        match invalid {
+            "missing_scope" => config.instrument_ids.clear(),
+            "duplicate_scope" => config.instrument_ids.push(instrument_id),
+            "wrong_venue" => config.instrument_ids = vec![InstrumentId::from("BTCUSDT-PERP.OTHER")],
+            "wrong_account" => config.account_id = AccountId::from("BINANCE-PAPI-002"),
+            "missing_credentials" => config.read_only = None,
+            _ => unreachable!(),
+        }
+
+        assert!(config.validate().is_err());
     }
 }

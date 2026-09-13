@@ -32,7 +32,9 @@ use crate::{
     execution::BinancePapiExecutionClient,
 };
 
-/// Factory for Binance Portfolio Margin execution skeletons.
+/// Factory for scoped Binance Portfolio Margin read-only execution reports.
+///
+/// LiveNode startup remains unavailable until economic account projection is accepted.
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(
     feature = "python",
@@ -67,7 +69,8 @@ impl ExecutionClientFactory for BinancePapiExecutionClientFactory {
                 "Invalid config type for BinancePapiExecutionClientFactory: expected BinancePapiExecutionClientConfig"
             ))?;
 
-        // Identity metadata only; no PM account or position semantics are implemented
+        config.validate()?;
+
         let core = ExecutionClientCore::new(
             trader_id,
             ClientId::from(name),
@@ -78,7 +81,10 @@ impl ExecutionClientFactory for BinancePapiExecutionClientFactory {
             None,
             cache,
         );
-        Ok(Box::new(BinancePapiExecutionClient::new(core)))
+        Ok(Box::new(BinancePapiExecutionClient::new(
+            core,
+            config.clone(),
+        )))
     }
 
     fn name(&self) -> &'static str {
@@ -105,6 +111,7 @@ mod tests {
     fn test_factory_preserves_identity_and_shares_binance_venue() {
         let config = BinancePapiExecutionClientConfig {
             account_id: AccountId::from("BINANCE-PAPI-002"),
+            ..Default::default()
         };
         let client = BinancePapiExecutionClientFactory::new()
             .create(

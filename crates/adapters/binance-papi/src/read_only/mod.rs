@@ -1,0 +1,450 @@
+// -------------------------------------------------------------------------------------------------
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+//  https://nautechsystems.io
+//
+//  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+//  You may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+// -------------------------------------------------------------------------------------------------
+
+//! Signed PAPI reads with explicit instrument and history coverage.
+//!
+//! This query surface does not publish an account, connect a LiveNode, or enable trading.
+//! Historical reports remain incomplete until authenticated venue semantics are verified.
+
+mod config;
+
+#[cfg(test)]
+mod engine_tests;
+#[cfg(test)]
+mod tests;
+
+use std::{fmt::Debug, sync::Arc, time::Duration};
+
+use nautilus_common::live::dst::time::Instant;
+use nautilus_core::{UnixNanos, time::AtomicTime};
+use nautilus_model::{
+    identifiers::{AccountId, ClientOrderId, InstrumentId, VenueOrderId},
+    instruments::InstrumentAny,
+    reports::{ExecutionMassStatus, OrderStatusReport, PositionStatusReport},
+};
+use parking_lot::Mutex;
+use serde::Serialize;
+use tokio_util::sync::CancellationToken;
+
+pub use self::config::BinancePapiReadOnlyConfig;
+pub use crate::http::BinancePapiResponseMetadata;
+use crate::{
+    http::{PapiHttpClient, RequestBudget, RequestGate, error::PapiHttpError, query::PapiRequest},
+    observations::{AccountObservation, ObservationSlot, ObservationSource, ReceiptStatus},
+    reports::{InstrumentScope, ReportCollector, history::HistoryWindow},
+};
+
+/// A bounded set of current and historical observations, with explicit incompleteness.
+///
+/// `mass_status.reports_complete()` remains false in this development stage. Successful
+/// paging does not establish retention, order selection time, or complete algo discovery.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "nautilus_trader.adapters.binance_papi",
+        frozen,
+        from_py_object
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.binance_papi")
+)]
+pub struct BinancePapiReadOnlySnapshot {
+    /// Engine report representation, carrying the exact lower history bound.
+    pub mass_status: ExecutionMassStatus,
+    /// Fixed inclusive upper history bound used throughout the operation.
+    pub window_end: UnixNanos,
+    /// Explicit metadata scope scanned, including symbols with no current exposure.
+    pub instrument_ids: Vec<InstrumentId>,
+    /// Coverage limitations and failed historical sources.
+    pub issues: Vec<String>,
+    /// Receipt and quota metadata for each successful response.
+    pub responses: Vec<BinancePapiResponseMetadata>,
+}
+
+impl BinancePapiReadOnlySnapshot {
+    /// Serializes reports, exact history bounds, coverage issues, and response metadata.
+    ///
+    /// The output contains private account and execution data. It is evidence for review,
+    /// not a statement of historical completeness or economic account validity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the snapshot cannot be serialized.
+    pub fn to_json(&self) -> anyhow::Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+}
+
+/// A cloneable PAPI GET client; clones share cancellation and retained observations.
+///
+/// All instances share a process-wide IP gate: 3000 weight/minute, burst 40, four concurrent
+/// attempts. This reserves headroom below the venue's documented 6000 weight/minute allowance;
+/// other processes require separate coordination. A throttle or ban latches the gate closed.
+/// SDK 69.2.1 discards error headers, so automatic throttle recovery is unavailable.
+#[derive(Clone)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "nautilus_trader.adapters.binance_papi",
+        frozen,
+        from_py_object
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.binance_papi")
+)]
+pub struct BinancePapiReadOnlyClient {
+    inner: Arc<ReadOnlyInner>,
+}
+
+impl BinancePapiReadOnlyClient {
+    /// Constructs a read-only client from explicit credentials and preloaded UM instruments.
+    ///
+    /// Obtain public metadata from the existing Binance adapter without PAPI credentials.
+    /// Construction performs no network requests and reads no environment variables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid credentials, resource bounds, origin, account or instrument scope.
+    pub fn new(
+        config: &BinancePapiReadOnlyConfig,
+        instruments: Vec<InstrumentAny>,
+    ) -> anyhow::Result<Self> {
+        Self::from_parts(
+            config,
+            instruments,
+            PapiHttpClient::shared_gate(),
+            Arc::new(AtomicTime::default()),
+        )
+    }
+
+    pub(crate) fn from_parts(
+        config: &BinancePapiReadOnlyConfig,
+        instruments: Vec<InstrumentAny>,
+        gate: Arc<RequestGate>,
+        clock: Arc<AtomicTime>,
+    ) -> anyhow::Result<Self> {
+        let scope = InstrumentScope::new(instruments)?;
+        let http = PapiHttpClient::new(config, gate, Arc::clone(&clock))?;
+        let sources = observation_sources();
+        let observations = sources
+            .into_iter()
+            .map(|source| StoredObservation {
+                slot: ObservationSlot::new(config.account_id, source),
+                metadata: None,
+            })
+            .collect();
+
+        Ok(Self {
+            inner: Arc::new(ReadOnlyInner {
+                http,
+                scope,
+                clock,
+                account_id: config.account_id,
+                operation_timeout: config.operation_timeout,
+                max_requests: config.max_requests,
+                max_rows: config.max_rows,
+                cancel: CancellationToken::new(),
+                refresh: tokio::sync::Mutex::new(()),
+                observations: Mutex::new(AccountObservations {
+                    generation: 0,
+                    sources: observations,
+                }),
+            }),
+        })
+    }
+
+    /// Cancels outstanding and future operations on this client and all its clones.
+    pub fn cancel(&self) {
+        self.inner.cancel.cancel();
+    }
+
+    /// Returns whether the shared IP gate has been latched closed by a throttle or ban.
+    #[must_use]
+    pub fn is_throttled(&self) -> bool {
+        self.inner.http.is_throttled()
+    }
+
+    /// Refreshes balance, PM summary, and UM V1/V2 observations without projecting balances.
+    ///
+    /// Successful sources are retained independently; a failure preserves that source's prior
+    /// response and marks it failed. All four sources share one generation and operation budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for cancellation, quota/deadline exhaustion, any failed request, or invalid JSON.
+    pub async fn refresh_account_observations(&self) -> anyhow::Result<()> {
+        let budget = self.budget()?;
+
+        let _guard = tokio::select! {
+            biased;
+            () = self.inner.cancel.cancelled() => return Err(PapiHttpError::Canceled.into()),
+            result = tokio::time::timeout(
+                Duration::from_millis(budget.remaining_ms()?),
+                self.inner.refresh.lock(),
+            ) => result.map_err(|_| PapiHttpError::Budget)?,
+        };
+        let generation = {
+            let mut observations = self.inner.observations.lock();
+            observations.generation = observations
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("PAPI observation generation overflow"))?;
+
+            // An interrupted refresh must not leave unread sources looking successful
+            for stored in &mut observations.sources {
+                stored.slot.record_failure();
+            }
+
+            observations.generation
+        };
+        let mut failures = Vec::new();
+
+        for (index, source) in observation_sources().into_iter().enumerate() {
+            let response = self
+                .inner
+                .http
+                .get(
+                    &PapiRequest::Observation(source.clone()),
+                    &budget,
+                    &self.inner.cancel,
+                )
+                .await;
+            let mut observations = self.inner.observations.lock();
+            let stored = &mut observations.sources[index];
+
+            let result = match response {
+                Ok(response) => {
+                    let result = stored.slot.record_response(
+                        response.body.get(),
+                        generation,
+                        response.metadata.ts_received,
+                        response.received_at,
+                    );
+
+                    if result.is_ok() {
+                        stored.metadata = Some(response.metadata);
+                    }
+
+                    result
+                }
+                Err(e) => {
+                    stored.slot.record_failure();
+                    Err(e.into())
+                }
+            };
+
+            if let Err(e) = result {
+                failures.push(format!("{}: {e}", source.endpoint()));
+            }
+        }
+
+        anyhow::ensure!(
+            failures.is_empty(),
+            "PAPI observation refresh failed: {}",
+            failures.join("; ")
+        );
+        budget.check()?;
+        Ok(())
+    }
+
+    /// Serializes retained observations and their current receipt status as exact JSON evidence.
+    ///
+    /// The output contains private account data. Recent receipt does not establish economic
+    /// validity or authorize order admission. Original JSON and numeric strings are preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the observations cannot be serialized.
+    pub fn account_observations_json(&self, max_receipt_age: Duration) -> anyhow::Result<String> {
+        let observations = self.inner.observations.lock();
+        let now = Instant::now();
+        let views: Vec<_> = observation_sources()
+            .iter()
+            .zip(&observations.sources)
+            .map(|(source, stored)| ObservationView {
+                endpoint: source.endpoint(),
+                receipt_status: stored.slot.receipt_status(now, max_receipt_age),
+                observation: stored.slot.last_response(),
+                metadata: stored.metadata.as_ref(),
+            })
+            .collect();
+        Ok(serde_json::to_string(&views)?)
+    }
+
+    /// Queries the account's order quota as unprojected JSON evidence.
+    ///
+    /// This GET consumes one IP-weight unit; it does not reserve or consume an order slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the signed read fails or exhausts its budget.
+    pub async fn query_order_rate_limit(&self) -> anyhow::Result<String> {
+        let budget = self.budget()?;
+        let response = self
+            .inner
+            .http
+            .get(&PapiRequest::OrderRateLimit, &budget, &self.inner.cancel)
+            .await?;
+        let body = response.body.get().to_owned();
+        budget.check()?;
+        Ok(body)
+    }
+
+    /// Collects a fixed inclusive history window plus current orders and explicit positions.
+    ///
+    /// Fills are linked to ordinary orders or their algo parent using targeted child reads.
+    /// Commission, active-source, position, schema and identity failures fail the request.
+    /// Other failed historical legs are listed in the returned incomplete snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid bounds, unsupported mode, unrepresentable reports, contradictory
+    /// identities, unresolved fill linkage, or failure of a required read.
+    pub async fn generate_mass_status(
+        &self,
+        start: UnixNanos,
+        end: UnixNanos,
+    ) -> anyhow::Result<BinancePapiReadOnlySnapshot> {
+        let window = HistoryWindow::new(start, end)?;
+        anyhow::ensure!(
+            end <= self.inner.clock.get_time_ns(),
+            "PAPI history end is in the future"
+        );
+        self.collector()?.mass_status(window).await
+    }
+
+    /// Returns all current open or in-flight orders within the requested metadata scope.
+    ///
+    /// Active orders are included regardless of their age. A partial result is never returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for failed current reads, unsupported mode, unresolved algo children or invalid reports.
+    pub async fn generate_open_order_status_reports(
+        &self,
+        instrument_id: Option<InstrumentId>,
+    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        self.collector()?.open_orders(instrument_id).await
+    }
+
+    /// Returns explicit one-way position rows for every requested instrument.
+    ///
+    /// An omitted row is an error. Sparse account V2 data is never used to infer a flat position.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported mode, missing coverage, failed reads or inexact quantities.
+    pub async fn generate_position_status_reports(
+        &self,
+        instrument_id: Option<InstrumentId>,
+    ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        self.collector()?.positions(instrument_id).await
+    }
+
+    /// Resolves one order by its encoded venue identity or ordinary client order ID.
+    ///
+    /// Venue IDs use `PAPI:O:SYMBOL:ID` for ordinary orders and `PAPI:A:SYMBOL:ID` for algos.
+    /// A venue not-found response remains an error while endpoint retention/absence is unverified.
+    /// This method therefore cannot return absence evidence to the execution engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid scope/identity, an unresolved order, or any failed read or conversion.
+    pub async fn generate_order_status_report(
+        &self,
+        instrument_id: InstrumentId,
+        venue_order_id: Option<VenueOrderId>,
+        client_order_id: Option<ClientOrderId>,
+    ) -> anyhow::Result<OrderStatusReport> {
+        self.collector()?
+            .single_order(instrument_id, venue_order_id, client_order_id)
+            .await
+    }
+
+    fn budget(&self) -> anyhow::Result<RequestBudget> {
+        Ok(RequestBudget::new(
+            self.inner.operation_timeout,
+            self.inner.max_requests,
+            self.inner.max_rows,
+        )?)
+    }
+
+    fn collector(&self) -> anyhow::Result<ReportCollector<'_>> {
+        Ok(ReportCollector {
+            http: &self.inner.http,
+            scope: &self.inner.scope,
+            account_id: self.inner.account_id,
+            clock: &self.inner.clock,
+            cancel: &self.inner.cancel,
+            budget: self.budget()?,
+            responses: Vec::new(),
+        })
+    }
+}
+
+impl Debug for BinancePapiReadOnlyClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(BinancePapiReadOnlyClient))
+            .field("account_id", &self.inner.account_id)
+            .field("instrument_count", &self.inner.scope.instrument_ids().len())
+            .field("throttled", &self.is_throttled())
+            .finish_non_exhaustive()
+    }
+}
+
+struct ReadOnlyInner {
+    http: PapiHttpClient,
+    scope: InstrumentScope,
+    clock: Arc<AtomicTime>,
+    account_id: AccountId,
+    operation_timeout: Duration,
+    max_requests: u32,
+    max_rows: usize,
+    cancel: CancellationToken,
+    refresh: tokio::sync::Mutex<()>,
+    observations: Mutex<AccountObservations>,
+}
+
+struct AccountObservations {
+    generation: u64,
+    sources: Vec<StoredObservation>,
+}
+
+struct StoredObservation {
+    slot: ObservationSlot,
+    metadata: Option<BinancePapiResponseMetadata>,
+}
+
+#[derive(Serialize)]
+struct ObservationView<'a> {
+    endpoint: &'static str,
+    receipt_status: ReceiptStatus,
+    observation: Option<&'a AccountObservation>,
+    metadata: Option<&'a BinancePapiResponseMetadata>,
+}
+
+fn observation_sources() -> [ObservationSource; 4] {
+    [
+        ObservationSource::Balance { asset: None },
+        ObservationSource::Account,
+        ObservationSource::UmAccountV1,
+        ObservationSource::UmAccountV2,
+    ]
+}

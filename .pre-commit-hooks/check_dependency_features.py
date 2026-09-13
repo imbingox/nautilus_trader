@@ -64,6 +64,7 @@ NETWORK_PACKAGE_FEATURES = {
     "nautilus-architect-ax": frozenset({"transport-sockudo"}),
     "nautilus-betfair": frozenset(),
     "nautilus-binance": frozenset({"transport-sockudo"}),
+    "nautilus-binance-papi": frozenset(),
     "nautilus-bitmex": frozenset({"transport-sockudo"}),
     "nautilus-blockchain": frozenset({"transport-sockudo"}),
     "nautilus-bybit": frozenset({"transport-sockudo"}),
@@ -97,6 +98,7 @@ TEST_SUPPORT_DEV_PACKAGES = frozenset(
     {
         "nautilus-analysis",
         "nautilus-backtest",
+        "nautilus-binance-papi",
         "nautilus-blockchain",
         "nautilus-common",
         "nautilus-data",

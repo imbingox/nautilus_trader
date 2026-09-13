@@ -13,18 +13,21 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Construction-only PAPI client, rejecting all unimplemented execution operations.
+//! Scoped read-only execution reports, with live account startup gated on economic mapping.
+
+use std::cell::RefCell;
 
 use async_trait::async_trait;
 use nautilus_common::{
     clients::ExecutionClient,
+    enums::LogLevel,
     messages::execution::{
         BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
         GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
         ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
     },
 };
-use nautilus_core::{Params, UnixNanos};
+use nautilus_core::{Params, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_execution::client::core::ExecutionClientCore;
 use nautilus_model::{
     accounts::AccountAny,
@@ -35,14 +38,80 @@ use nautilus_model::{
     types::{AccountBalance, MarginBalance, Money, Price, Quantity},
 };
 
+use crate::{config::BinancePapiExecutionClientConfig, read_only::BinancePapiReadOnlyClient};
+
 #[derive(Debug)]
 pub(crate) struct BinancePapiExecutionClient {
     core: ExecutionClientCore,
+    config: BinancePapiExecutionClientConfig,
+    reader: RefCell<Option<BinancePapiReadOnlyClient>>,
 }
 
 impl BinancePapiExecutionClient {
-    pub(crate) const fn new(core: ExecutionClientCore) -> Self {
-        Self { core }
+    pub(crate) const fn new(
+        core: ExecutionClientCore,
+        config: BinancePapiExecutionClientConfig,
+    ) -> Self {
+        Self {
+            core,
+            config,
+            reader: RefCell::new(None),
+        }
+    }
+
+    fn reader(&self) -> anyhow::Result<BinancePapiReadOnlyClient> {
+        anyhow::ensure!(
+            self.core.is_started(),
+            "PAPI read-only client is not started"
+        );
+
+        if let Some(client) = self.reader.borrow().as_ref() {
+            return Ok(client.clone());
+        }
+
+        let config = self
+            .config
+            .read_only
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PAPI read-only configuration is required"))?;
+        let instruments = {
+            let cache = self.core.cache();
+            self.config
+                .instrument_ids
+                .iter()
+                .map(|id| {
+                    cache
+                        .instrument(id)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("PAPI instrument is not preloaded: {id}"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?
+        };
+        let client = BinancePapiReadOnlyClient::new(config, instruments)?;
+        *self.reader.borrow_mut() = Some(client.clone());
+        Ok(client)
+    }
+
+    fn cancel_reads(&mut self) {
+        if let Some(client) = self.reader.get_mut().take() {
+            client.cancel();
+        }
+
+        self.core.set_disconnected();
+        self.core.set_stopped();
+    }
+
+    fn log_report_receipt(count: usize, report_type: &str, level: LogLevel) {
+        let message = format!("Received {count} PAPI {report_type} reports");
+
+        match level {
+            LogLevel::Off => {}
+            LogLevel::Trace => log::trace!("{message}"),
+            LogLevel::Debug => log::debug!("{message}"),
+            LogLevel::Info => log::info!("{message}"),
+            LogLevel::Warning => log::warn!("{message}"),
+            LogLevel::Error => log::error!("{message}"),
+        }
     }
 }
 
@@ -72,8 +141,8 @@ impl ExecutionClient for BinancePapiExecutionClient {
         None
     }
 
-    fn provides_bulk_position_coverage(&self, _instrument_id: InstrumentId) -> bool {
-        false
+    fn provides_bulk_position_coverage(&self, instrument_id: InstrumentId) -> bool {
+        self.config.instrument_ids.contains(&instrument_id)
     }
 
     fn generate_account_state(
@@ -98,20 +167,40 @@ impl ExecutionClient for BinancePapiExecutionClient {
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
-        anyhow::bail!("Binance PAPI execution is not implemented; node construction only")
+        self.config.validate()?;
+        anyhow::ensure!(
+            self.config.read_only.is_some(),
+            "PAPI read-only configuration is required"
+        );
+        self.core.set_started();
+        Ok(())
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
-        anyhow::bail!("Binance PAPI connection is not implemented; node construction only")
+        self.cancel_reads();
+        anyhow::bail!(
+            "PAPI LiveNode startup requires an accepted economic account balance mapping; \
+             use BinancePapiReadOnlyClient for account evidence and reports"
+        )
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
-        // No resources can be acquired because start and connect always fail
+        self.cancel_reads();
         Ok(())
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        // Already disconnected; teardown remains idempotent after a failed start
+        self.cancel_reads();
+        Ok(())
+    }
+
+    fn reset(&mut self) -> anyhow::Result<()> {
+        self.cancel_reads();
+        Ok(())
+    }
+
+    fn dispose(&mut self) -> anyhow::Result<()> {
+        self.cancel_reads();
         Ok(())
     }
 
@@ -153,37 +242,72 @@ impl ExecutionClient for BinancePapiExecutionClient {
 
     async fn generate_order_status_report(
         &self,
-        _cmd: &GenerateOrderStatusReport,
+        cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
-        anyhow::bail!("Binance PAPI generate_order_status_report is not implemented")
+        let instrument_id = cmd
+            .instrument_id
+            .ok_or_else(|| anyhow::anyhow!("PAPI single-order queries require an instrument ID"))?;
+        self.reader()?
+            .generate_order_status_report(instrument_id, cmd.venue_order_id, cmd.client_order_id)
+            .await
+            .map(Some)
     }
 
     async fn generate_order_status_reports(
         &self,
-        _cmd: &GenerateOrderStatusReports,
+        cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        anyhow::bail!("Binance PAPI generate_order_status_reports is not implemented")
+        anyhow::ensure!(
+            cmd.open_only,
+            "PAPI history is incomplete; use the bounded mass status report"
+        );
+        let reports = self
+            .reader()?
+            .generate_open_order_status_reports(cmd.instrument_id)
+            .await?;
+        Self::log_report_receipt(reports.len(), "order status", cmd.log_receipt_level);
+        Ok(reports)
     }
 
     async fn generate_fill_reports(
         &self,
         _cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        anyhow::bail!("Binance PAPI generate_fill_reports is not implemented")
+        anyhow::bail!("PAPI fill history is incomplete; use the bounded mass status report")
     }
 
     async fn generate_position_status_reports(
         &self,
-        _cmd: &GeneratePositionStatusReports,
+        cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        anyhow::bail!("Binance PAPI generate_position_status_reports is not implemented")
+        anyhow::ensure!(
+            cmd.start.is_none() && cmd.end.is_none(),
+            "PAPI position reports support current observations only"
+        );
+        let reports = self
+            .reader()?
+            .generate_position_status_reports(cmd.instrument_id)
+            .await?;
+        Self::log_report_receipt(reports.len(), "position status", cmd.log_receipt_level);
+        Ok(reports)
     }
 
     async fn generate_mass_status(
         &self,
-        _lookback_mins: Option<u64>,
+        lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
-        anyhow::bail!("Binance PAPI generate_mass_status is not implemented")
+        let end = get_atomic_clock_realtime().get_time_ns();
+        let start = lookback_mins
+            .unwrap_or(60)
+            .checked_mul(60_000_000_000)
+            .and_then(|lookback| end.as_u64().checked_sub(lookback))
+            .ok_or_else(|| anyhow::anyhow!("PAPI history lookback exceeds timestamp bounds"))?;
+        let mut snapshot = self
+            .reader()?
+            .generate_mass_status(start.into(), end)
+            .await?;
+        snapshot.mass_status.client_id = self.core.client_id;
+        Ok(Some(snapshot.mass_status))
     }
 }
 
@@ -207,10 +331,13 @@ mod tests {
         orders::{MarketOrder, OrderAny, OrderList},
     };
     use rstest::rstest;
+    use serde_json::json;
 
     use super::*;
     use crate::{
-        config::BinancePapiExecutionClientConfig, factories::BinancePapiExecutionClientFactory,
+        config::BinancePapiExecutionClientConfig,
+        factories::BinancePapiExecutionClientFactory,
+        testing::{self, MockServer, Reply, TRADE_TIME, ms},
     };
 
     fn client() -> Box<dyn ExecutionClient> {
@@ -224,6 +351,226 @@ mod tests {
             .unwrap()
     }
 
+    fn configured_client(
+        server: &MockServer,
+        symbols: &[&str],
+        preload: bool,
+    ) -> Box<dyn ExecutionClient> {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+
+        if preload {
+            for symbol in symbols {
+                cache
+                    .borrow_mut()
+                    .add_instrument(testing::instrument(symbol))
+                    .unwrap();
+            }
+        }
+
+        let config = BinancePapiExecutionClientConfig {
+            read_only: Some(testing::config(&server.url)),
+            instrument_ids: symbols
+                .iter()
+                .map(|symbol| InstrumentId::from(format!("{symbol}-PERP.BINANCE")))
+                .collect(),
+            ..Default::default()
+        };
+        BinancePapiExecutionClientFactory::new()
+            .create(
+                TraderId::from("TRADER-001"),
+                "PAPI-READ-007",
+                &config,
+                cache.into(),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_factory_reports_preserve_scope_identity_and_incompleteness() {
+        let server = MockServer::new(|request| match request.path.as_str() {
+            "/papi/v1/um/openOrders" if request.params["symbol"] == "BTCUSDT" => {
+                Reply::json(&json!([testing::order()]))
+            }
+            "/papi/v1/um/order" => Reply::json(&testing::order()),
+            _ => testing::quiet(request),
+        })
+        .await;
+        let mut client = configured_client(&server, &["BTCUSDT", "ETHUSDT"], true);
+        assert!(server.requests().is_empty());
+        client.start().unwrap();
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let orders = GenerateOrderStatusReportsBuilder::default()
+            .ts_init(UnixNanos::default())
+            .instrument_id(Some(instrument_id))
+            .open_only(true)
+            .start(Some(ms(TRADE_TIME + 1)))
+            .build()
+            .unwrap();
+        let positions = GeneratePositionStatusReportsBuilder::default()
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
+        let single = GenerateOrderStatusReportBuilder::default()
+            .ts_init(UnixNanos::default())
+            .instrument_id(Some(instrument_id))
+            .client_order_id(Some(ClientOrderId::from("abc")))
+            .build()
+            .unwrap();
+        let open = client.generate_order_status_reports(&orders).await.unwrap();
+        let position_reports = client
+            .generate_position_status_reports(&positions)
+            .await
+            .unwrap();
+        let order = client
+            .generate_order_status_report(&single)
+            .await
+            .unwrap()
+            .unwrap();
+        let mass = client
+            .generate_mass_status(Some(60))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].instrument_id, instrument_id);
+        assert_eq!(open[0].venue_order_id, order.venue_order_id);
+        assert_eq!(position_reports.len(), 2);
+        assert_eq!(mass.client_id, ClientId::from("PAPI-READ-007"));
+        assert_eq!(mass.account_id, client.account_id());
+        assert!(mass.lookback_start().is_some());
+        assert!(!mass.reports_complete());
+        assert!(client.provides_bulk_position_coverage(instrument_id));
+        assert!(
+            !client.provides_bulk_position_coverage(InstrumentId::from("BNBUSDT-PERP.BINANCE"))
+        );
+        assert!(!client.is_connected());
+        assert!(client.get_account().is_none());
+        assert!(server.requests().iter().all(|request| {
+            request.method == "GET" && request.params.contains_key("signature")
+        }));
+        client.stop().unwrap();
+        assert!(client.generate_order_status_reports(&orders).await.is_err());
+        client.start().unwrap();
+        assert_eq!(
+            client
+                .generate_order_status_reports(&orders)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_factory_failed_queries_remain_errors_and_never_publish_an_account() {
+        let server = MockServer::new(|request| match request.path.as_str() {
+            "/papi/v1/um/openOrders" | "/papi/v1/um/positionRisk" => Reply::raw(401, "{}"),
+            _ => testing::quiet(request),
+        })
+        .await;
+        let mut client = configured_client(&server, &["BTCUSDT"], true);
+        client.start().unwrap();
+        let orders = GenerateOrderStatusReportsBuilder::default()
+            .ts_init(UnixNanos::default())
+            .open_only(true)
+            .build()
+            .unwrap();
+        let positions = GeneratePositionStatusReportsBuilder::default()
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
+        let single = GenerateOrderStatusReportBuilder::default()
+            .ts_init(UnixNanos::default())
+            .instrument_id(Some(InstrumentId::from("BTCUSDT-PERP.BINANCE")))
+            .client_order_id(Some(ClientOrderId::from("abc")))
+            .build()
+            .unwrap();
+
+        assert!(client.generate_order_status_reports(&orders).await.is_err());
+        assert!(
+            client
+                .generate_position_status_reports(&positions)
+                .await
+                .is_err()
+        );
+        assert!(client.generate_order_status_report(&single).await.is_err());
+        assert!(client.generate_mass_status(None).await.is_err());
+        assert!(client.get_account().is_none());
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test]
+    async fn test_factory_rejects_unverifiable_filters_and_history_vectors_before_requests() {
+        let server = MockServer::new(testing::quiet).await;
+        let mut client = configured_client(&server, &["BTCUSDT"], true);
+        client.start().unwrap();
+        let history = GenerateOrderStatusReportsBuilder::default()
+            .ts_init(UnixNanos::default())
+            .open_only(false)
+            .build()
+            .unwrap();
+        let fills = GenerateFillReportsBuilder::default()
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
+        let positions = GeneratePositionStatusReportsBuilder::default()
+            .ts_init(UnixNanos::default())
+            .start(Some(ms(TRADE_TIME)))
+            .build()
+            .unwrap();
+
+        assert!(
+            client
+                .generate_order_status_reports(&history)
+                .await
+                .is_err()
+        );
+        assert!(client.generate_fill_reports(fills).await.is_err());
+        assert!(
+            client
+                .generate_position_status_reports(&positions)
+                .await
+                .is_err()
+        );
+        assert!(client.generate_mass_status(Some(u64::MAX)).await.is_err());
+        assert!(server.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_missing_metadata_and_unaccepted_account_mapping_prevent_bootstrap() {
+        let server = MockServer::new(testing::quiet).await;
+        let mut client = configured_client(&server, &["BTCUSDT"], false);
+        client.start().unwrap();
+        let positions = GeneratePositionStatusReportsBuilder::default()
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
+        let error = client
+            .generate_position_status_reports(&positions)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not preloaded"));
+        assert!(
+            client
+                .connect()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("economic account")
+        );
+        assert!(!client.is_connected());
+        assert!(client.get_account().is_none());
+        assert!(server.requests().is_empty());
+
+        for _ in 0..2 {
+            client.stop().unwrap();
+            client.disconnect().await.unwrap();
+            client.reset().unwrap();
+            client.dispose().unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn test_start_and_connect_fail_without_account_or_connection() {
         let mut client = client();
@@ -232,7 +579,7 @@ mod tests {
                 .start()
                 .unwrap_err()
                 .to_string()
-                .contains("not implemented")
+                .contains("read-only configuration is required")
         );
         assert!(
             client
@@ -240,7 +587,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string()
-                .contains("not implemented")
+                .contains("economic account balance mapping")
         );
         assert!(!client.is_connected());
         assert!(client.get_account().is_none());

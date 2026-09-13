@@ -1908,6 +1908,12 @@ ADAPTER_CONFIG_FIELD_READBACK_REPLACEMENTS = {
     ): "has_password",
 }
 ADAPTER_CONFIG_CONSTRUCTOR_ONLY_FIELDS = {
+    # Private PAPI gateway origins remain opaque alongside the credentials
+    (
+        "nautilus_trader.adapters.binance_papi",
+        "BinancePapiReadOnlyConfig",
+        "base_url",
+    ),
     (
         "nautilus_trader.adapters.interactive_brokers",
         "InteractiveBrokersDataClientConfig",
@@ -2811,6 +2817,15 @@ def test_adapter_config_secret_values_are_not_exposed(tmp_path: Path) -> None:
         "wallet_address": "0x2222222222222222222222222222222222222222",
         "weth_address": "0x3333333333333333333333333333333333333333",
     }
+
+    # PAPI validates the account issuer and alphanumeric HMAC credentials
+    constructor_overrides = {
+        ("nautilus_trader.adapters.binance_papi", "BinancePapiReadOnlyConfig"): {
+            "account_id": AccountId("BINANCE-PAPI-001"),
+            "api_key": "RawSecretPapiKey",
+            "api_secret": "RawSecretPapiSecret",
+        },
+    }
     failures = []
 
     for stub_file in sorted((STUB_ROOT / "adapters").glob("*/__init__.pyi")):
@@ -2833,6 +2848,7 @@ def test_adapter_config_secret_values_are_not_exposed(tmp_path: Path) -> None:
                 continue
 
             kwargs = {name: f"raw-secret-{name}" for name in secret_parameters}
+            kwargs.update(constructor_overrides.get((module_name, stub_class.name), {}))
             for parameter in signature.parameters.values():
                 if parameter.default is not inspect.Parameter.empty or parameter.name in kwargs:
                     continue

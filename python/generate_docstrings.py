@@ -65,6 +65,7 @@ ANNOTATED_ADAPTER_CRATES = [
     "architect_ax",
     "betfair",
     "binance",
+    "binance-papi",
     "bitmex",
     "blockchain",
     "bybit",

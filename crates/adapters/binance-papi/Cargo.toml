@@ -40,6 +40,7 @@ python = [
   "nautilus-model/python",
   "nautilus-system/python",
   "pyo3",
+  "pyo3-async-runtimes",
   "pyo3-stub-gen",
 ]
 
@@ -49,16 +50,35 @@ nautilus-common = { workspace = true }
 nautilus-core = { workspace = true }
 nautilus-execution = { workspace = true }
 nautilus-model = { workspace = true }
+nautilus-network = { workspace = true }
 nautilus-system = { workspace = true, optional = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+binance-sdk = { workspace = true }
+http = { workspace = true }
+log = { workspace = true }
+parking_lot = { workspace = true }
+reqwest = { workspace = true }
+rust_decimal = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+url = { workspace = true }
 
 pyo3 = { workspace = true, optional = true }
+pyo3-async-runtimes = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
+nautilus-live = { workspace = true }
+nautilus-model = { workspace = true, features = ["test-support"] }
+
+aws-lc-rs = { workspace = true }
+axum = { workspace = true }
 rstest = { workspace = true }
-tokio = { workspace = true }
+rust_decimal_macros = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }

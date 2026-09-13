@@ -1,0 +1,26 @@
+{
+  "assets": [
+    {
+      "asset": "USDT",
+      "crossWalletBalance": "-10.00000000",
+      "crossUnPnl": "-0.12345678",
+      "initialMargin": "10.12345678",
+      "maintMargin": "5.12345678",
+      "positionInitialMargin": "8.12345678",
+      "openOrderInitialMargin": "2.00000000",
+      "updateTime": 1617939110373
+    }
+  ],
+  "positions": [
+    {
+      "symbol": "BTCUSDT",
+      "positionSide": "BOTH",
+      "positionAmt": "-2.00000000",
+      "initialMargin": "10.12345678",
+      "maintMargin": "5.12345678",
+      "unrealizedProfit": "-0.12345678",
+      "notional": "-100000.12345678",
+      "updateTime": 0
+    }
+  ]
+}

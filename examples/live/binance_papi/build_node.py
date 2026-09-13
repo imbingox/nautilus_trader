@@ -13,10 +13,11 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 """
-Construct a node with Binance public USD-M data and the PAPI execution skeleton.
+Construct a node with Binance public USD-M data and the PAPI execution factory.
 
 Requires a wheel built with the ``papi`` feature. This example does not run the
-node or contact Binance. PAPI startup, trading and reconciliation are not implemented.
+node or contact Binance. PAPI LiveNode startup awaits an accepted account balance mapping.
+Use read_only_acceptance.py to collect scoped account evidence and execution reports.
 
 """
 
@@ -56,4 +57,4 @@ def build_node() -> LiveNode:
 
 if __name__ == "__main__":
     node = build_node()
-    print(f"Constructed node for {node.trader_id}; PAPI execution is not implemented")
+    print(f"Constructed node for {node.trader_id}; PAPI account bootstrap remains unavailable")

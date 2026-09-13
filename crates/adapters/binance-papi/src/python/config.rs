@@ -13,28 +13,55 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Python configuration bindings for the PAPI skeleton.
+//! Python configuration bindings for scoped read-only PAPI execution reports.
 
-use nautilus_model::identifiers::AccountId;
+use nautilus_core::python::to_pyvalue_err;
+use nautilus_model::identifiers::{AccountId, InstrumentId};
 use pyo3::prelude::*;
 
-use crate::config::BinancePapiExecutionClientConfig;
+use crate::{config::BinancePapiExecutionClientConfig, read_only::BinancePapiReadOnlyConfig};
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl BinancePapiExecutionClientConfig {
-    /// Configuration for node construction only; PAPI execution is not implemented.
+    /// Configuration for scoped Binance Portfolio Margin execution reports.
+    ///
+    /// The default supports node construction without credentials. Supplying `read_only`
+    /// and explicit instrument IDs enables the Rust execution client's report methods.
+    /// Instruments must already exist in the node cache. LiveNode startup remains unavailable
+    /// until the native account balance mapping is accepted; trading is unsupported.
     #[new]
-    #[pyo3(signature = (account_id = None))]
-    fn py_new(account_id: Option<AccountId>) -> Self {
-        Self {
-            account_id: account_id.unwrap_or_else(|| Self::default().account_id),
-        }
+    #[pyo3(signature = (account_id=None, read_only=None, instrument_ids=None))]
+    fn py_new(
+        account_id: Option<AccountId>,
+        read_only: Option<BinancePapiReadOnlyConfig>,
+        instrument_ids: Option<Vec<InstrumentId>>,
+    ) -> PyResult<Self> {
+        let defaults = Self::default();
+        let config = Self {
+            account_id: account_id
+                .or_else(|| read_only.as_ref().map(|config| config.account_id))
+                .unwrap_or(defaults.account_id),
+            read_only,
+            instrument_ids: instrument_ids.unwrap_or(defaults.instrument_ids),
+        };
+        config.validate().map_err(to_pyvalue_err)?;
+        Ok(config)
     }
 
     #[getter]
     fn account_id(&self) -> AccountId {
         self.account_id
+    }
+
+    #[getter]
+    fn read_only(&self) -> Option<BinancePapiReadOnlyConfig> {
+        self.read_only.clone()
+    }
+
+    #[getter]
+    fn instrument_ids(&self) -> Vec<InstrumentId> {
+        self.instrument_ids.clone()
     }
 
     fn __repr__(&self) -> String {

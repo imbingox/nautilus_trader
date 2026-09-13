@@ -20,6 +20,7 @@ This script needs only the installed wheel and the Python standard library.
 
 """
 
+import asyncio
 import importlib
 import importlib.metadata
 import sys
@@ -38,6 +39,12 @@ from nautilus_trader.adapters.binance import BinanceProductType
 from nautilus_trader.common import Environment
 from nautilus_trader.live import LiveNode
 from nautilus_trader.model import AccountId
+from nautilus_trader.model import CryptoPerpetual
+from nautilus_trader.model import Currency
+from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import Price
+from nautilus_trader.model import Quantity
+from nautilus_trader.model import Symbol
 from nautilus_trader.model import TraderId
 
 
@@ -106,6 +113,43 @@ def main() -> None:
     assert config.account_id == account_id
     assert isinstance(config.account_id, AccountId)
     assert papi.BinancePapiExecutionClientFactory().name() == "BINANCE_PAPI"
+    for name in (
+        "BinancePapiReadOnlyClient",
+        "BinancePapiReadOnlyConfig",
+        "BinancePapiReadOnlySnapshot",
+    ):
+        assert getattr(papi, name) is getattr(_libnautilus.binance_papi, name)
+    instrument = CryptoPerpetual(
+        instrument_id=InstrumentId.from_str("BTCUSDT-PERP.BINANCE"),
+        raw_symbol=Symbol("BTCUSDT"),
+        base_currency=Currency.from_str("BTC"),
+        quote_currency=Currency.from_str("USDT"),
+        settlement_currency=Currency.from_str("USDT"),
+        is_inverse=False,
+        price_precision=1,
+        size_precision=3,
+        price_increment=Price.from_str("0.1"),
+        size_increment=Quantity.from_str("0.001"),
+        ts_event=0,
+        ts_init=0,
+    )
+    read_only = papi.BinancePapiReadOnlyConfig(
+        account_id=account_id,
+        api_key="OfflinePapiKey",
+        api_secret="OfflinePapiSecret",
+        base_url="http://127.0.0.1:9",
+    )
+    reader = papi.BinancePapiReadOnlyClient(read_only, [instrument])
+    reader.cancel()
+
+    async def canceled_query() -> None:
+        await reader.query_order_rate_limit()
+
+    check = unittest.TestCase()
+    with check.assertRaisesRegex(RuntimeError, "canceled"):  # noqa: PT027 - stdlib-only check
+        asyncio.run(canceled_query())
+    assert "OfflinePapiSecret" not in repr(read_only)
+    assert not hasattr(read_only, "api_secret")
     node = (
         LiveNode.builder("PAPI-WHEEL", trader_id, Environment.LIVE)
         .add_data_client(None, BinanceDataClientFactory(), data_config)
@@ -118,7 +162,14 @@ def main() -> None:
     unsupported = (
         LiveNode.builder("PAPI-UNSUPPORTED", trader_id, Environment.LIVE)
         .with_timeout_connection(1)
-        .add_exec_client(None, papi.BinancePapiExecutionClientFactory(), config)
+        .add_exec_client(
+            None,
+            papi.BinancePapiExecutionClientFactory(),
+            papi.BinancePapiExecutionClientConfig(
+                read_only=read_only,
+                instrument_ids=[instrument.id],
+            ),
+        )
         .build()
     )
     # The engine logs the client's PAPI error and the node fails its readiness check

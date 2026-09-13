@@ -13,10 +13,11 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 """
-Binance Portfolio Margin construction skeleton (requires the ``papi`` build feature).
+Binance Portfolio Margin read-only queries (requires the ``papi`` build feature).
 
 Use ``nautilus_trader.adapters.binance`` for public data and instrument loading.
-Starting or connecting the PAPI execution client raises an error.
+``BinancePapiReadOnlyClient`` returns exact account evidence and execution reports.
+LiveNode startup still requires an accepted economic account projection.
 
 """
 
@@ -25,6 +26,9 @@ from nautilus_trader._libnautilus.binance_papi import BINANCE_PAPI_CLIENT_ID
 from nautilus_trader._libnautilus.binance_papi import BINANCE_PAPI_VENUE
 from nautilus_trader._libnautilus.binance_papi import BinancePapiExecutionClientConfig
 from nautilus_trader._libnautilus.binance_papi import BinancePapiExecutionClientFactory
+from nautilus_trader._libnautilus.binance_papi import BinancePapiReadOnlyClient
+from nautilus_trader._libnautilus.binance_papi import BinancePapiReadOnlyConfig
+from nautilus_trader._libnautilus.binance_papi import BinancePapiReadOnlySnapshot
 
 
 __all__ = [
@@ -33,4 +37,7 @@ __all__ = [
     "BINANCE_PAPI_VENUE",
     "BinancePapiExecutionClientConfig",
     "BinancePapiExecutionClientFactory",
+    "BinancePapiReadOnlyClient",
+    "BinancePapiReadOnlyConfig",
+    "BinancePapiReadOnlySnapshot",
 ]

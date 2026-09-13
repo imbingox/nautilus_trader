@@ -13,17 +13,23 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Binance Portfolio Margin adapter construction and Python registration.
+//! Binance Portfolio Margin account evidence and bounded Rust/Python read-only queries.
 //!
-//! This skeleton supports node construction only. Starting, connecting, trading and
-//! reconciliation return errors until PAPI execution is implemented. Public market
-//! data and instruments are provided by the existing `nautilus-binance` adapter.
+//! The [`read_only`] client uses the pinned Binance SDK for signed account observations,
+//! order/fill/position reports, and explicitly incomplete historical snapshots. It accepts
+//! explicit credentials and preloaded one-way UM instrument scope. No economic account
+//! projection or trading is available.
+//!
+//! Factory-created Rust execution clients support scoped reports after explicit read-only
+//! configuration and instrument preloading. LiveNode startup remains unavailable until the
+//! native account balance mapping is accepted. Public market data and instruments use the
+//! existing `nautilus-binance` adapter.
 //!
 //! # Feature Flags
 //!
 //! - `extension-module`: Builds Python bindings into an extension module.
 //! - `high-precision` (default): Uses 128-bit fixed-point domain values.
-//! - `python`: Enables Python configuration and factory bindings.
+//! - `python`: Enables Python read-only query, configuration, and factory bindings.
 
 #![deny(unsafe_code)]
 #![deny(missing_debug_implementations)]
@@ -33,8 +39,15 @@
 pub mod config;
 pub mod consts;
 pub mod factories;
+pub mod read_only;
 
 #[cfg(feature = "python")]
 pub mod python;
 
 mod execution;
+mod http;
+mod observations;
+mod reports;
+
+#[cfg(test)]
+mod testing;

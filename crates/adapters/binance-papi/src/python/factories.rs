@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Python factory bindings for the PAPI skeleton.
+//! Python factory bindings for scoped read-only PAPI execution reports.
 
 use pyo3::prelude::*;
 
@@ -22,7 +22,9 @@ use crate::{consts::BINANCE_PAPI, factories::BinancePapiExecutionClientFactory};
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl BinancePapiExecutionClientFactory {
-    /// Factory for PAPI execution skeletons; running a client is not supported.
+    /// Factory for scoped Binance Portfolio Margin read-only execution reports.
+    ///
+    /// LiveNode startup remains unavailable until economic account projection is accepted.
     #[new]
     fn py_new() -> Self {
         Self::new()

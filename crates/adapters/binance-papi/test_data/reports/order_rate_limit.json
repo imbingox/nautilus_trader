@@ -1,0 +1,8 @@
+[
+  {
+    "rateLimitType": "ORDERS",
+    "interval": "MINUTE",
+    "intervalNum": 1,
+    "limit": 1200
+  }
+]

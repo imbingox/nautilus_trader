@@ -17,6 +17,10 @@
 
 mod config;
 mod factories;
+mod read_only;
+
+#[cfg(test)]
+mod tests;
 
 use nautilus_common::factories::{ClientConfig, ExecutionClientFactory};
 use nautilus_core::python::to_pyruntime_err;
@@ -27,6 +31,9 @@ use crate::{
     config::BinancePapiExecutionClientConfig,
     consts::{BINANCE_PAPI, BINANCE_PAPI_CLIENT_ID, BINANCE_PAPI_VENUE},
     factories::BinancePapiExecutionClientFactory,
+    read_only::{
+        BinancePapiReadOnlyClient, BinancePapiReadOnlyConfig, BinancePapiReadOnlySnapshot,
+    },
 };
 
 #[expect(clippy::needless_pass_by_value)]
@@ -58,6 +65,9 @@ pub fn binance_papi(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(stringify!(BINANCE_PAPI_VENUE), *BINANCE_PAPI_VENUE)?;
     m.add_class::<BinancePapiExecutionClientConfig>()?;
     m.add_class::<BinancePapiExecutionClientFactory>()?;
+    m.add_class::<BinancePapiReadOnlyConfig>()?;
+    m.add_class::<BinancePapiReadOnlyClient>()?;
+    m.add_class::<BinancePapiReadOnlySnapshot>()?;
 
     let registry = get_global_pyo3_registry();
     registry
