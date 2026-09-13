@@ -7,6 +7,11 @@ This is a design investigation, not an implementation or a statement of live com
 Evidence consists of local source inspection and Binance's official documentation. No credentials,
 authenticated requests, trading operations, or new adapter runtime tests were used for this report.
 
+The later [UM account V2 verification](V2_VERIFICATION.md) records a separate authenticated
+GET comparison on 2026-09-13, its observed coverage and field differences, and its remaining limits.
+The [account mapping verification](ACCOUNT_VERIFICATION.md) adds balance, liability, fee, funding,
+and failure-handling evidence, along with the decision to calculate unrealized PnL from live prices.
+
 ## Findings and implementation gates
 
 Offline REST wrapping, exact parsing, and reconciliation work can proceed independently of the
@@ -75,7 +80,7 @@ established by the response examples.
 | `crossMarginAsset`, `crossMarginBorrowed`, `crossMarginInterest`, `negativeBalance` | Preserve separately. Verify which deductions are already included before computing a net balance.          |
 | `crossMarginFree`, `crossMarginLocked`                                              | Preserve as cross-Margin observations. Do not equate them with PM-wide available/reserved amounts.         |
 | `umWalletBalance`, `cmWalletBalance`, UM `crossWalletBalance`                       | Preserve as component observations; do not create a second authoritative wallet.                           |
-| `umUnrealizedPNL`, `cmUnrealizedPNL`, UM `crossUnPnl`                               | Keep distinct from wallet totals and locally calculated PnL.                                               |
+| `umUnrealizedPNL`, `cmUnrealizedPNL`, UM `crossUnPnl`                               | Optional diagnostics, separate from wallet totals and locally calculated PnL.                              |
 | `/account`: `accountEquity`, `actualEquity`                                         | USD valuations with different collateral-rate treatment. Keep distinct from native wallet assets.          |
 | `accountInitialMargin`, `accountMaintMargin`                                        | Candidate account-wide USD margin observation, subject to unit and precision validation.                   |
 | `totalAvailableBalance`, `virtualMaxWithdrawAmount`                                 | Preserve separately. Withdrawal capacity is not a substitute for order purchasing power.                   |
@@ -98,6 +103,12 @@ The intended account projection uses `base_currency=None`. An account-wide USD `
 conditional on verified units and exact representation; additional PM observations remain separate.
 Selection of this direction does not establish the native `total/free/locked` formulas or choose
 where the PM order check runs.
+
+REST synchronizes wallet balances, position quantities, and `entryPrice`; live prices and
+synchronized positions drive local unrealized PnL. REST unrealized PnL is optional diagnostic data,
+not a required account-projection or startup field. Sequential responses need not agree on PnL.
+Venue PM equity, margins, and capacity remain separate risk inputs with their own validation and
+freshness requirements. See the follow-up verification for the tested scope and remaining gaps.
 
 Stage exact observations privately and build order/fill/position reports independently of the
 unresolved balance projection. Reuse `AccountState.info` when an account event has a valid typed
@@ -131,7 +142,7 @@ economic formula is verified.
 | -------------------- | ------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
 | Native assets        | PM account plus asset; total wallet observation and wallet components.                            | One authoritative asset entry; preserve components without adding them again.                            |
 | Native liabilities   | Same account and asset; borrowed principal, interest, and negative-balance observations.          | Keep each source amount separate; verify overlap and inclusion in wallet totals before deduction.        |
-| Unrealized PnL       | Account, asset, and product; UM/CM reported unrealized amounts.                                   | Keep separate from the wallet and from local position PnL calculations.                                  |
+| Unrealized PnL       | Account, asset, and product; optional UM/CM reported unrealized amounts.                          | Diagnostics only; local PnL uses live prices and synchronized positions.                                 |
 | PM risk observations | Account-level equity, margin, available capacity, withdrawal capacity, ratio, and status.         | Retain each field's verified unit; an unknown unit or unavailable amount cannot drive order admission.   |
 | Observation metadata | Endpoint/version, requested scope, source update times, receipt times, and collection generation. | Track success and coverage per source; collection generation does not imply an atomic exchange snapshot. |
 
@@ -184,15 +195,15 @@ the required evidence; it does not enable trading or claim that either admission
 Before accepting the option A projection, record the outcome of these cases separately from REST
 connectivity and pagination validation:
 
-| Case                                                   | Required evidence                                                                                                            |
-| ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
-| BTC collateral with no USDT wallet balance             | Asset queries retain BTC and actual USDT amounts; PM capacity is separate and no USDT balance is invented.                   |
-| Borrowed funds, accrued interest, and negative balance | Identify which source totals already include each liability; prove that the projection subtracts each obligation once.       |
-| Existing UM gains or losses                            | Show wallet totals and both reported/local PnL separately; demonstrate that portfolio equity does not add a component twice. |
-| Changes only in account risk status or capacity        | Preserve the update even when native balances and margin amounts are unchanged.                                              |
-| USD valuation with more digits than `Money` supports   | Preserve the exact observation; reject a lossy typed projection until an explicit representation policy is accepted.         |
-| Timeout, partial response, or stale snapshot           | Retain previous observations for inspection without treating them as current admission authority.                            |
-| Multiple strategies and settlement currencies          | Later admission tests prove a single shared capacity budget and correct reservation lifecycle.                               |
+| Case                                                   | Required evidence                                                                                                         |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| BTC collateral with no USDT wallet balance             | Asset queries retain BTC and actual USDT amounts; PM capacity is separate and no USDT balance is invented.                |
+| Borrowed funds, accrued interest, and negative balance | Identify which source totals already include each liability; prove that the projection subtracts each obligation once.    |
+| Existing UM gains or losses                            | Wallet totals exclude unrealized PnL; live prices drive local PnL. REST PnL is diagnostic, not a required equality check. |
+| Changes only in account risk status or capacity        | Preserve the update even when native balances and margin amounts are unchanged.                                           |
+| USD valuation with more digits than `Money` supports   | Preserve the exact observation; reject a lossy typed projection until an explicit representation policy is accepted.      |
+| Timeout, partial response, or stale snapshot           | Retain previous observations for inspection without treating them as current admission authority.                         |
+| Multiple strategies and settlement currencies          | Later admission tests prove a single shared capacity budget and correct reservation lifecycle.                            |
 
 If a valid native `free/locked` mapping cannot be established, keep that projection unavailable and
 document the minimum model capability required. Choosing option A is not permission to substitute
