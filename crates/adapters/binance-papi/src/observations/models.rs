@@ -150,6 +150,18 @@ pub(crate) struct UmPosition {
     pub(crate) update_time: Field<VenueTime>,
 }
 
+/// Minimal identity and exposure fields for current product-scope validation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ScopeRow {
+    #[serde(default)]
+    pub(crate) symbol: Field<String>,
+    #[serde(default)]
+    pub(crate) pair: Field<String>,
+    #[serde(default)]
+    pub(crate) position_amt: Field<Amount>,
+}
+
 /// Requires an object without Serde's positional-array representation for structs.
 #[derive(Debug)]
 pub(crate) struct JsonObject<T>(pub(crate) T);

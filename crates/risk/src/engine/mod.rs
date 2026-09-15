@@ -1026,6 +1026,10 @@ impl RiskEngine {
             return false;
         }
 
+        if !self.validate_modify_order_native_capital(&order, &instrument, command) {
+            return false;
+        }
+
         let state_reason = match self.trading_state {
             TradingState::Halted => Some(OrderDeniedReason::TradingHalted.to_string()),
             TradingState::Reducing => Some(
@@ -1040,6 +1044,49 @@ impl RiskEngine {
 
         if let Some(reason) = state_reason {
             self.reject_modify_order(&order, &reason);
+            return false;
+        }
+
+        true
+    }
+
+    fn validate_modify_order_native_capital(
+        &self,
+        order: &OrderAny,
+        instrument: &InstrumentAny,
+        command: &ModifyOrder,
+    ) -> bool {
+        let totals_only_account_id = {
+            let cache = self.cache.borrow();
+            let account = if let Some(account_id) = order.account_id() {
+                cache.account(&account_id)
+            } else {
+                cache.account_for_venue(&instrument.id().venue)
+            };
+
+            match account.as_deref() {
+                Some(AccountAny::Margin(margin)) if !margin.total_only_balances.is_empty() => {
+                    Some(margin.id)
+                }
+                _ => None,
+            }
+        };
+
+        if let Some(account_id) = totals_only_account_id
+            && (command
+                .quantity
+                .is_some_and(|quantity| quantity > order.quantity())
+                || command
+                    .price
+                    .is_some_and(|price| Some(price) != order.price())
+                || command
+                    .trigger_price
+                    .is_some_and(|price| Some(price) != order.trigger_price()))
+        {
+            self.reject_modify_order(
+                order,
+                &OrderDeniedReason::NativeCapitalCheckUnavailable { account_id }.to_string(),
+            );
             return false;
         }
 
@@ -1253,6 +1300,24 @@ impl RiskEngine {
 
         if self.config.debug {
             log::debug!("Free balance: {free:?}");
+        }
+
+        // Quantity-based netting cannot prove reduction for every execution/OMS route
+        if let AccountAny::Margin(margin) = &account
+            && !margin.total_only_balances.is_empty()
+        {
+            for order in orders {
+                if !order.is_reduce_only() && !full_position_exit {
+                    self.deny_order(
+                        order,
+                        &OrderDeniedReason::NativeCapitalCheckUnavailable {
+                            account_id: margin.id,
+                        }
+                        .to_string(),
+                    );
+                    return false;
+                }
+            }
         }
 
         // Get net LONG position quantity for this instrument (for position-reducing sell checks),

@@ -17,8 +17,8 @@ Collect private PAPI GET evidence for manual account and endpoint acceptance.
 
 Read explicit credentials from a local JSON file. Write a new file with owner-only
 permissions, containing unsanitized account data. The collection never places orders or
-changes account settings. Successful collection does not accept a balance mapping, prove
-complete history, or enable LiveNode startup.
+changes account settings. Successful collection does not by itself accept a projected
+account, prove complete history, or enable LiveNode startup.
 
 """
 
@@ -130,16 +130,16 @@ async def collect_evidence(
     """
     if not 0 <= start <= end <= time_ns():
         raise ValueError("Invalid inclusive history window")
-    if not 0 <= max_receipt_age_ms <= 2**64 - 1:
-        raise ValueError("Receipt age must fit an unsigned 64-bit millisecond value")
+    if not 1 <= max_receipt_age_ms <= 2**64 - 1:
+        raise ValueError("Receipt age must be a positive unsigned 64-bit millisecond value")
 
     client = BinancePapiReadOnlyClient(config, instruments)
     operations = dict.fromkeys(
-        ("account_observations", "order_rate_limit", "mass_status"),
+        ("account_observations", "account_snapshot", "order_rate_limit", "mass_status"),
         "not_attempted",
     )
     evidence: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "account_id": str(config.account_id),
         "instrument_ids": [str(instrument.id) for instrument in instruments],
         "instruments_json": json.dumps([i.to_dict() for i in instruments], default=_decimal_json),
@@ -150,7 +150,7 @@ async def collect_evidence(
         "operations": operations,
         "acceptance": {
             "venue_semantics": "requires_manual_review",
-            "native_balance_mapping": "unavailable",
+            "native_balance_mapping": "requires_snapshot_review",
             "history_completeness": "unverified",
             "live_node_startup": "unavailable",
         },
@@ -170,9 +170,22 @@ async def collect_evidence(
         operations[operation] = "failed"
         evidence["error"] = str(e)
     finally:
-        client.cancel()
-        evidence["account_observations_json"] = client.account_observations_json(max_receipt_age_ms)
-        evidence["collection_finished_ns"] = time_ns()
+        try:
+            try:
+                evidence["account_snapshot_json"] = client.account_snapshot_json(
+                    max_receipt_age_ms,
+                    max_receipt_age_ms,
+                )
+                operations["account_snapshot"] = "succeeded"
+            except RuntimeError as e:
+                operations["account_snapshot"] = "failed"
+                evidence["account_snapshot_error"] = str(e)
+            evidence["account_observations_json"] = client.account_observations_json(
+                max_receipt_age_ms,
+            )
+        finally:
+            client.cancel()
+            evidence["collection_finished_ns"] = time_ns()
     return evidence
 
 

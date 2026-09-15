@@ -75,6 +75,13 @@ impl PapiRequest {
             | Self::Positions { .. }
             | Self::History { .. }
             | Self::Algo { .. } => 5,
+            Self::Observation(
+                ObservationSource::UmOpenOrders
+                | ObservationSource::UmOpenAlgos
+                | ObservationSource::CmOpenOrders,
+            ) => 40,
+            Self::Observation(ObservationSource::CmPositions) => 1,
+            Self::Observation(ObservationSource::MarginOpenOrders) => 5,
             Self::PositionMode => 30,
             Self::OpenOrders { .. }
             | Self::Order { .. }

@@ -164,6 +164,61 @@ async fn incomplete_history_cannot_estimate_missing_venue_commission() {
 }
 
 #[tokio::test]
+async fn explicit_flat_report_closes_cached_position_through_execution_path() {
+    let server = MockServer::new(|request| {
+        if request.path == "/papi/v1/um/positionRisk" {
+            let mut row = testing::position("BTCUSDT");
+            row["positionAmt"] = json!("0.000");
+            row["entryPrice"] = json!("0");
+            Reply::json(&json!([row]))
+        } else {
+            testing::quiet(request)
+        }
+    })
+    .await;
+    let mut client = ReadClient::new(testing::client(&server, &["BTCUSDT"]));
+    client.bulk_position_coverage = true;
+    let mut ctx = EngineContext::new(client.clone());
+    ctx.add_position();
+    let (handler, portfolio_events) = get_typed_into_message_saving_handler::<OrderEventAny>(None);
+    let endpoint = MessagingSwitchboard::portfolio_update_order();
+    msgbus::register_order_event_endpoint(endpoint, handler);
+
+    let events = ctx.manager.check_positions_consistency(&[&client]).await;
+
+    for event in &events {
+        ctx.engine.borrow_mut().process(event);
+    }
+    msgbus::deregister_any(endpoint);
+
+    let fills: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some(fill),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fills.len(), 1);
+    assert_eq!(fills[0].order_side, OrderSide::Sell);
+    assert_eq!(fills[0].last_qty, Quantity::from("0.010"));
+    assert!(fills[0].reconciliation);
+    assert!(
+        ctx.cache
+            .borrow()
+            .positions_open(None, None, None, None, None)
+            .is_empty()
+    );
+    assert_eq!(
+        portfolio_events
+            .get_messages()
+            .iter()
+            .filter(|event| matches!(event, OrderEventAny::Filled(_)))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn failed_periodic_reads_preserve_cached_orders_and_positions() {
     let server = MockServer::new(|request| {
         if matches!(
@@ -312,7 +367,7 @@ impl EngineContext {
             .borrow_mut()
             .advance_time(ms(TRADE_TIME + 1_000), true);
         let cache = Rc::new(RefCell::new(Cache::default()));
-        // Synthetic core setup only; PAPI observations do not project an AccountState.
+        // Synthetic core setup; read-only PAPI snapshots never mutate this cache
         let account_state = AccountState::new(
             account_id(),
             AccountType::Margin,
@@ -373,6 +428,7 @@ impl EngineContext {
         let instrument = testing::instrument("BTCUSDT");
         let order = OrderTestBuilder::new(OrderType::Market)
             .instrument_id(instrument.id())
+            .strategy_id(StrategyId::from("EXTERNAL"))
             .side(OrderSide::Buy)
             .quantity(Quantity::from("0.010"))
             .build();
@@ -380,7 +436,7 @@ impl EngineContext {
             &order,
             &instrument,
             Some(TradeId::from("cached-trade")),
-            Some(PositionId::from("P-CACHED")),
+            Some(PositionId::from("BTCUSDT-PERP.BINANCE-EXTERNAL")),
             Some(Price::from("28511.00")),
             Some(Quantity::from("0.010")),
             None,
@@ -402,6 +458,7 @@ impl EngineContext {
 struct ReadClient {
     reader: BinancePapiReadOnlyClient,
     covered_bulk: Option<Vec<OrderStatusReport>>,
+    bulk_position_coverage: bool,
 }
 
 impl ReadClient {
@@ -409,6 +466,7 @@ impl ReadClient {
         Self {
             reader,
             covered_bulk: None,
+            bulk_position_coverage: false,
         }
     }
 }
@@ -440,7 +498,7 @@ impl ExecutionClient for ReadClient {
     }
 
     fn provides_bulk_position_coverage(&self, _instrument_id: InstrumentId) -> bool {
-        false
+        self.bulk_position_coverage
     }
 
     fn generate_account_state(

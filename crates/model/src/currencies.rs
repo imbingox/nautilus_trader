@@ -164,6 +164,7 @@ currency_constants! {
     TRX => "TRX", 8, 0, "TRON", Crypto;
     TRYB => "TRYB", 8, 0, "BiLira", Crypto;
     TUSD => "TUSD", 8, 0, "TrueUSD", Crypto;
+    U => "U", 8, 0, "United Stables", Crypto;
     UNI => "UNI", 8, 0, "Uniswap", Crypto;
     VTC => "VTC", 8, 0, "Vertcoin", Crypto;
     WBTC => "WBTC", 8, 0, "Wrapped Bitcoin", Crypto;
@@ -299,6 +300,7 @@ mod tests {
         "USDP|8|0|Pax Dollar|Crypto",
         "USDT|8|0|Tether|Crypto",
         "USD|2|840|United States dollar|Fiat",
+        "U|8|0|United Stables|Crypto",
         "VTC|8|0|Vertcoin|Crypto",
         "WBTC|8|0|Wrapped Bitcoin|Crypto",
         "WSB|8|0|WallStreetBets DApp|Crypto",

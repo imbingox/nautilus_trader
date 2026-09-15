@@ -3,7 +3,8 @@
 Binance Portfolio Margin (PAPI) adapter for NautilusTrader, with Rust and Python read-only queries.
 The client collects exact account observations and
 ordinary/algo order, fill, and one-way UM position reports through signed GET requests.
-Authenticated acceptance and economic account projection remain pending.
+The read-only account projection is implemented and has authenticated supported-account acceptance.
+The documented scope limits and trading startup gate remain in place.
 
 The execution factory supports configuration, factory extraction and `LiveNode` construction.
 Factory-created Rust clients can generate scoped reports after `start()` when configured with
@@ -12,8 +13,9 @@ remain unavailable because their interface cannot express incomplete coverage. T
 mass status defaults to a sixty-minute lookback and preserves the configured client identity.
 Position reports support current observations only; historical position filters fail explicitly.
 
-`LiveNode.run()` still fails its connection readiness check: native `total/free/locked` balances
-have no accepted economic mapping. Account publication and trading remain unavailable.
+`LiveNode.run()` still fails its connection readiness check. The diagnostic totals-only snapshot
+does not publish an execution-client account, implement PM admission, or authorize trading.
+Account publication and writes remain unavailable.
 Construction and rejected connection attempts perform no network requests. Cleanup cancels
 outstanding reads and remains idempotent; a later `start()` creates a new read session.
 
@@ -104,6 +106,8 @@ credentials and URLs, and no plaintext credential getters are exposed.
 The client exposes:
 
 - `refresh_account_observations` and `account_observations_json` for retained exact account evidence.
+- `account_snapshot_json(max_receipt_age, max_collection_span)` for an independent native wallet
+  projection and PM risk view with explicit validity and source metadata.
 - `query_order_rate_limit` for unprojected quota JSON.
 - `generate_open_order_status_reports` for current ordinary and algo orders.
 - `generate_position_status_reports` for explicit one-way position rows.
@@ -132,17 +136,49 @@ position/portfolio effects. They do not establish readiness for live reconciliat
 
 Snapshot `to_json()` preserves the fixed window, instrument scope, reports, response metadata,
 and coverage issues. `cancel()` stops outstanding and future calls on that read-only client.
-An interrupted account refresh marks unread sources failed while retaining prior observations.
+Account observations distinguish `missing`, `refreshing`, `recent`, `failed`, `canceled`, and
+`stale` receipt states. A completed partial refresh retains each failed source's prior response
+and redacted failure reason independently of successful sources. Dropping a refresh future or
+calling `cancel()` invalidates the current refresh while retaining diagnostic values; it cannot
+restore the receipt validity of a prior response.
+
+`account_observations_json(max_receipt_age)` requires a positive receipt-age bound and computes
+age at each read using a monotonic clock. Each source includes `timing.receipt_age_ns` and
+`timing.collection_span_ns`. Collection spans include quota waits and retries from the logical
+GET start to the SDK's body receipt. Wall-clock request metadata describes the successful signed
+attempt, not the logical start. Monotonic instants are not persisted or restored through replay.
+These timings do not verify economic freshness or cross-endpoint atomicity. The account snapshot
+requires one generation and a bounded combined span for each view. Its wallet uses
+`totalWalletBalance` as native-currency totals only after validating zero borrowing and interest,
+currency registration, exact `Money` conversion, UM instrument scope, and the absence of CM and
+cross-margin exposure or orders. Missing, failed, canceled, stale, inconsistent, and semantically
+unsupported results remain distinct and never return a partial `AccountState`.
+
+The PM account summary is a separate view. It preserves exact decimal strings, field availability,
+known/unknown status, verified USD or ratio units, and explicitly unverified units. Wallet and PM
+risk failures do not invalidate each other. Neither view grants trading authority.
 
 ## Acceptance collection
 
 The third stage has a local collection entry point. A bounded authenticated GET collection on
 2026-09-13 succeeded for the account sources, order quota, and mass status of an active one-way
-position. Its one-hour history window returned no orders or fills, so ordinary/algo linkage,
-commission behavior, and retention remain unverified. A separate collection scoped to flat
-instruments failed the explicit `positionRisk` coverage requirement: UM account V1 supplied
-explicit zero rows while V2 omitted them. Native balance projection and LiveNode startup remain
-unavailable. Raw captures and credentials stay outside the repository.
+position. Its one-hour history window returned no orders or fills, so that capture did not add
+order/fill linkage or commission evidence and did not test retention. A separate collection scoped
+to flat instruments failed the explicit `positionRisk` coverage requirement: UM account V1
+supplied explicit zero rows while V2 omitted them. Those captures predate the totals-only projection
+and do not constitute its live acceptance. LiveNode startup remains unavailable. Raw captures and
+credentials stay outside the repository.
+
+On 2026-09-15, the current projection and collection script completed against an active GWEI UM
+position. All nine account observation sources, the order-rate-limit query, and the bounded mass
+status succeeded. The wallet and PM risk views were available; the wallet contained four exact
+native totals-only currencies and no synthesized free/locked values. Binance returned the newly
+listed `U` asset, identified by its read-only asset configuration as United Stables and by public
+spot metadata with eight-digit asset precision. The built-in currency registry now carries that
+identity and precision. The active position produced one report; the one-hour window contained no
+orders or fills and remains explicitly incomplete. Observed account-wide weight increments were 40
+for UM ordinary orders, 40 for UM algo orders, 40 for CM orders, and 5 for margin orders. The
+collection used authenticated GET requests only and did not authorize trading.
 
 Prepare a local JSON credential file with `account_id`, `api_key`, and `api_secret`. Optional
 fields match the Python read-only config constructor, including `base_url` for a configured
@@ -172,13 +208,14 @@ existing output file is never overwritten. A zero exit status means the selected
 succeeded; every acceptance decision remains subject to review. Sanitize captures before sharing
 them or adding fixtures.
 
-Authenticated captures must establish liability inclusion, native free/locked semantics, V2
-coverage, and ordinary/algo linkage. Quiet-account samples cannot establish debt, mixed collateral,
-active algo transitions, or retention behavior. The acceptance cases in [RESEARCH.md](RESEARCH.md)
-remain open until the corresponding evidence exists. PM capacity is not assigned to a USDT/USDC
-wallet, and a zero balance is not substituted for an unavailable projection. If the native balance
-split cannot be established, scope the required account-model capability separately before enabling
-LiveNode startup.
+Authenticated acceptance of the supported projection must establish its zero-liability scope,
+account-wide CM and margin query behavior, V2 coverage, exact wallet output, and validity metadata.
+Evidence that the existing account cannot provide is listed explicitly in
+[ACCOUNT_VERIFICATION.md](ACCOUNT_VERIFICATION.md); unsupported debt and uncollected live algo,
+retention, flat-account, and throttling cases must not be represented as live acceptance. Their
+offline regressions remain distinct from authenticated evidence. PM capacity is not assigned to a
+USDT/USDC wallet, and a zero balance is not substituted for an unavailable projection. Totals-only
+balances deliberately leave native free/locked components unavailable.
 
 ## Request policy
 
@@ -192,6 +229,11 @@ four concurrent attempts. Defaults are five seconds per attempt, sixty seconds p
 256 attempts and 100,000 decoded rows. Clones share cancellation and retained observations;
 other processes sharing the IP require separate quota coordination.
 
+Account-wide UM ordinary/algo and CM open-order reads reserve their documented unscoped weight of
+40. The margin open-orders documentation assigns IP weight 5 but separately states that an
+unscoped request count equals the number of currently trading symbols. Authenticated acceptance
+must compare its quota headers before this diagnostic collection is run repeatedly.
+
 A 429, 418, or recognized throttling code permanently closes the shared gate for the process.
 SDK 69.2.1 loses error response headers, so an unknown `Retry-After` cannot trigger automatic
 recovery. A restart requires externally verified venue backoff. Successful response metadata
@@ -201,8 +243,8 @@ not that SDK allocation.
 
 ## Exact account observations
 
-The internal `observations` module parses balance,
-PM account summary, and UM account V1/V2 response parsing. It retains native asset identity,
+The internal `observations` module parses balance, PM account summary, UM account V1/V2, UM current
+ordinary/algo orders, CM positions/orders, and cross-margin current orders. It retains native asset identity,
 separate liabilities/PnL/margin fields, exact decimal text, source/version/scope, account ID,
 collection generation, receipt time, and the original JSON. Missing, null, empty, invalid and
 valid fields remain distinct. Unknown status strings remain observations, not trading permission.
@@ -212,17 +254,20 @@ uses monotonic time; a recently received response does not establish freshness o
 data. Risk-only updates are retained independently of balance changes. A response is bounded
 to 8 MiB, and invalid envelope shapes, duplicate identities, or scope mismatches fail the refresh.
 Malformed scalar values remain explicitly invalid; a consumer must require and economically
-validate every field it uses. Exact account balances and PM purchasing power are not projected.
+validate every field it uses. PM purchasing power is not projected into a native balance.
 
-The read-only client refreshes all four sources within one generation and operation budget,
+The read-only client refreshes all nine sources within one generation and operation budget,
 retaining successful sources independently after a partial failure. The SDK decodes into raw
 JSON before the exact observation parser runs, preserving missing/null distinctions. There is
-no account-state publication or native free/locked balance mapping. The
+no account-state publication or native free/locked balance mapping. A successful diagnostic wallet
+contains a formal reported margin `AccountState` with `base_currency=None`, empty complete balances
+and margins, and exact native `total_only_balances`. The
 [synthetic account fixtures](test_data/observations/README.md) and
 [official report examples](test_data/reports/README.md) do not establish live compatibility.
 
-The remaining acceptance work must establish authenticated endpoint behavior, historical
-coverage and linkage, a correct PM balance/capacity mapping, and successful LiveNode bootstrap.
+The remaining acceptance work must establish authenticated endpoint behavior for the complete
+scope checks and supported wallet projection, plus unobserved historical/algo lifecycle evidence.
+PM admission and successful LiveNode bootstrap remain later trading work.
 The rationale and acceptance obligations are recorded in [RESEARCH.md](RESEARCH.md).
 
 ## Local tests

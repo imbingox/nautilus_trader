@@ -146,10 +146,10 @@ impl BinancePapiReadOnlyClient {
         self.is_throttled()
     }
 
-    /// Refreshes balance, PM summary, and UM V1/V2 observations without projecting balances.
+    /// Refreshes account, product-scope, and UM V1/V2 observations for later projection.
     ///
     /// Successful sources are retained independently; a failure preserves that source's prior
-    /// response and marks it failed. All four sources share one generation and operation budget.
+    /// response and marks it failed. All nine sources share one generation and operation budget.
     ///
     /// # Errors
     ///
@@ -174,11 +174,46 @@ impl BinancePapiReadOnlyClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the observations cannot be serialized.
+    /// Returns an error for a zero receipt-age bound or if serialization fails.
     #[pyo3(name = "account_observations_json")]
     fn py_account_observations_json(&self, max_receipt_age_ms: u64) -> PyResult<String> {
+        if max_receipt_age_ms == 0 {
+            return Err(to_pyvalue_err("PAPI maximum receipt age must be positive"));
+        }
+
         self.account_observations_json(Duration::from_millis(max_receipt_age_ms))
             .map_err(to_pyruntime_err)
+    }
+
+    /// Projects retained observations into independent wallet and PM risk results.
+    ///
+    /// This is a read-only diagnostic snapshot. It neither updates the cache nor authorizes
+    /// trading. A failed projection contains reasons and never publishes a partial account state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero freshness bounds or if serialization fails.
+    #[pyo3(name = "account_snapshot_json")]
+    fn py_account_snapshot_json(
+        &self,
+        max_receipt_age_ms: u64,
+        max_collection_span_ms: u64,
+    ) -> PyResult<String> {
+        if max_receipt_age_ms == 0 {
+            return Err(to_pyvalue_err("PAPI maximum receipt age must be positive"));
+        }
+
+        if max_collection_span_ms == 0 {
+            return Err(to_pyvalue_err(
+                "PAPI maximum collection span must be positive",
+            ));
+        }
+
+        self.account_snapshot_json(
+            Duration::from_millis(max_receipt_age_ms),
+            Duration::from_millis(max_collection_span_ms),
+        )
+        .map_err(to_pyruntime_err)
     }
 
     /// Queries the account's order quota as unprojected JSON evidence.

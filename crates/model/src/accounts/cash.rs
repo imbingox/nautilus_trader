@@ -38,6 +38,9 @@ use std::{
 };
 
 use ahash::AHashMap;
+use nautilus_core::correctness::{
+    CorrectnessResult, CorrectnessResultExt, FAILED, check_predicate_true,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -65,6 +68,7 @@ use crate::{
 )]
 pub struct CashAccount {
     /// The account state shared by every account type.
+    #[serde(deserialize_with = "BaseAccount::deserialize_full_balances")]
     pub base: BaseAccount,
     /// Indicates if a balance may go negative.
     pub allow_borrowing: bool,
@@ -75,13 +79,34 @@ pub struct CashAccount {
 
 impl CashAccount {
     /// Creates a new [`CashAccount`] instance.
+    ///
+    /// # Panics
+    ///
+    /// Panics if balance currencies are duplicated or totals-only balances are provided.
     #[must_use]
     pub fn new(event: AccountState, calculate_account_state: bool, allow_borrowing: bool) -> Self {
-        Self {
-            base: BaseAccount::new(event, calculate_account_state),
+        Self::new_checked(event, calculate_account_state, allow_borrowing).expect_display(FAILED)
+    }
+
+    /// Creates a cash account after validating its balance representations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for duplicate currencies or totals-only balances.
+    pub fn new_checked(
+        event: AccountState,
+        calculate_account_state: bool,
+        allow_borrowing: bool,
+    ) -> CorrectnessResult<Self> {
+        check_predicate_true(
+            event.total_only_balances.is_empty(),
+            "cash accounts do not support totals-only balances",
+        )?;
+        Ok(Self {
+            base: BaseAccount::new_checked(event, calculate_account_state)?,
             allow_borrowing,
             balances_locked: AHashMap::new(),
-        }
+        })
     }
 
     #[must_use]
@@ -183,6 +208,11 @@ impl Account for CashAccount {
 
     fn apply(&mut self, event: AccountState) -> anyhow::Result<()> {
         self.check_event_account_id(&event)?;
+        self.check_event_balances(&event)?;
+        check_predicate_true(
+            event.total_only_balances.is_empty(),
+            "cash accounts do not support totals-only balances",
+        )?;
 
         if !self.allow_borrowing {
             for balance in &event.balances {

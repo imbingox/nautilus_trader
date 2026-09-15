@@ -96,7 +96,7 @@ macro_rules! impl_account_base_members {
         }
 
         fn currencies(&self) -> Vec<$crate::types::Currency> {
-            self.balances.keys().copied().collect()
+            self.base_balances_total().keys().copied().collect()
         }
 
         fn starting_balances(
@@ -109,6 +109,12 @@ macro_rules! impl_account_base_members {
             &self,
         ) -> ::indexmap::IndexMap<$crate::types::Currency, $crate::types::AccountBalance> {
             self.balances.clone()
+        }
+
+        fn total_only_balances(
+            &self,
+        ) -> ::indexmap::IndexMap<$crate::types::Currency, $crate::types::Money> {
+            self.total_only_balances.clone()
         }
 
         fn purge_account_events(&mut self, ts_now: ::nautilus_core::UnixNanos, lookback_secs: u64) {

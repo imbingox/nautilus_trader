@@ -140,6 +140,8 @@ impl PapiHttpClient {
         budget: &RequestBudget,
         cancel: &CancellationToken,
     ) -> Result<RawResponse, PapiHttpError> {
+        // Collection timing includes quota waits and all attempts, not just the successful retry
+        let requested_at = Instant::now();
         let retry = RetryManager::new(RetryConfig {
             max_retries: 2,
             initial_delay_ms: 200,
@@ -154,7 +156,7 @@ impl PapiHttpClient {
         let response = retry
             .invocation(
                 request.endpoint(),
-                || self.attempt(request, budget),
+                || self.attempt(request, budget, requested_at),
                 PapiHttpError::retryable,
                 |e| PapiHttpError::from_retry(&e),
             )
@@ -169,6 +171,7 @@ impl PapiHttpClient {
         &self,
         request: &PapiRequest,
         budget: &RequestBudget,
+        requested_at: Instant,
     ) -> Result<RawResponse, PapiHttpError> {
         budget.charge_request()?;
 
@@ -193,7 +196,7 @@ impl PapiHttpClient {
         let result = tokio::select! {
             biased;
             () = self.gate.closed.cancelled() => Err(PapiHttpError::GateClosed),
-            result = timeout(self.request_timeout, self.send(request)) => {
+            result = timeout(self.request_timeout, self.send(request, requested_at)) => {
                 result.unwrap_or(Err(PapiHttpError::Timeout))
             }
         };
@@ -207,7 +210,11 @@ impl PapiHttpClient {
         result
     }
 
-    async fn send(&self, request: &PapiRequest) -> Result<RawResponse, PapiHttpError> {
+    async fn send(
+        &self,
+        request: &PapiRequest,
+        requested_at: Instant,
+    ) -> Result<RawResponse, PapiHttpError> {
         let ts_requested = self.clock.get_time_ns();
         let response = self
             .sdk
@@ -258,6 +265,7 @@ impl PapiHttpClient {
         Ok(RawResponse {
             body,
             metadata,
+            requested_at,
             received_at,
         })
     }
@@ -275,6 +283,8 @@ impl Debug for PapiHttpClient {
 pub(crate) struct RawResponse {
     pub(crate) body: Box<RawValue>,
     pub(crate) metadata: BinancePapiResponseMetadata,
+    /// Logical collection start, including quota waits and failed attempts.
+    pub(crate) requested_at: Instant,
     pub(crate) received_at: Instant,
 }
 

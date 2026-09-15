@@ -32,7 +32,7 @@ use nautilus_model::identifiers::AccountId;
 use serde::Serialize;
 use serde_json::value::RawValue;
 
-use self::models::{AccountSummary, AssetBalance, JsonObject, UmAccount};
+use self::models::{AccountSummary, AssetBalance, JsonObject, ScopeRow, UmAccount};
 
 // Bounds retained evidence and parsing allocations for each account response
 pub(crate) const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
@@ -44,6 +44,11 @@ pub(crate) enum ObservationSource {
     Account,
     UmAccountV1,
     UmAccountV2,
+    UmOpenOrders,
+    UmOpenAlgos,
+    CmPositions,
+    CmOpenOrders,
+    MarginOpenOrders,
 }
 
 impl ObservationSource {
@@ -54,6 +59,11 @@ impl ObservationSource {
             Self::Account => "/papi/v1/account",
             Self::UmAccountV1 => "/papi/v1/um/account",
             Self::UmAccountV2 => "/papi/v2/um/account",
+            Self::UmOpenOrders => "/papi/v1/um/openOrders",
+            Self::UmOpenAlgos => "/papi/v1/um/algo/openAlgoOrders",
+            Self::CmPositions => "/papi/v1/cm/positionRisk",
+            Self::CmOpenOrders => "/papi/v1/cm/openOrders",
+            Self::MarginOpenOrders => "/papi/v1/margin/openOrders",
         }
     }
 }
@@ -75,8 +85,9 @@ pub(crate) struct ObservationSlot {
     account_id: AccountId,
     source: ObservationSource,
     last_response: Option<AccountObservation>,
+    requested_at: Option<Instant>,
     received_at: Option<Instant>,
-    refresh_failed: bool,
+    failure: Option<ObservationFailure>,
 }
 
 impl ObservationSlot {
@@ -86,8 +97,9 @@ impl ObservationSlot {
             account_id,
             source,
             last_response: None,
+            requested_at: None,
             received_at: None,
-            refresh_failed: false,
+            failure: None,
         }
     }
 
@@ -101,9 +113,39 @@ impl ObservationSlot {
         body: &str,
         generation: u64,
         ts_received: UnixNanos,
+        requested_at: Instant,
         received_at: Instant,
     ) -> anyhow::Result<()> {
-        self.refresh_failed = true;
+        let result =
+            self.parse_observation(body, generation, ts_received, requested_at, received_at);
+
+        match result {
+            Ok(observation) => {
+                self.last_response = Some(observation);
+                self.requested_at = Some(requested_at);
+                self.received_at = Some(received_at);
+                self.failure = None;
+                Ok(())
+            }
+            Err(e) => {
+                self.record_failure(e.to_string());
+                Err(e)
+            }
+        }
+    }
+
+    fn parse_observation(
+        &self,
+        body: &str,
+        generation: u64,
+        ts_received: UnixNanos,
+        requested_at: Instant,
+        received_at: Instant,
+    ) -> anyhow::Result<AccountObservation> {
+        anyhow::ensure!(
+            requested_at <= received_at,
+            "PAPI observation receipt precedes its request"
+        );
 
         anyhow::ensure!(
             body.len() <= MAX_RESPONSE_BYTES,
@@ -114,6 +156,7 @@ impl ObservationSlot {
             .last_response
             .as_ref()
             .is_some_and(|last| generation <= last.generation)
+            || self.requested_at.is_some_and(|last| requested_at < last)
             || self.received_at.is_some_and(|last| received_at < last)
         {
             anyhow::bail!("Out-of-order PAPI observation");
@@ -123,22 +166,48 @@ impl ObservationSlot {
             .map_err(|_| anyhow::anyhow!("Invalid PAPI response JSON"))?;
         let data = parse_response(&self.source, body)?;
 
-        self.last_response = Some(AccountObservation {
+        Ok(AccountObservation {
             account_id: self.account_id,
             source: self.source.clone(),
             generation,
             ts_received,
             raw,
             data,
-        });
-        self.received_at = Some(received_at);
-        self.refresh_failed = false;
-        Ok(())
+        })
     }
 
     /// Retains the last parsed response for inspection after any failed refresh.
-    pub(crate) fn record_failure(&mut self) {
-        self.refresh_failed = true;
+    pub(crate) fn record_failure(&mut self, reason: String) {
+        self.failure = Some(ObservationFailure::Failed { reason });
+    }
+
+    pub(crate) fn record_refresh_started(&mut self) {
+        self.failure = Some(ObservationFailure::Refreshing);
+    }
+
+    pub(crate) fn record_canceled(&mut self) {
+        self.failure = Some(ObservationFailure::Canceled);
+    }
+
+    #[must_use]
+    pub(crate) fn failure(&self) -> Option<&ObservationFailure> {
+        self.failure.as_ref()
+    }
+
+    /// Monotonic instants are deliberately not serialized or restored through replay.
+    #[must_use]
+    pub(crate) fn timing(&self, now: Instant) -> ObservationTiming {
+        ObservationTiming {
+            receipt_age_ns: self
+                .received_at
+                .and_then(|received| now.checked_duration_since(received))
+                .map(|age| age.as_nanos()),
+            collection_span_ns: self
+                .requested_at
+                .zip(self.received_at)
+                .and_then(|(requested, received)| received.checked_duration_since(requested))
+                .map(|span| span.as_nanos()),
+        }
     }
 
     #[must_use]
@@ -146,11 +215,20 @@ impl ObservationSlot {
         self.last_response.as_ref()
     }
 
+    #[must_use]
+    pub(crate) const fn source(&self) -> &ObservationSource {
+        &self.source
+    }
+
     /// Measures receipt age only. Even `Recent` is not proof of fresh venue risk data.
     #[must_use]
     pub(crate) fn receipt_status(&self, now: Instant, max_age: Duration) -> ReceiptStatus {
-        if self.refresh_failed {
-            return ReceiptStatus::Failed;
+        if let Some(failure) = &self.failure {
+            return match failure {
+                ObservationFailure::Refreshing => ReceiptStatus::Refreshing,
+                ObservationFailure::Canceled => ReceiptStatus::Canceled,
+                ObservationFailure::Failed { .. } => ReceiptStatus::Failed,
+            };
         }
 
         match self.received_at {
@@ -169,7 +247,24 @@ pub(crate) enum ReceiptStatus {
     Missing,
     Recent,
     Failed,
+    Refreshing,
+    Canceled,
     Stale,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(crate) enum ObservationFailure {
+    Refreshing,
+    Canceled,
+    Failed { reason: String },
+}
+
+/// Diagnostic durations do not establish economic validity or order admission authority.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub(crate) struct ObservationTiming {
+    pub(crate) receipt_age_ns: Option<u128>,
+    pub(crate) collection_span_ns: Option<u128>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -177,6 +272,7 @@ pub(crate) enum ObservationData {
     Balances(Vec<AssetBalance>),
     Account(Box<AccountSummary>),
     UmAccount(UmAccount),
+    ScopeRows(Vec<ScopeRow>),
 }
 
 fn parse_response(source: &ObservationSource, body: &str) -> anyhow::Result<ObservationData> {
@@ -238,6 +334,17 @@ fn parse_response(source: &ObservationSource, body: &str) -> anyhow::Result<Obse
             }
 
             Ok(ObservationData::UmAccount(account))
+        }
+        ObservationSource::UmOpenOrders
+        | ObservationSource::UmOpenAlgos
+        | ObservationSource::CmPositions
+        | ObservationSource::CmOpenOrders
+        | ObservationSource::MarginOpenOrders => {
+            let rows: Vec<JsonObject<ScopeRow>> = serde_json::from_str(body)
+                .map_err(|_| anyhow::anyhow!("Invalid PAPI scope response"))?;
+            Ok(ObservationData::ScopeRows(
+                rows.into_iter().map(|row| row.0).collect(),
+            ))
         }
     }
 }

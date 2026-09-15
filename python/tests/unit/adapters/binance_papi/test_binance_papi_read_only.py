@@ -82,6 +82,9 @@ def _quiet(path: str, params: dict[str, list[str]]) -> Reply:
     if path in {
         "/papi/v1/um/openOrders",
         "/papi/v1/um/algo/openAlgoOrders",
+        "/papi/v1/cm/positionRisk",
+        "/papi/v1/cm/openOrders",
+        "/papi/v1/margin/openOrders",
         "/papi/v1/um/allOrders",
         "/papi/v1/um/algo/allAlgoOrders",
         "/papi/v1/um/userTrades",
@@ -201,6 +204,15 @@ def test_python_queries_return_shared_domain_types_and_exact_fees() -> None:
 
         async def query() -> tuple[Any, Any, Any]:
             await client.refresh_account_observations()
+            sources = json.loads(client.account_observations_json(30_000))
+            assert all(source["receipt_status"] == "recent" for source in sources)
+            assert all(source["failure"] is None for source in sources)
+            assert all(source["timing"]["receipt_age_ns"] >= 0 for source in sources)
+            assert all(source["timing"]["collection_span_ns"] >= 0 for source in sources)
+            account = json.loads(client.account_snapshot_json(30_000, 30_000))
+            assert account["trading_authorized"] is False
+            assert account["wallet"]["value"] is None
+            assert account["portfolio_margin_risk"]["value"]["units"]["account_equity"] == "USD"
             await client.query_order_rate_limit()
             assert await client.generate_open_order_status_reports() == []
             positions = await client.generate_position_status_reports(INSTRUMENT_ID)
@@ -278,9 +290,9 @@ def test_python_scope_and_factory_validation_preserve_account_identity() -> None
         assert requests == []
 
 
-def test_python_cancellation_preserves_failed_refresh_evidence() -> None:
+def test_python_cancellation_preserves_canceled_refresh_evidence() -> None:
     """
-    Mark unread account sources failed when Python drops an in-flight refresh.
+    Mark account sources canceled when Python drops an in-flight refresh.
     """
     entered = Event()
     release = Event()
@@ -310,10 +322,51 @@ def test_python_cancellation_preserves_failed_refresh_evidence() -> None:
         try:
             asyncio.run(cancel_refresh())
             sources = json.loads(client.account_observations_json(30_000))
-            assert all(source["receipt_status"] == "failed" for source in sources)
+            assert all(source["receipt_status"] == "canceled" for source in sources)
+            assert all(source["failure"]["state"] == "canceled" for source in sources)
             assert len(requests) == 1
         finally:
             release.set()
+
+
+def test_python_receipt_age_requires_a_positive_bound() -> None:
+    """
+    Reject a zero receipt-age bound without querying the venue.
+    """
+    client = papi.BinancePapiReadOnlyClient(
+        _config("https://papi.binance.com"),
+        [TestInstrumentProvider.btcusdt_perp_binance()],
+    )
+    with pytest.raises(ValueError, match="maximum receipt age must be positive"):
+        client.account_observations_json(0)
+    with pytest.raises(ValueError, match="maximum receipt age must be positive"):
+        client.account_snapshot_json(0, 1)
+    with pytest.raises(ValueError, match="maximum collection span must be positive"):
+        client.account_snapshot_json(1, 0)
+    sources = json.loads(client.account_observations_json(1))
+    assert all(source["receipt_status"] == "missing" for source in sources)
+    assert all(source["timing"]["receipt_age_ns"] is None for source in sources)
+    assert all(source["timing"]["collection_span_ns"] is None for source in sources)
+
+
+@pytest.mark.parametrize("max_receipt_age_ms", [0, -1, 2**64])
+def test_acceptance_receipt_age_is_validated_before_queries(max_receipt_age_ms: int) -> None:
+    """
+    Reject invalid evidence parameters before making authenticated requests.
+    """
+    example = load_example_module("binance_papi", "read_only_acceptance")
+    with _serve() as (url, requests):
+        with pytest.raises(ValueError, match="Receipt age must be a positive unsigned"):
+            asyncio.run(
+                example.collect_evidence(
+                    _config(url),
+                    [TestInstrumentProvider.btcusdt_perp_binance()],
+                    TRADE_TIME * 1_000_000,
+                    TRADE_TIME * 1_000_000,
+                    max_receipt_age_ms,
+                ),
+            )
+        assert requests == []
 
 
 def test_python_failed_single_order_query_never_becomes_none() -> None:
@@ -411,8 +464,12 @@ def test_acceptance_script_keeps_exact_private_evidence_and_source_failures(
         assert result == int(fail_account)
         assert stat.S_IMODE(output.stat().st_mode) == 0o600
         assert "0.12345678901234567890123456789" in evidence["account_observations_json"]
-        assert evidence["acceptance"]["native_balance_mapping"] == "unavailable"
+        assert evidence["schema_version"] == 2
+        assert evidence["acceptance"]["native_balance_mapping"] == "requires_snapshot_review"
         assert evidence["acceptance"]["history_completeness"] == "unverified"
+        assert evidence["operations"]["account_snapshot"] == "succeeded"
+        account_snapshot = json.loads(evidence["account_snapshot_json"])
+        assert account_snapshot["trading_authorized"] is False
         assert evidence["operations"]["account_observations"] == (
             "failed" if fail_account else "succeeded"
         )

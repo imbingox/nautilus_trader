@@ -8266,6 +8266,382 @@ fn margin_account_with_usdt_balance(total: &str, locked: &str, free: &str) -> Ma
 }
 
 #[rstest]
+#[case::quote_buy(OrderSide::Buy, None, "100000 USDT", false, "1.000", false)]
+#[case::quote_sell(OrderSide::Sell, None, "100000 USDT", false, "1.000", false)]
+#[case::other_collateral(OrderSide::Buy, None, "1.23456789 BTC", false, "1.000", false)]
+#[case::mixed_complete_quote(OrderSide::Buy, None, "1.23456789 BTC", true, "1.000", false)]
+#[case::unflagged_opposite_long(
+    OrderSide::Sell,
+    Some((OrderSide::Buy, "BINANCE-001")),
+    "100000 USDT",
+    false,
+    "1.000",
+    false
+)]
+#[case::unflagged_opposite_short(
+    OrderSide::Buy,
+    Some((OrderSide::Sell, "BINANCE-001")),
+    "100000 USDT",
+    false,
+    "1.000",
+    false
+)]
+#[case::reverse_long(
+    OrderSide::Sell,
+    Some((OrderSide::Buy, "BINANCE-001")),
+    "100000 USDT",
+    false,
+    "3.000",
+    false
+)]
+#[case::reverse_short(
+    OrderSide::Buy,
+    Some((OrderSide::Sell, "BINANCE-001")),
+    "100000 USDT",
+    false,
+    "3.000",
+    false
+)]
+#[case::other_account_long(
+    OrderSide::Sell,
+    Some((OrderSide::Buy, "BINANCE-OTHER")),
+    "100000 USDT",
+    false,
+    "1.000",
+    false
+)]
+#[case::other_account_short(
+    OrderSide::Buy,
+    Some((OrderSide::Sell, "BINANCE-OTHER")),
+    "100000 USDT",
+    false,
+    "1.000",
+    false
+)]
+#[case::cumulative_reverse_long(
+    OrderSide::Sell,
+    Some((OrderSide::Buy, "BINANCE-001")),
+    "100000 USDT",
+    false,
+    "1.500",
+    false
+)]
+#[case::cumulative_reverse_short(
+    OrderSide::Buy,
+    Some((OrderSide::Sell, "BINANCE-001")),
+    "100000 USDT",
+    false,
+    "1.500",
+    false
+)]
+#[case::reduce_only_long(
+    OrderSide::Sell,
+    Some((OrderSide::Buy, "BINANCE-001")),
+    "100000 USDT",
+    false,
+    "1.000",
+    true
+)]
+#[case::reduce_only_short(
+    OrderSide::Buy,
+    Some((OrderSide::Sell, "BINANCE-001")),
+    "100000 USDT",
+    false,
+    "1.000",
+    true
+)]
+fn test_submit_order_totals_only_margin_capital_guard(
+    #[values(false, true)] as_order_list: bool,
+    #[values(false, true)] trailing_without_market_data: bool,
+    #[values(None, Some("BINANCE-001"), Some("BINANCE-OTHER"))] pending_quote_account: Option<&str>,
+    #[values(false, true)] pending_accepted: bool,
+    #[case] side: OrderSide,
+    #[case] held_position: Option<(OrderSide, &str)>,
+    #[case] total: &str,
+    #[case] complete_quote: bool,
+    #[case] quantity: &str,
+    #[case] reduce_only: bool,
+    strategy_id_ema_cross: StrategyId,
+    client_id_binance: ClientId,
+    trader_id: TraderId,
+    instrument_eth_usdt: InstrumentAny,
+    quote_ethusdt_binance: QuoteTick,
+    process_order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    execute_order_event_handler: TypedIntoMessageSavingHandler<TradingCommand>,
+    mut simple_cache: Cache,
+) {
+    let denied = !reduce_only;
+    simple_cache
+        .add_instrument(instrument_eth_usdt.clone())
+        .unwrap();
+    if !trailing_without_market_data {
+        simple_cache.add_quote(quote_ethusdt_binance).unwrap();
+    }
+    let balances = if complete_quote {
+        let total = Money::from("100000 USDT");
+        vec![AccountBalance::new(
+            total,
+            Money::zero(total.currency),
+            total,
+        )]
+    } else {
+        vec![]
+    };
+    let state = AccountState::new(
+        AccountId::from("BINANCE-001"),
+        AccountType::Margin,
+        balances,
+        vec![],
+        true,
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        None,
+    )
+    .with_total_only_balances(vec![Money::from(total)])
+    .unwrap();
+    simple_cache
+        .add_account(AccountAny::Margin(MarginAccount::new(state, false)))
+        .unwrap();
+
+    if let Some((held_side, held_account_id)) = held_position {
+        let entry = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument_eth_usdt.id())
+            .side(held_side)
+            .quantity(Quantity::from("2.000"))
+            .build();
+        let mut fill = order_filled(
+            &entry,
+            &instrument_eth_usdt,
+            None,
+            Some(AccountId::from(held_account_id)),
+            Some(VenueOrderId::from("V-001")),
+            None,
+            None,
+            Some(Price::from("3000.00")),
+            None,
+            None,
+            None,
+        );
+        fill.position_id = Some(PositionId::from("P-001"));
+        simple_cache
+            .add_position(&Position::new(&instrument_eth_usdt, fill), OmsType::Hedging)
+            .unwrap();
+    }
+
+    if let Some(pending_account_id) = pending_quote_account {
+        let pending = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument_eth_usdt.id())
+            .client_order_id(ClientOrderId::from("O-PENDING-QUOTE"))
+            .side(side)
+            .quantity(Quantity::from("0.500"))
+            .quote_quantity(true)
+            .build();
+        simple_cache
+            .add_order(pending.clone(), None, Some(client_id_binance), false)
+            .unwrap();
+        let mut submitted = order_submitted(&pending);
+        submitted.account_id = AccountId::from(pending_account_id);
+        simple_cache
+            .update_order(&OrderEventAny::Submitted(submitted))
+            .unwrap();
+
+        if pending_accepted {
+            simple_cache
+                .update_order(&OrderEventAny::Accepted(order_accepted(
+                    &pending,
+                    Some(VenueOrderId::from("V-PENDING-QUOTE")),
+                    Some(AccountId::from(pending_account_id)),
+                )))
+                .unwrap();
+        }
+    }
+
+    let mut risk_engine =
+        get_risk_engine(Some(Rc::new(RefCell::new(simple_cache))), None, None, false);
+    let order_type = if trailing_without_market_data {
+        OrderType::TrailingStopMarket
+    } else {
+        OrderType::Market
+    };
+    let mut builder = OrderTestBuilder::new(order_type);
+
+    if trailing_without_market_data {
+        builder
+            .trailing_offset(dec!(100))
+            .trailing_offset_type(TrailingOffsetType::Price)
+            .trigger_type(TriggerType::BidAsk);
+    }
+    let order = builder
+        .instrument_id(instrument_eth_usdt.id())
+        .side(side)
+        .quantity(Quantity::from(quantity))
+        .reduce_only(reduce_only)
+        .build();
+    risk_engine
+        .cache()
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(client_id_binance), false)
+        .unwrap();
+    let command = SubmitOrder::new(
+        trader_id,
+        Some(client_id_binance),
+        strategy_id_ema_cross,
+        instrument_eth_usdt.id(),
+        order.client_order_id(),
+        order.init_event().clone(),
+        None,
+        None,
+        None,
+        UUID4::new(),
+        risk_engine.clock().borrow().timestamp_ns(),
+        None,
+    );
+
+    if as_order_list {
+        let mut second = order.init_event().clone();
+        second.client_order_id = ClientOrderId::from("O-TOTALS-002");
+        second.event_id = UUID4::new();
+        let second_order = OrderAny::try_from(second.clone()).unwrap();
+        risk_engine
+            .cache()
+            .borrow_mut()
+            .add_order(second_order, None, Some(client_id_binance), false)
+            .unwrap();
+        let order_list = OrderList::new(
+            OrderListId::new("L-TOTALS-001"),
+            instrument_eth_usdt.id(),
+            strategy_id_ema_cross,
+            vec![order.client_order_id(), second.client_order_id],
+            risk_engine.clock().borrow().timestamp_ns(),
+        );
+        let command = SubmitOrderList::new(
+            trader_id,
+            Some(client_id_binance),
+            strategy_id_ema_cross,
+            order_list,
+            vec![order.init_event().clone(), second],
+            None,
+            None,
+            None,
+            UUID4::new(),
+            risk_engine.clock().borrow().timestamp_ns(),
+            None,
+        );
+        risk_engine.execute(TradingCommand::SubmitOrderList(command));
+    } else {
+        risk_engine.execute(TradingCommand::SubmitOrder(command));
+    }
+    let process_messages = get_process_order_event_handler_messages(&process_order_event_handler);
+    let execute_messages = get_execute_order_event_handler_messages(&execute_order_event_handler);
+
+    let expected_denials = usize::from(denied) * if as_order_list { 3 } else { 1 };
+    assert_eq!(process_messages.len(), expected_denials);
+    assert_eq!(execute_messages.len(), usize::from(!denied));
+
+    if denied {
+        assert_eq!(process_messages[0].event_type(), OrderEventType::Denied);
+        assert_eq!(
+            process_messages[0].message().unwrap(),
+            Ustr::from(
+                &OrderDeniedReason::NativeCapitalCheckUnavailable {
+                    account_id: AccountId::from("BINANCE-001")
+                }
+                .to_string()
+            )
+        );
+    }
+}
+
+#[rstest]
+#[case::increase(Some("2.000"), None, None, true)]
+#[case::decrease(Some("0.500"), None, None, false)]
+#[case::unchanged(Some("1.000"), Some("3000.00"), None, false)]
+#[case::price_change(None, Some("3001.00"), None, true)]
+#[case::trigger_change(None, None, Some("3100.00"), true)]
+fn test_modify_order_totals_only_margin_capital_guard(
+    #[case] quantity: Option<&str>,
+    #[case] price: Option<&str>,
+    #[case] trigger_price: Option<&str>,
+    #[case] rejected: bool,
+    strategy_id_ema_cross: StrategyId,
+    client_id_binance: ClientId,
+    trader_id: TraderId,
+    instrument_eth_usdt: InstrumentAny,
+    process_order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    execute_order_event_handler: TypedIntoMessageSavingHandler<TradingCommand>,
+    mut simple_cache: Cache,
+) {
+    simple_cache
+        .add_instrument(instrument_eth_usdt.clone())
+        .unwrap();
+    let state = AccountState::new(
+        AccountId::from("BINANCE-001"),
+        AccountType::Margin,
+        vec![],
+        vec![],
+        true,
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        None,
+    )
+    .with_total_only_balances(vec![Money::from("100000 USDT")])
+    .unwrap();
+    simple_cache
+        .add_account(AccountAny::Margin(MarginAccount::new(state, false)))
+        .unwrap();
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.000"))
+        .price(Price::from("3000.00"))
+        .build();
+    simple_cache
+        .add_order(order.clone(), None, Some(client_id_binance), false)
+        .unwrap();
+    let mut risk_engine =
+        get_risk_engine(Some(Rc::new(RefCell::new(simple_cache))), None, None, false);
+    let command = ModifyOrder::new(
+        trader_id,
+        Some(client_id_binance),
+        strategy_id_ema_cross,
+        instrument_eth_usdt.id(),
+        order.client_order_id(),
+        Some(VenueOrderId::from("V-001")),
+        quantity.map(Quantity::from),
+        price.map(Price::from),
+        trigger_price.map(Price::from),
+        UUID4::new(),
+        risk_engine.clock().borrow().timestamp_ns(),
+        None,
+        None,
+    );
+    risk_engine.execute(TradingCommand::ModifyOrder(command));
+    let process_messages = get_process_order_event_handler_messages(&process_order_event_handler);
+    let execute_messages = get_execute_order_event_handler_messages(&execute_order_event_handler);
+
+    assert_eq!(process_messages.len(), usize::from(rejected));
+    assert_eq!(execute_messages.len(), usize::from(!rejected));
+
+    if rejected {
+        assert_eq!(
+            process_messages[0].event_type(),
+            OrderEventType::ModifyRejected
+        );
+        assert_eq!(
+            process_messages[0].message().unwrap(),
+            Ustr::from(
+                &OrderDeniedReason::NativeCapitalCheckUnavailable {
+                    account_id: AccountId::from("BINANCE-001")
+                }
+                .to_string()
+            )
+        );
+    }
+}
+
+#[rstest]
 #[case::unheld(None, "1.000", false, false, Some("0 ETH"), Some("1 ETH"))]
 #[case::held_within_balance(Some("2 ETH"), "1.000", false, false, None, None)]
 #[case::held_exceeding_balance(Some("2 ETH"), "3.000", false, false, Some("2 ETH"), Some("3 ETH"))]

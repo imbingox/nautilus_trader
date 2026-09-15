@@ -95,6 +95,7 @@ impl WalletAccount {
     ) -> CorrectnessResult<Self> {
         Self::validate_event(&event)?;
         event.balances = Self::normalize_balances(&event.balances)?;
+        BaseAccount::validate_event_balances(&event, calculate_account_state)?;
         Ok(Self {
             base: BaseAccount::new(event, calculate_account_state),
             balances_locked: AHashMap::new(),
@@ -541,7 +542,10 @@ impl Account for WalletAccount {
         self.check_event_account_id(&event)?;
         Self::validate_event(&event)?;
         let mut event = event;
-        event.balances = Self::normalize_balances(&event.balances)?
+        event.balances = Self::normalize_balances(&event.balances)?;
+        self.check_event_balances(&event)?;
+        event.balances = event
+            .balances
             .into_iter()
             .map(|balance| Self::balance_from_locks_checked(balance, &self.balances_locked))
             .collect::<CorrectnessResult<Vec<_>>>()?;

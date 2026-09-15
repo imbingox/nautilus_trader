@@ -1334,7 +1334,7 @@ impl AccountsManager {
         // regenerated state events preserve the full margin picture.
         let mut margins: Vec<_> = margin_account.margins.values().copied().collect();
         margins.extend(margin_account.account_margins.values().copied());
-        AccountState::new(
+        let mut state = AccountState::new(
             margin_account.id,
             AccountType::Margin,
             margin_account.balances.clone().into_values().collect(),
@@ -1344,7 +1344,13 @@ impl AccountsManager {
             ts_event,
             self.clock.borrow().timestamp_ns(),
             margin_account.base_currency(),
-        )
+        );
+        state.total_only_balances = margin_account
+            .total_only_balances
+            .values()
+            .copied()
+            .collect();
+        state
     }
 
     fn generate_unleveraged_account_state(
@@ -3659,6 +3665,37 @@ mod tests {
         assert_eq!(account_wide[0].currency, usd);
         assert_eq!(account_wide[0].initial, Money::new(500.0, usd));
         assert_eq!(account_wide[0].maintenance, Money::new(250.0, usd));
+    }
+
+    #[rstest]
+    fn test_generate_account_state_preserves_totals_only_balances() {
+        let usd = Currency::USD();
+        let total = Money::from("-19.23 USD");
+        let event = AccountState::new(
+            AccountId::from("BINANCE-PAPI-001"),
+            AccountType::Margin,
+            vec![],
+            vec![],
+            true,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            None,
+        )
+        .with_total_only_balances(vec![total])
+        .unwrap();
+        let account = AccountAny::Margin(MarginAccount::new(event, false));
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        let manager = AccountsManager::new(clock, cache);
+        let state = manager.generate_account_state(&account, UnixNanos::from(17));
+
+        assert!(state.balances.is_empty());
+        assert_eq!(state.total_only_balances, vec![total]);
+        assert_eq!(state.ts_event, UnixNanos::from(17));
+        let restored = AccountAny::try_from_state(state).unwrap();
+        assert_eq!(restored.balance_total(Some(usd)), Some(total));
+        assert_eq!(restored.balance_free(Some(usd)), None);
     }
 
     #[rstest]

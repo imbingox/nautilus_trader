@@ -319,7 +319,7 @@ fn test_failed_refresh_preserves_observation_and_monotonic_age() {
         ObservationSource::Account,
     );
     assert_eq!(slot.receipt_status(start, max_age), ReceiptStatus::Missing);
-    slot.record_response(ACCOUNT, 1, UnixNanos::from(100), start)
+    slot.record_response(ACCOUNT, 1, UnixNanos::from(100), start, start)
         .unwrap();
     assert_eq!(
         slot.receipt_status(start + max_age, max_age),
@@ -333,11 +333,11 @@ fn test_failed_refresh_preserves_observation_and_monotonic_age() {
         slot.receipt_status(start - Duration::from_nanos(1), max_age),
         ReceiptStatus::Stale
     );
-    slot.record_failure();
+    slot.record_failure("Fixture request failed".to_string());
     assert_eq!(slot.receipt_status(start, max_age), ReceiptStatus::Failed);
     assert_eq!(slot.last_response().unwrap().generation, 1);
     assert!(
-        slot.record_response("{}", 2, UnixNanos::from(90), start)
+        slot.record_response("{}", 2, UnixNanos::from(90), start, start)
             .is_err()
     );
     assert_eq!(slot.receipt_status(start, max_age), ReceiptStatus::Failed);
@@ -348,6 +348,7 @@ fn test_failed_refresh_preserves_observation_and_monotonic_age() {
         ACCOUNT,
         3,
         UnixNanos::from(90),
+        start + Duration::from_secs(1),
         start + Duration::from_secs(1),
     )
     .unwrap();
@@ -368,14 +369,14 @@ fn test_source_isolation_and_risk_only_updates() {
     let mut balances = ObservationSlot::new(account_id, ObservationSource::Balance { asset: None });
     let mut risk = ObservationSlot::new(account_id, ObservationSource::Account);
     balances
-        .record_response(BALANCES, 1, UnixNanos::from(100), start)
+        .record_response(BALANCES, 1, UnixNanos::from(100), start, start)
         .unwrap();
-    risk.record_response(ACCOUNT, 1, UnixNanos::from(100), start)
+    risk.record_response(ACCOUNT, 1, UnixNanos::from(100), start, start)
         .unwrap();
     let changed = ACCOUNT.replace("FUTURE_STATUS", "REDUCE_ONLY");
-    risk.record_response(&changed, 2, UnixNanos::from(200), start)
+    risk.record_response(&changed, 2, UnixNanos::from(200), start, start)
         .unwrap();
-    balances.record_failure();
+    balances.record_failure("Fixture request failed".to_string());
     assert_eq!(balances.last_response().unwrap().generation, 1);
     assert_eq!(risk.last_response().unwrap().generation, 2);
     assert_eq!(
@@ -398,14 +399,14 @@ fn test_out_of_order_response_preserves_latest_observation() {
         AccountId::from("BINANCE-PAPI-001"),
         ObservationSource::Account,
     );
-    slot.record_response(ACCOUNT, 2, UnixNanos::from(100), start)
+    slot.record_response(ACCOUNT, 2, UnixNanos::from(100), start, start)
         .unwrap();
     assert!(
-        slot.record_response(ACCOUNT, 1, UnixNanos::from(200), start)
+        slot.record_response(ACCOUNT, 1, UnixNanos::from(200), start, start)
             .is_err()
     );
     assert!(
-        slot.record_response(ACCOUNT, 2, UnixNanos::from(200), start)
+        slot.record_response(ACCOUNT, 2, UnixNanos::from(200), start, start)
             .is_err()
     );
     assert!(
@@ -413,6 +414,7 @@ fn test_out_of_order_response_preserves_latest_observation() {
             ACCOUNT,
             3,
             UnixNanos::from(200),
+            start - Duration::from_secs(1),
             start - Duration::from_secs(1)
         )
         .is_err()
@@ -431,7 +433,8 @@ fn test_observation_serialization_preserves_provenance_and_raw_body() {
         AccountId::from("BINANCE-PAPI-002"),
         ObservationSource::Account,
     );
-    slot.record_response(&body, 42, UnixNanos::from(123), Instant::now())
+    let now = Instant::now();
+    slot.record_response(&body, 42, UnixNanos::from(123), now, now)
         .unwrap();
     let observation = slot.last_response().unwrap();
     assert_eq!(observation.source.endpoint(), "/papi/v1/account");
@@ -453,11 +456,11 @@ fn test_oversized_response_preserves_previous_observation() {
         AccountId::from("BINANCE-PAPI-001"),
         ObservationSource::Account,
     );
-    slot.record_response(ACCOUNT, 1, UnixNanos::from(100), start)
+    slot.record_response(ACCOUNT, 1, UnixNanos::from(100), start, start)
         .unwrap();
     let oversized = " ".repeat(MAX_RESPONSE_BYTES + 1);
     assert!(
-        slot.record_response(&oversized, 2, UnixNanos::from(200), start)
+        slot.record_response(&oversized, 2, UnixNanos::from(200), start, start)
             .is_err()
     );
     assert_eq!(slot.last_response().unwrap().generation, 1);
@@ -465,4 +468,81 @@ fn test_oversized_response_preserves_previous_observation() {
         slot.receipt_status(start, Duration::from_secs(1)),
         ReceiptStatus::Failed
     );
+}
+
+#[rstest]
+fn test_request_timing_and_refresh_lifecycle_preserve_diagnostic_values() {
+    let requested = Instant::now();
+    let received = requested + Duration::from_millis(25);
+    let mut slot = ObservationSlot::new(
+        AccountId::from("BINANCE-PAPI-001"),
+        ObservationSource::Account,
+    );
+    let missing = slot.timing(requested);
+    assert_eq!(missing.receipt_age_ns, None);
+    assert_eq!(missing.collection_span_ns, None);
+    slot.record_response(ACCOUNT, 1, UnixNanos::from(100), requested, received)
+        .unwrap();
+    let initial = slot.timing(received);
+    assert_eq!(initial.receipt_age_ns, Some(0));
+    assert_eq!(initial.collection_span_ns, Some(25_000_000));
+    let later = slot.timing(received + Duration::from_secs(2));
+    assert_eq!(later.receipt_age_ns, Some(2_000_000_000));
+    assert_eq!(later.collection_span_ns, initial.collection_span_ns);
+    assert_eq!(slot.timing(requested).receipt_age_ns, None);
+
+    slot.record_refresh_started();
+    assert_eq!(
+        slot.receipt_status(received, Duration::from_secs(1)),
+        ReceiptStatus::Refreshing
+    );
+    slot.record_canceled();
+    assert_eq!(
+        slot.receipt_status(received, Duration::from_secs(1)),
+        ReceiptStatus::Canceled
+    );
+    assert_eq!(slot.last_response().unwrap().generation, 1);
+    assert_eq!(slot.timing(received).collection_span_ns, Some(25_000_000));
+    slot.record_response(ACCOUNT, 3, UnixNanos::from(90), received, received)
+        .unwrap();
+    assert_eq!(
+        slot.receipt_status(received, Duration::from_secs(1)),
+        ReceiptStatus::Recent
+    );
+    assert!(slot.failure().is_none());
+    assert_eq!(slot.timing(received).collection_span_ns, Some(0));
+}
+
+#[rstest]
+#[case(10, 9, "PAPI observation receipt precedes its request")]
+#[case(-1, 11, "Out-of-order PAPI observation")]
+fn test_invalid_request_timing_atomically_rejects_response(
+    #[case] request_offset_ms: i64,
+    #[case] receipt_offset_ms: u64,
+    #[case] expected: &str,
+) {
+    let requested = Instant::now();
+    let received = requested + Duration::from_millis(10);
+    let mut slot = ObservationSlot::new(
+        AccountId::from("BINANCE-PAPI-001"),
+        ObservationSource::Account,
+    );
+    slot.record_response(ACCOUNT, 1, UnixNanos::from(100), requested, received)
+        .unwrap();
+    let next_request = if request_offset_ms < 0 {
+        requested - Duration::from_millis(request_offset_ms.unsigned_abs())
+    } else {
+        requested + Duration::from_millis(request_offset_ms.unsigned_abs())
+    };
+    let next_receipt = requested + Duration::from_millis(receipt_offset_ms);
+    let e = slot
+        .record_response(ACCOUNT, 2, UnixNanos::from(200), next_request, next_receipt)
+        .unwrap_err();
+    assert_eq!(e.to_string(), expected);
+    assert_eq!(slot.last_response().unwrap().generation, 1);
+    assert_eq!(slot.timing(received).collection_span_ns, Some(10_000_000));
+    assert_eq!(slot.timing(received).receipt_age_ns, Some(0));
+    let failure = serde_json::to_value(slot.failure()).unwrap();
+    assert_eq!(failure["state"], "failed");
+    assert_eq!(failure["reason"], expected);
 }

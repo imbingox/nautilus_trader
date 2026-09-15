@@ -19,6 +19,7 @@
 //! Historical reports remain incomplete until authenticated venue semantics are verified.
 
 mod config;
+mod projection;
 
 #[cfg(test)]
 mod engine_tests;
@@ -42,7 +43,10 @@ pub use self::config::BinancePapiReadOnlyConfig;
 pub use crate::http::BinancePapiResponseMetadata;
 use crate::{
     http::{PapiHttpClient, RequestBudget, RequestGate, error::PapiHttpError, query::PapiRequest},
-    observations::{AccountObservation, ObservationSlot, ObservationSource, ReceiptStatus},
+    observations::{
+        AccountObservation, ObservationFailure, ObservationSlot, ObservationSource,
+        ObservationTiming, ReceiptStatus,
+    },
     reports::{InstrumentScope, ReportCollector, history::HistoryWindow},
 };
 
@@ -173,6 +177,10 @@ impl BinancePapiReadOnlyClient {
     /// Cancels outstanding and future operations on this client and all its clones.
     pub fn cancel(&self) {
         self.inner.cancel.cancel();
+
+        for stored in &mut self.inner.observations.lock().sources {
+            stored.slot.record_canceled();
+        }
     }
 
     /// Returns whether the shared IP gate has been latched closed by a throttle or ban.
@@ -181,10 +189,10 @@ impl BinancePapiReadOnlyClient {
         self.inner.http.is_throttled()
     }
 
-    /// Refreshes balance, PM summary, and UM V1/V2 observations without projecting balances.
+    /// Refreshes account, product-scope, and UM V1/V2 observations for later projection.
     ///
     /// Successful sources are retained independently; a failure preserves that source's prior
-    /// response and marks it failed. All four sources share one generation and operation budget.
+    /// response and marks it failed. All nine sources share one generation and operation budget.
     ///
     /// # Errors
     ///
@@ -202,17 +210,26 @@ impl BinancePapiReadOnlyClient {
         };
         let generation = {
             let mut observations = self.inner.observations.lock();
+
+            if self.inner.cancel.is_cancelled() {
+                return Err(PapiHttpError::Canceled.into());
+            }
+
             observations.generation = observations
                 .generation
                 .checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("PAPI observation generation overflow"))?;
 
-            // An interrupted refresh must not leave unread sources looking successful
+            // Retained diagnostic values are unavailable while their replacement is pending
             for stored in &mut observations.sources {
-                stored.slot.record_failure();
+                stored.slot.record_refresh_started();
             }
 
             observations.generation
+        };
+        let mut refresh = ObservationRefresh {
+            observations: &self.inner.observations,
+            completed: false,
         };
         let mut failures = Vec::new();
 
@@ -231,10 +248,16 @@ impl BinancePapiReadOnlyClient {
 
             let result = match response {
                 Ok(response) => {
+                    if self.inner.cancel.is_cancelled() {
+                        stored.slot.record_canceled();
+                        return Err(PapiHttpError::Canceled.into());
+                    }
+
                     let result = stored.slot.record_response(
                         response.body.get(),
                         generation,
                         response.metadata.ts_received,
+                        response.requested_at,
                         response.received_at,
                     );
 
@@ -245,7 +268,12 @@ impl BinancePapiReadOnlyClient {
                     result
                 }
                 Err(e) => {
-                    stored.slot.record_failure();
+                    if e == PapiHttpError::Canceled {
+                        stored.slot.record_canceled();
+                        return Err(e.into());
+                    }
+
+                    stored.slot.record_failure(e.to_string());
                     Err(e.into())
                 }
             };
@@ -255,12 +283,27 @@ impl BinancePapiReadOnlyClient {
             }
         }
 
+        if let Err(e) = budget.check() {
+            let mut observations = self.inner.observations.lock();
+
+            if self.inner.cancel.is_cancelled() {
+                return Err(PapiHttpError::Canceled.into());
+            }
+
+            for stored in &mut observations.sources {
+                stored.slot.record_failure(e.to_string());
+            }
+
+            refresh.completed = true;
+            return Err(e.into());
+        }
+
+        refresh.completed = true;
         anyhow::ensure!(
             failures.is_empty(),
             "PAPI observation refresh failed: {}",
             failures.join("; ")
         );
-        budget.check()?;
         Ok(())
     }
 
@@ -271,21 +314,72 @@ impl BinancePapiReadOnlyClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the observations cannot be serialized.
+    /// Returns an error for a zero receipt-age bound or if serialization fails.
     pub fn account_observations_json(&self, max_receipt_age: Duration) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            !max_receipt_age.is_zero(),
+            "PAPI maximum receipt age must be positive"
+        );
         let observations = self.inner.observations.lock();
         let now = Instant::now();
+        let canceled = ObservationFailure::Canceled;
+        let is_canceled = self.inner.cancel.is_cancelled();
         let views: Vec<_> = observation_sources()
             .iter()
             .zip(&observations.sources)
             .map(|(source, stored)| ObservationView {
                 endpoint: source.endpoint(),
-                receipt_status: stored.slot.receipt_status(now, max_receipt_age),
+                receipt_status: if is_canceled {
+                    ReceiptStatus::Canceled
+                } else {
+                    stored.slot.receipt_status(now, max_receipt_age)
+                },
+                failure: if is_canceled {
+                    Some(&canceled)
+                } else {
+                    stored.slot.failure()
+                },
+                timing: stored.slot.timing(now),
                 observation: stored.slot.last_response(),
                 metadata: stored.metadata.as_ref(),
             })
             .collect();
         Ok(serde_json::to_string(&views)?)
+    }
+
+    /// Projects retained observations into independent wallet and PM risk results.
+    ///
+    /// This is a read-only diagnostic snapshot. It neither updates the cache nor authorizes
+    /// trading. A failed projection contains reasons and never publishes a partial account state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero freshness bounds or if serialization fails.
+    pub fn account_snapshot_json(
+        &self,
+        max_receipt_age: Duration,
+        max_collection_span: Duration,
+    ) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            !max_receipt_age.is_zero(),
+            "PAPI maximum receipt age must be positive"
+        );
+        anyhow::ensure!(
+            !max_collection_span.is_zero(),
+            "PAPI maximum collection span must be positive"
+        );
+        let observations = self.inner.observations.lock();
+        let context = projection::AccountProjectionContext {
+            account_id: self.inner.account_id,
+            scope: &self.inner.scope,
+            ts_init: self.inner.clock.get_time_ns(),
+            now: Instant::now(),
+            max_receipt_age,
+            max_collection_span,
+            canceled: self.inner.cancel.is_cancelled(),
+        };
+        let snapshot = projection::project_account_snapshot(&observations.sources, &context);
+        Ok(serde_json::to_string(&snapshot)?)
     }
 
     /// Queries the account's order quota as unprojected JSON evidence.
@@ -427,24 +521,47 @@ struct AccountObservations {
     sources: Vec<StoredObservation>,
 }
 
-struct StoredObservation {
+pub(super) struct StoredObservation {
     slot: ObservationSlot,
     metadata: Option<BinancePapiResponseMetadata>,
+}
+
+// Dropping an in-progress future must invalidate the refresh, not restore prior freshness
+struct ObservationRefresh<'a> {
+    observations: &'a Mutex<AccountObservations>,
+    completed: bool,
+}
+
+impl Drop for ObservationRefresh<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            for stored in &mut self.observations.lock().sources {
+                stored.slot.record_canceled();
+            }
+        }
+    }
 }
 
 #[derive(Serialize)]
 struct ObservationView<'a> {
     endpoint: &'static str,
     receipt_status: ReceiptStatus,
+    failure: Option<&'a ObservationFailure>,
+    timing: ObservationTiming,
     observation: Option<&'a AccountObservation>,
     metadata: Option<&'a BinancePapiResponseMetadata>,
 }
 
-fn observation_sources() -> [ObservationSource; 4] {
+fn observation_sources() -> [ObservationSource; 9] {
     [
         ObservationSource::Balance { asset: None },
         ObservationSource::Account,
         ObservationSource::UmAccountV1,
         ObservationSource::UmAccountV2,
+        ObservationSource::UmOpenOrders,
+        ObservationSource::UmOpenAlgos,
+        ObservationSource::CmPositions,
+        ObservationSource::CmOpenOrders,
+        ObservationSource::MarginOpenOrders,
     ]
 }

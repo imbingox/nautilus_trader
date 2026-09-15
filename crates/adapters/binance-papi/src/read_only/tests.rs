@@ -35,14 +35,21 @@ use crate::{
     testing::{self, MockServer, Reply, TRADE_TIME, ms},
 };
 
+#[rstest]
+#[case("/papi/v1/balance", 10, 0)]
+#[case("/papi/v2/um/account", 13, 3)]
 #[tokio::test]
-async fn test_dropped_refresh_marks_every_unread_source_failed() {
+async fn test_dropped_refresh_marks_every_source_canceled(
+    #[case] delayed_endpoint: &'static str,
+    #[case] request_count: usize,
+    #[case] completed_sources: usize,
+) {
     let delay = Arc::new(AtomicBool::new(false));
     let trigger = Arc::clone(&delay);
     let server = MockServer::new(move |request| {
         let mut reply = testing::quiet(request);
 
-        if request.path == "/papi/v1/balance" && trigger.load(Ordering::Acquire) {
+        if request.path == delayed_endpoint && trigger.load(Ordering::Acquire) {
             reply.delay = Duration::from_secs(10);
         }
 
@@ -56,7 +63,40 @@ async fn test_dropped_refresh_marks_every_unread_source_failed() {
 
     // This task must stay on the test runtime with the mock server
     let task = tokio::spawn(async move { refreshing.refresh_account_observations().await }); // tokio-import-ok
-    server.wait_for_requests(5).await;
+    server.wait_for_requests(request_count).await;
+    let pending: Value = serde_json::from_str(
+        &client
+            .account_observations_json(Duration::from_secs(30))
+            .unwrap(),
+    )
+    .unwrap();
+
+    for (index, source) in pending.as_array().unwrap().iter().enumerate() {
+        assert_eq!(
+            source["receipt_status"],
+            if index < completed_sources {
+                "recent"
+            } else {
+                "refreshing"
+            }
+        );
+    }
+    let pending_snapshot: Value = serde_json::from_str(
+        &client
+            .account_snapshot_json(Duration::from_secs(30), Duration::from_secs(30))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(pending_snapshot["wallet"]["status"], "refreshing");
+    assert_eq!(
+        pending_snapshot["portfolio_margin_risk"]["status"],
+        if completed_sources >= 2 {
+            "available"
+        } else {
+            "refreshing"
+        }
+    );
+
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     let retained: Value = serde_json::from_str(
@@ -66,9 +106,13 @@ async fn test_dropped_refresh_marks_every_unread_source_failed() {
     )
     .unwrap();
 
-    for source in retained.as_array().unwrap() {
-        assert_eq!(source["receipt_status"], "failed");
-        assert_eq!(source["observation"]["generation"], 1);
+    for (index, source) in retained.as_array().unwrap().iter().enumerate() {
+        assert_eq!(source["receipt_status"], "canceled");
+        assert_eq!(source["failure"]["state"], "canceled");
+        assert_eq!(
+            source["observation"]["generation"],
+            if index < completed_sources { 2 } else { 1 }
+        );
     }
 
     delay.store(false, Ordering::Release);
@@ -82,6 +126,22 @@ async fn test_dropped_refresh_marks_every_unread_source_failed() {
     assert!(recovered.as_array().unwrap().iter().all(|source| {
         source["receipt_status"] == "recent" && source["observation"]["generation"] == 3
     }));
+}
+
+#[rstest]
+fn test_account_snapshot_reports_missing_sources_before_refresh() {
+    let config = testing::config("https://papi.binance.com");
+    let client =
+        BinancePapiReadOnlyClient::new(&config, vec![testing::instrument("BTCUSDT")]).unwrap();
+    let snapshot: Value = serde_json::from_str(
+        &client
+            .account_snapshot_json(Duration::from_secs(30), Duration::from_secs(30))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(snapshot["wallet"]["status"], "missing");
+    assert_eq!(snapshot["portfolio_margin_risk"]["status"], "missing");
+    assert!(snapshot["wallet"]["value"].is_null());
 }
 
 #[tokio::test]
@@ -148,12 +208,564 @@ async fn test_partial_account_refresh_retains_failed_source_and_updates_other_so
     )
     .unwrap();
     assert_eq!(next[1]["receipt_status"], "failed");
+    assert_eq!(next[1]["failure"]["state"], "failed");
+    assert_eq!(
+        next[1]["failure"]["reason"],
+        "PAPI server failure (status 503)"
+    );
     assert_eq!(next[1]["observation"], first[1]["observation"]);
+    assert_eq!(next[1]["metadata"], first[1]["metadata"]);
+    assert_eq!(
+        next[1]["timing"]["collection_span_ns"],
+        first[1]["timing"]["collection_span_ns"]
+    );
     assert_eq!(next[0]["observation"]["generation"], 2);
     assert_eq!(next[0]["receipt_status"], "recent");
+    assert!(next[0]["failure"].is_null());
     assert_eq!(next[2]["observation"]["generation"], 2);
     assert_eq!(next[3]["observation"]["generation"], 2);
     assert_eq!(next[3]["endpoint"], "/papi/v2/um/account");
+}
+
+#[tokio::test]
+async fn test_account_snapshot_separates_wallet_and_pm_risk_validity() {
+    let server = MockServer::new(testing::quiet).await;
+    let client = testing::client(&server, &["BTCUSDT"]);
+    client.refresh_account_observations().await.unwrap();
+    let snapshot: Value = serde_json::from_str(
+        &client
+            .account_snapshot_json(Duration::from_secs(30), Duration::from_secs(30))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(snapshot["account_id"], "BINANCE-PAPI-001");
+    assert_eq!(snapshot["trading_authorized"], false);
+    assert_eq!(snapshot["wallet"]["status"], "unsupported");
+    assert!(snapshot["wallet"]["value"].is_null());
+    assert!(
+        snapshot["wallet"]["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue.as_str().unwrap().contains("borrowing or interest"))
+    );
+    let risk = &snapshot["portfolio_margin_risk"];
+    assert_eq!(risk["status"], "available");
+    assert!(risk["issues"].as_array().unwrap().is_empty());
+    assert_eq!(risk["value"]["endpoint"], "/papi/v1/account");
+    assert_eq!(risk["value"]["generation"], 1);
+    assert_eq!(risk["value"]["status_recognized"], false);
+    assert_eq!(risk["value"]["units"]["account_equity"], "USD");
+    assert_eq!(
+        risk["value"]["units"]["account_initial_margin"],
+        "unverified"
+    );
+    assert_eq!(
+        risk["value"]["account_summary"]["accountEquity"]["value"],
+        "1234.12345678"
+    );
+}
+
+#[tokio::test]
+async fn test_account_snapshot_publishes_complete_totals_only_state() {
+    let server = MockServer::new(|request| {
+        if request.path == "/papi/v1/balance" {
+            Reply::json(&testing::supported_balances())
+        } else {
+            testing::quiet(request)
+        }
+    })
+    .await;
+    let client = testing::client(&server, &["BTCUSDT"]);
+    client.refresh_account_observations().await.unwrap();
+    let snapshot: Value = serde_json::from_str(
+        &client
+            .account_snapshot_json(Duration::from_secs(30), Duration::from_secs(30))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(snapshot["wallet"]["status"], "available");
+    assert!(snapshot["wallet"]["issues"].as_array().unwrap().is_empty());
+    assert_eq!(snapshot["wallet"]["sources"].as_array().unwrap().len(), 7);
+    assert!(snapshot["wallet"]["collection_span_ns"].as_u64().is_some());
+
+    for source in snapshot["wallet"]["sources"].as_array().unwrap() {
+        assert_eq!(source["receipt_status"], "recent");
+        assert_eq!(source["generation"], 1);
+        assert_eq!(source["response_metadata"]["status"], 200);
+        assert!(
+            source["response_metadata"]["ts_requested"]
+                .as_u64()
+                .is_some()
+        );
+        assert!(
+            source["response_metadata"]["ts_received"]
+                .as_u64()
+                .is_some()
+        );
+    }
+
+    let state = &snapshot["wallet"]["value"];
+    assert_eq!(state["account_id"], "BINANCE-PAPI-001");
+    assert_eq!(state["account_type"], "MARGIN");
+    assert_eq!(state["base_currency"], Value::Null);
+    assert_eq!(state["balances"], json!([]));
+    assert_eq!(state["margins"], json!([]));
+    assert_eq!(state["is_reported"], true);
+    assert_eq!(
+        state["total_only_balances"],
+        json!(["1.00000000 BTC", "-10.00000000 USDT"])
+    );
+}
+
+#[tokio::test]
+async fn test_account_snapshot_supports_united_stables_balance() {
+    let server = MockServer::new(|request| {
+        if request.path == "/papi/v1/balance" {
+            let mut row = testing::supported_balances().as_array().unwrap()[0].clone();
+            row["asset"] = json!("U");
+            Reply::json(&json!([row]))
+        } else {
+            testing::quiet(request)
+        }
+    })
+    .await;
+    let client = testing::client(&server, &["BTCUSDT"]);
+    client.refresh_account_observations().await.unwrap();
+    let snapshot: Value = serde_json::from_str(
+        &client
+            .account_snapshot_json(Duration::from_secs(30), Duration::from_secs(30))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(snapshot["wallet"]["status"], "available");
+    assert_eq!(
+        snapshot["wallet"]["value"]["total_only_balances"],
+        json!(["1.00000000 U"])
+    );
+}
+
+#[rstest]
+#[case("/papi/v1/cm/positionRisk", json!([{"pair":"BTCUSD","positionAmt":"1"}]), "CM exposure")]
+#[case("/papi/v1/cm/openOrders", json!([{"symbol":"BTCUSD_PERP"}]), "CM open orders")]
+#[case("/papi/v1/margin/openOrders", json!([{"symbol":"BTCUSDT"}]), "cross-margin open orders")]
+#[case("/papi/v1/um/openOrders", json!([{"symbol":"ETHUSDT"}]), "in-scope instrument")]
+#[tokio::test]
+async fn test_account_snapshot_rejects_unsupported_product_scope(
+    #[case] endpoint: &'static str,
+    #[case] body: Value,
+    #[case] expected: &str,
+) {
+    let server = MockServer::new(move |request| {
+        if request.path == "/papi/v1/balance" {
+            Reply::json(&testing::supported_balances())
+        } else if request.path == endpoint {
+            Reply::json(&body)
+        } else {
+            testing::quiet(request)
+        }
+    })
+    .await;
+    let client = testing::client(&server, &["BTCUSDT"]);
+    client.refresh_account_observations().await.unwrap();
+    let snapshot: Value = serde_json::from_str(
+        &client
+            .account_snapshot_json(Duration::from_secs(30), Duration::from_secs(30))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(snapshot["wallet"]["status"], "unsupported");
+    assert!(snapshot["wallet"]["value"].is_null());
+    assert!(
+        snapshot["wallet"]["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue.as_str().unwrap().contains(expected))
+    );
+}
+
+#[rstest]
+#[case("borrowed_missing", "Missing PAPI field crossMarginBorrowed")]
+#[case("borrowed_null", "Null PAPI field crossMarginBorrowed")]
+#[case("interest_invalid", "Invalid PAPI field crossMarginInterest")]
+#[case("total_missing", "Missing PAPI field totalWalletBalance")]
+#[case("total_null", "Null PAPI field totalWalletBalance")]
+#[case("total_invalid", "Invalid PAPI field totalWalletBalance")]
+#[case("unknown_currency", "Unknown PAPI asset currency")]
+#[case("inexact_total", "loses precision")]
+#[tokio::test]
+async fn test_account_snapshot_rejects_unavailable_or_inexact_wallet_fields(
+    #[case] scenario: &'static str,
+    #[case] expected: &'static str,
+) {
+    let server = MockServer::new(move |request| {
+        if request.path != "/papi/v1/balance" {
+            return testing::quiet(request);
+        }
+
+        let mut rows = testing::supported_balances();
+        let row = &mut rows.as_array_mut().unwrap()[0];
+
+        match scenario {
+            "borrowed_missing" => {
+                row.as_object_mut().unwrap().remove("crossMarginBorrowed");
+            }
+            "borrowed_null" => row["crossMarginBorrowed"] = Value::Null,
+            "interest_invalid" => row["crossMarginInterest"] = json!(false),
+            "total_missing" => {
+                row.as_object_mut().unwrap().remove("totalWalletBalance");
+            }
+            "total_null" => row["totalWalletBalance"] = Value::Null,
+            "total_invalid" => row["totalWalletBalance"] = json!(1),
+            "unknown_currency" => row["asset"] = json!("NOT_REGISTERED_ASSET"),
+            "inexact_total" => row["totalWalletBalance"] = json!("1.000000001"),
+            _ => unreachable!(),
+        }
+
+        Reply::json(&rows)
+    })
+    .await;
+    let client = testing::client(&server, &["BTCUSDT"]);
+    client.refresh_account_observations().await.unwrap();
+    let snapshot: Value = serde_json::from_str(
+        &client
+            .account_snapshot_json(Duration::from_secs(30), Duration::from_secs(30))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(snapshot["wallet"]["status"], "unsupported");
+    assert!(snapshot["wallet"]["value"].is_null());
+    assert!(
+        snapshot["wallet"]["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue.as_str().unwrap().contains(expected)),
+        "{scenario}"
+    );
+}
+
+#[rstest]
+#[case(
+    "/papi/v2/um/account",
+    json!({"assets":[],"positions":[{"symbol":"ETHUSDT","positionSide":"BOTH","positionAmt":"1"}]}),
+    "in-scope instrument"
+)]
+#[case(
+    "/papi/v1/cm/positionRisk",
+    json!([{"positionAmt":"0"}]),
+    "no valid pair or symbol"
+)]
+#[case(
+    "/papi/v1/cm/positionRisk",
+    json!([{"pair":"BTC USD","positionAmt":"0"}]),
+    "invalid pair or symbol"
+)]
+#[case(
+    "/papi/v1/cm/positionRisk",
+    json!([{"pair":"BTCUSD","positionAmt":0}]),
+    "Invalid PAPI field positionAmt"
+)]
+#[tokio::test]
+async fn test_account_snapshot_rejects_ambiguous_scope_rows(
+    #[case] endpoint: &'static str,
+    #[case] body: Value,
+    #[case] expected: &'static str,
+) {
+    let server = MockServer::new(move |request| {
+        if request.path == "/papi/v1/balance" {
+            Reply::json(&testing::supported_balances())
+        } else if request.path == endpoint {
+            Reply::json(&body)
+        } else {
+            testing::quiet(request)
+        }
+    })
+    .await;
+    let client = testing::client(&server, &["BTCUSDT"]);
+    client.refresh_account_observations().await.unwrap();
+    let snapshot: Value = serde_json::from_str(
+        &client
+            .account_snapshot_json(Duration::from_secs(30), Duration::from_secs(30))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(snapshot["wallet"]["status"], "unsupported");
+    assert!(snapshot["wallet"]["value"].is_null());
+    assert!(
+        snapshot["wallet"]["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue.as_str().unwrap().contains(expected))
+    );
+}
+
+#[tokio::test]
+async fn test_account_snapshot_preserves_positive_negative_and_zero_totals() {
+    let server = MockServer::new(|request| {
+        if request.path != "/papi/v1/balance" {
+            return testing::quiet(request);
+        }
+
+        let mut rows = testing::supported_balances();
+        let mut zero = rows.as_array().unwrap()[0].clone();
+        zero["asset"] = json!("ETH");
+        zero["totalWalletBalance"] = json!("0.00000000");
+        zero["crossMarginAsset"] = json!("0.00000000");
+        rows.as_array_mut().unwrap().push(zero);
+        Reply::json(&rows)
+    })
+    .await;
+    let client = testing::client(&server, &["BTCUSDT"]);
+    client.refresh_account_observations().await.unwrap();
+    let snapshot: Value = serde_json::from_str(
+        &client
+            .account_snapshot_json(Duration::from_secs(30), Duration::from_secs(30))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(snapshot["wallet"]["status"], "available");
+    assert_eq!(
+        snapshot["wallet"]["value"]["total_only_balances"],
+        json!(["1.00000000 BTC", "-10.00000000 USDT", "0.00000000 ETH"])
+    );
+}
+
+#[rstest]
+#[case("/papi/v1/account", "available", "failed")]
+#[case("/papi/v1/balance", "failed", "available")]
+#[tokio::test]
+async fn test_wallet_and_risk_source_failures_are_independent(
+    #[case] failed_endpoint: &'static str,
+    #[case] wallet_status: &'static str,
+    #[case] risk_status: &'static str,
+) {
+    let server = MockServer::new(move |request| {
+        if request.path == failed_endpoint {
+            Reply::raw(503, "{}")
+        } else if request.path == "/papi/v1/balance" {
+            Reply::json(&testing::supported_balances())
+        } else {
+            testing::quiet(request)
+        }
+    })
+    .await;
+    let client = testing::client(&server, &["BTCUSDT"]);
+    assert!(client.refresh_account_observations().await.is_err());
+    let snapshot: Value = serde_json::from_str(
+        &client
+            .account_snapshot_json(Duration::from_secs(30), Duration::from_secs(30))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(snapshot["wallet"]["status"], wallet_status);
+    assert_eq!(snapshot["portfolio_margin_risk"]["status"], risk_status);
+    assert_eq!(
+        snapshot["wallet"]["value"].is_object(),
+        wallet_status == "available"
+    );
+    assert_eq!(
+        snapshot["portfolio_margin_risk"]["value"].is_object(),
+        risk_status == "available"
+    );
+}
+
+#[tokio::test]
+async fn test_snapshot_marks_stale_canceled_and_overlong_collections() {
+    let server = MockServer::new(|request| {
+        let mut reply = if request.path == "/papi/v1/balance" {
+            Reply::json(&testing::supported_balances())
+        } else {
+            testing::quiet(request)
+        };
+
+        if request.path == "/papi/v1/balance" {
+            reply.delay = Duration::from_millis(2);
+        }
+        reply
+    })
+    .await;
+    let client = testing::client(&server, &["BTCUSDT"]);
+    client.refresh_account_observations().await.unwrap();
+
+    let overlong: Value = serde_json::from_str(
+        &client
+            .account_snapshot_json(Duration::from_secs(30), Duration::from_nanos(1))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(overlong["wallet"]["status"], "inconsistent");
+    assert!(overlong["wallet"]["value"].is_null());
+
+    std::thread::sleep(Duration::from_millis(1));
+    let stale: Value = serde_json::from_str(
+        &client
+            .account_snapshot_json(Duration::from_nanos(1), Duration::from_secs(30))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stale["wallet"]["status"], "stale");
+    assert_eq!(stale["portfolio_margin_risk"]["status"], "stale");
+
+    client.cancel();
+    let canceled: Value = serde_json::from_str(
+        &client
+            .account_snapshot_json(Duration::from_secs(30), Duration::from_secs(30))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(canceled["wallet"]["status"], "canceled");
+    assert_eq!(canceled["portfolio_margin_risk"]["status"], "canceled");
+    assert!(canceled["wallet"]["value"].is_null());
+}
+
+#[tokio::test]
+async fn test_snapshot_detects_retained_sources_from_different_generations() {
+    let fail = Arc::new(AtomicBool::new(false));
+    let trigger = Arc::clone(&fail);
+    let server = MockServer::new(move |request| {
+        if request.path == "/papi/v1/balance" && trigger.load(Ordering::Acquire) {
+            Reply::raw(503, "{}")
+        } else if request.path == "/papi/v1/balance" {
+            Reply::json(&testing::supported_balances())
+        } else {
+            testing::quiet(request)
+        }
+    })
+    .await;
+    let client = testing::client(&server, &["BTCUSDT"]);
+    client.refresh_account_observations().await.unwrap();
+    fail.store(true, Ordering::Release);
+    assert!(client.refresh_account_observations().await.is_err());
+    let snapshot: Value = serde_json::from_str(
+        &client
+            .account_snapshot_json(Duration::from_secs(30), Duration::from_secs(30))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(snapshot["wallet"]["status"], "failed");
+    assert!(
+        snapshot["wallet"]["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue.as_str().unwrap().contains("different generations"))
+    );
+    assert!(snapshot["wallet"]["value"].is_null());
+}
+
+#[tokio::test]
+async fn test_risk_values_change_without_changing_wallet_totals() {
+    let changed = Arc::new(AtomicBool::new(false));
+    let trigger = Arc::clone(&changed);
+    let server = MockServer::new(move |request| {
+        if request.path == "/papi/v1/balance" {
+            Reply::json(&testing::supported_balances())
+        } else if request.path == "/papi/v1/account" && trigger.load(Ordering::Acquire) {
+            let mut summary: Value =
+                serde_json::from_str(include_str!("../../test_data/observations/account.json"))
+                    .unwrap();
+            summary["accountEquity"] = json!("2234.12345678");
+            Reply::json(&summary)
+        } else {
+            testing::quiet(request)
+        }
+    })
+    .await;
+    let client = testing::client(&server, &["BTCUSDT"]);
+    client.refresh_account_observations().await.unwrap();
+    let before: Value = serde_json::from_str(
+        &client
+            .account_snapshot_json(Duration::from_secs(30), Duration::from_secs(30))
+            .unwrap(),
+    )
+    .unwrap();
+    changed.store(true, Ordering::Release);
+    client.refresh_account_observations().await.unwrap();
+    let after: Value = serde_json::from_str(
+        &client
+            .account_snapshot_json(Duration::from_secs(30), Duration::from_secs(30))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        before["wallet"]["value"]["total_only_balances"],
+        after["wallet"]["value"]["total_only_balances"]
+    );
+    assert_ne!(
+        before["portfolio_margin_risk"]["value"]["account_summary"]["accountEquity"],
+        after["portfolio_margin_risk"]["value"]["account_summary"]["accountEquity"]
+    );
+    assert_eq!(after["portfolio_margin_risk"]["value"]["generation"], 2);
+}
+
+#[rstest]
+#[case(Duration::ZERO, Duration::from_secs(1), "receipt age")]
+#[case(Duration::from_secs(1), Duration::ZERO, "collection span")]
+fn test_account_snapshot_requires_positive_bounds(
+    #[case] age: Duration,
+    #[case] span: Duration,
+    #[case] expected: &str,
+) {
+    let config = testing::config("https://papi.binance.com");
+    let client =
+        BinancePapiReadOnlyClient::new(&config, vec![testing::instrument("BTCUSDT")]).unwrap();
+    let e = client.account_snapshot_json(age, span).unwrap_err();
+    assert!(e.to_string().contains(expected));
+}
+
+#[tokio::test]
+async fn test_cancel_invalidates_retained_receipts_and_future_refreshes() {
+    let server = MockServer::new(testing::quiet).await;
+    let client = testing::client(&server, &["BTCUSDT"]);
+    client.refresh_account_observations().await.unwrap();
+    let before: Value = serde_json::from_str(
+        &client
+            .account_observations_json(Duration::from_secs(30))
+            .unwrap(),
+    )
+    .unwrap();
+    client.clone().cancel();
+    let after: Value = serde_json::from_str(
+        &client
+            .account_observations_json(Duration::from_secs(30))
+            .unwrap(),
+    )
+    .unwrap();
+
+    for (prior, canceled) in before
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(after.as_array().unwrap())
+    {
+        assert_eq!(canceled["receipt_status"], "canceled");
+        assert_eq!(canceled["failure"]["state"], "canceled");
+        assert_eq!(canceled["observation"], prior["observation"]);
+        assert_eq!(canceled["metadata"], prior["metadata"]);
+        assert!(canceled["timing"]["receipt_age_ns"].as_u64().is_some());
+        assert!(canceled["timing"]["collection_span_ns"].as_u64().is_some());
+    }
+
+    let e = client.refresh_account_observations().await.unwrap_err();
+    assert_eq!(
+        e.downcast_ref::<PapiHttpError>(),
+        Some(&PapiHttpError::Canceled)
+    );
+    assert_eq!(server.requests().len(), 9);
+}
+
+#[rstest]
+fn test_zero_receipt_age_fails_without_network_access() {
+    let config = testing::config("https://papi.binance.com");
+    let client =
+        BinancePapiReadOnlyClient::new(&config, vec![testing::instrument("BTCUSDT")]).unwrap();
+    let e = client
+        .account_observations_json(Duration::ZERO)
+        .unwrap_err();
+    assert_eq!(e.to_string(), "PAPI maximum receipt age must be positive");
 }
 
 #[rstest]

@@ -36,9 +36,8 @@ impl BettingAccount {
     /// Represents a betting account that stakes on sports betting markets.
     #[new]
     #[pyo3(signature = (event, calculate_account_state))]
-    #[must_use]
-    pub fn py_new(event: AccountState, calculate_account_state: bool) -> Self {
-        Self::new(event, calculate_account_state)
+    pub fn py_new(event: AccountState, calculate_account_state: bool) -> PyResult<Self> {
+        Self::new_checked(event, calculate_account_state).map_err(to_pyvalue_err)
     }
 
     fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {

@@ -3,21 +3,23 @@
 Research date: 2026-09-12. Scope: [issue 3][issue-3], under [issue 1][issue-1], while
 [issue 2][issue-2] implements the construction and Python installation skeleton.
 
-This is a design investigation, not an implementation or a statement of live compatibility.
-Evidence consists of local source inspection and Binance's official documentation. No credentials,
+This is the original design investigation, not a statement of live compatibility. Its evidence
+consists of local source inspection and Binance's official documentation. No credentials,
 authenticated requests, trading operations, or new adapter runtime tests were used for this report.
+Later implementation outcomes are identified explicitly so historical proposals are not mistaken
+for the adapter's current capability.
 
 The later [UM account V2 verification](V2_VERIFICATION.md) records a separate authenticated
 GET comparison on 2026-09-13, its observed coverage and field differences, and its remaining limits.
 The [account mapping verification](ACCOUNT_VERIFICATION.md) adds balance, liability, fee, funding,
 and failure-handling evidence, along with the decision to calculate unrealized PnL from live prices.
 
-## Findings and implementation gates
+## Historical findings and implementation gates
 
-Offline REST wrapping, exact parsing, and reconciliation work can proceed independently of the
-installation skeleton. The selected direction is native asset accounting with separate PM risk
-observations (option A). Its field semantics and risk integration still need validation before
-publishing usable balances or enabling trading.
+Offline REST wrapping, exact parsing, and reconciliation work could proceed independently of the
+installation skeleton. The selected direction was native asset accounting with separate PM risk
+observations (option A). The later implementation publishes only a diagnostic totals-only wallet
+after validating its supported zero-liability scope; PM admission and trading remain unavailable.
 
 | Finding                                                                                                                  | Consequence                                                                                                |
 | ------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
@@ -68,13 +70,13 @@ Read [AccountBalance and MarginBalance](../../model/src/types/balance.rs),
 - A venue-reported account should use `calculate_account_state=false` so local order/position
   accounting does not overwrite its reported balances. This does not implement PM risk rules.
 
-### Field interpretation and proposed treatment
+### Historical field interpretation
 
-The [official account reference][account-api] and SDK models expose the fields below. The
-proposed treatment is an adapter design recommendation; formulas marked unresolved are not
-established by the response examples.
+The [official account reference][account-api] and SDK models expose the fields below. The treatment
+was the design recommendation at the research date; formulas marked unresolved were not established
+by the response examples.
 
-| Source field or group                                                               | Proposed treatment                                                                                         |
+| Source field or group                                                               | Treatment selected for investigation                                                                       |
 | ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
 | `/balance`: `totalWalletBalance`                                                    | Candidate native-asset total, once liability inclusion is verified. Never add its wallet components again. |
 | `crossMarginAsset`, `crossMarginBorrowed`, `crossMarginInterest`, `negativeBalance` | Preserve separately. Verify which deductions are already included before computing a net balance.          |
@@ -99,10 +101,10 @@ observations. Keep one PM account owner and preserve assets, liabilities, and fe
 currencies. Keep PM valuation, margin requirements, and available capacity distinct from those
 asset balances. The single USD valuation-account alternative is not selected.
 
-The intended account projection uses `base_currency=None`. An account-wide USD `MarginBalance` is
-conditional on verified units and exact representation; additional PM observations remain separate.
-Selection of this direction does not establish the native `total/free/locked` formulas or choose
-where the PM order check runs.
+The selected account projection uses `base_currency=None` and totals-only native balances. It does
+not publish an account-wide USD `MarginBalance`; PM observations remain separate and preserve exact
+decimals. The projection deliberately leaves native `free/locked` unavailable and does not provide
+a PM order check.
 
 REST synchronizes wallet balances, position quantities, and `entryPrice`; live prices and
 synchronized positions drive local unrealized PnL. REST unrealized PnL is optional diagnostic data,
@@ -129,8 +131,10 @@ research result is not a trading-ready account. The following constraints still 
   relabel USD as USDT or redefine a global currency to retain extra decimals. Preserve exact
   observations and explicitly resolve any lossy typed projection.
 
-The decision required before account acceptance is a tested mapping or a separately scoped minimal
-core extension. Do not bypass risk checks or duplicate collateral across accounts to make it fit.
+The implementation selected the scoped core extension: `AccountState.total_only_balances`
+represents known native totals while keeping free/locked unavailable. It is restricted to reported
+margin accounts without local account-state calculation. Native risk checks fail closed for
+risk-increasing orders when only totals are available; no PM admission authority is inferred.
 
 ### Option A observation contract
 
@@ -192,8 +196,10 @@ the required evidence; it does not enable trading or claim that either admission
 
 ### Account mapping acceptance cases
 
-Before accepting the option A projection, record the outcome of these cases separately from REST
-connectivity and pagination validation:
+The option A acceptance cases below remain separate from REST connectivity and pagination
+validation. The implementation has offline regressions for its supported and rejected states;
+authenticated evidence remains subject to the explicit limits in
+[ACCOUNT_VERIFICATION.md](ACCOUNT_VERIFICATION.md).
 
 | Case                                                   | Required evidence                                                                                                         |
 | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
@@ -205,9 +211,10 @@ connectivity and pagination validation:
 | Timeout, partial response, or stale snapshot           | Retain previous observations for inspection without treating them as current admission authority.                         |
 | Multiple strategies and settlement currencies          | Later admission tests prove a single shared capacity budget and correct reservation lifecycle.                            |
 
-If a valid native `free/locked` mapping cannot be established, keep that projection unavailable and
-document the minimum model capability required. Choosing option A is not permission to substitute
-cross-Margin free balance, withdrawal capacity, or a synthetic zero for an unknown PM value.
+The implementation does not claim a valid native `free/locked` mapping. It uses the scoped
+totals-only representation and keeps those components unavailable. Choosing option A is not
+permission to substitute cross-Margin free balance, withdrawal capacity, or a synthetic zero for
+an unknown PM value.
 
 ## REST and SDK boundary
 
@@ -217,25 +224,32 @@ All paths below are GET requests. Weights are the documented IP costs, cross-che
 `src/derivatives_trading_portfolio_margin/rest_api/mod.rs`. They are configuration evidence as of
 the research date, not permanent constants guaranteed by Binance.
 
-| Purpose                  | Path                              | SDK method                              | Weight                          |
-| ------------------------ | --------------------------------- | --------------------------------------- | ------------------------------- |
-| Shared asset balances    | `/papi/v1/balance`                | `account_balance`                       | 20                              |
-| PM risk summary          | `/papi/v1/account`                | `account_information`                   | 20                              |
-| UM details               | `/papi/v1/um/account`             | `get_um_account_detail`                 | 5                               |
-| UM details V2            | `/papi/v2/um/account`             | `get_um_account_detail_v2`              | 5                               |
-| Position mode            | `/papi/v1/um/positionSide/dual`   | `get_um_current_position_mode`          | 30                              |
-| UM positions             | `/papi/v1/um/positionRisk`        | `query_um_position_information`         | 5                               |
-| Ordinary open orders     | `/papi/v1/um/openOrders`          | `query_all_current_um_open_orders`      | 1 per symbol; 40 without symbol |
-| Ordinary order lookup    | `/papi/v1/um/order`               | `query_um_order`                        | 1                               |
-| Ordinary history         | `/papi/v1/um/allOrders`           | `query_all_um_orders`                   | 5                               |
-| Fills                    | `/papi/v1/um/userTrades`          | `um_account_trade_list`                 | 5                               |
-| Open algo orders         | `/papi/v1/um/algo/openAlgoOrders` | `query_all_current_um_open_algo_orders` | 1 per symbol; 40 without symbol |
-| Algo history             | `/papi/v1/um/algo/allAlgoOrders`  | `query_um_algo_order_history`           | 5                               |
-| Order quota observations | `/papi/v1/rateLimit/order`        | `query_user_rate_limit`                 | 1                               |
+| Purpose                  | Path                              | SDK method                              | Weight                              |
+| ------------------------ | --------------------------------- | --------------------------------------- | ----------------------------------- |
+| Shared asset balances    | `/papi/v1/balance`                | `account_balance`                       | 20                                  |
+| PM risk summary          | `/papi/v1/account`                | `account_information`                   | 20                                  |
+| UM details               | `/papi/v1/um/account`             | `get_um_account_detail`                 | 5                                   |
+| UM details V2            | `/papi/v2/um/account`             | `get_um_account_detail_v2`              | 5                                   |
+| Position mode            | `/papi/v1/um/positionSide/dual`   | `get_um_current_position_mode`          | 30                                  |
+| UM positions             | `/papi/v1/um/positionRisk`        | `query_um_position_information`         | 5                                   |
+| Ordinary open orders     | `/papi/v1/um/openOrders`          | `query_all_current_um_open_orders`      | 1 per symbol; 40 without symbol     |
+| CM positions             | `/papi/v1/cm/positionRisk`        | `query_cm_position_information`         | 1                                   |
+| CM open orders           | `/papi/v1/cm/openOrders`          | `query_all_current_cm_open_orders`      | 1 per symbol; 40 without symbol     |
+| Margin open orders       | `/papi/v1/margin/openOrders`      | raw GET; see below                      | 5 IP weight; dynamic unscoped count |
+| Ordinary order lookup    | `/papi/v1/um/order`               | `query_um_order`                        | 1                                   |
+| Ordinary history         | `/papi/v1/um/allOrders`           | `query_all_um_orders`                   | 5                                   |
+| Fills                    | `/papi/v1/um/userTrades`          | `um_account_trade_list`                 | 5                                   |
+| Open algo orders         | `/papi/v1/um/algo/openAlgoOrders` | `query_all_current_um_open_algo_orders` | 1 per symbol; 40 without symbol     |
+| Algo history             | `/papi/v1/um/algo/allAlgoOrders`  | `query_um_algo_order_history`           | 5                                   |
+| Order quota observations | `/papi/v1/rateLimit/order`        | `query_user_rate_limit`                 | 1                                   |
 
 See the [account][account-api] and [trade][trade-api] references. Fetching order quota observations
 does not consume a new-order slot or replace IP-weight accounting. Public instrument discovery
-continues through the existing Binance adapter.
+continues through the existing Binance adapter. SDK 69.2.1 incorrectly requires `symbol` for the
+margin open-orders request even though its generated endpoint documentation says omission returns
+all symbols. That documentation assigns IP weight 5 but also says the unscoped request count equals
+the number of currently trading symbols. The wrapper uses the documented IP weight; authenticated
+acceptance must verify the unscoped behavior and observed quota headers before repeated collection.
 
 ### Current documentation corrections
 
@@ -462,11 +476,11 @@ No test should depend on adapter environment variables.
 | Positions               | One-way long/short/flat; hedge-mode rejection or side identity; sparse V2; missing in-scope metadata; failed query never becomes flat.                                  |
 | Engine behavior         | Incomplete history suppresses unsafe inference; failed periodic reads preserve cached state; missing lookup differs from failure; exact fees survive reconciliation.    |
 
-Authenticated acceptance remains outstanding. When a PM account and safe local credential
-configuration are available, use a restricted key to observe only the GET inventory needed for the
-agreed scope. Record endpoint versions, permissions, response shapes, times, quota headers, and
-sanitized results. Obtain evidence for both quiet and active existing account states when available;
-do not create positions, debt, transfers, or orders to manufacture fixtures during read-only work.
+Authenticated acceptance of the supported active, zero-liability projection completed on
+2026-09-15 using a restricted key and GET requests only. The evidence records endpoint versions,
+permissions, response shapes, times, quota headers, and sanitized results. Obtain evidence for both
+quiet and active existing account states when available. Do not create positions, debt, transfers,
+or orders to manufacture fixtures during read-only work.
 Synthetic debt/limit tests do not replace successful authentication or prove live account semantics.
 
 The parent records no usable PAPI testnet and a prior invalid-key 401 probe. This research does not
@@ -488,9 +502,12 @@ independently establish testnet availability, repeat the probe, or count it as s
    feature-disabled dependency regression, `make format`, and `make pre-commit`. Repeat affected
    checks after integration edits. This research document does not satisfy those implementation gates.
 
-The next concrete deliverable is an offline wrapper/parser/report patch following option A. Exact
-account projection and automatic throttling recovery remain unresolved acceptance items. Issue 3
-cannot be closed until the account mapping and authenticated read-only validation are established.
+The option A read-only implementation now includes exact observations, bounded reports, a
+totals-only wallet projection, an independent PM risk view, scope checks, and fail-closed core risk
+behavior. Automatic throttling recovery remains unavailable because SDK 69.2.1 discards error
+headers. The current authenticated validation covers the supported projection and all newly added
+account-wide scope queries; the explicit unsupported and unavailable live cases remain documented
+rather than inferred.
 
 [issue-1]: https://github.com/imbingox/nautilus_trader/issues/1
 [issue-2]: https://github.com/imbingox/nautilus_trader/issues/2

@@ -28,7 +28,7 @@ use thiserror::Error;
 
 use crate::{
     enums::{OrderSide, OrderType, TimeInForce, TrailingOffsetType},
-    identifiers::{ClientId, InstrumentId, OrderListId, PositionId, Venue},
+    identifiers::{AccountId, ClientId, InstrumentId, OrderListId, PositionId, Venue},
     types::{Money, Price, Quantity},
 };
 
@@ -246,6 +246,13 @@ pub enum OrderDeniedReason {
     InitialMarginCalculationFailed {
         /// The underlying calculation error.
         detail: String,
+    },
+
+    /// Native capital checking is unavailable for reported totals-only balances.
+    #[error("NATIVE_CAPITAL_CHECK_UNAVAILABLE: account_id={account_id}")]
+    NativeCapitalCheckUnavailable {
+        /// The account whose free and locked balance components are unavailable.
+        account_id: AccountId,
     },
 
     /// The order initial margin exceeds the account free balance.
@@ -473,6 +480,9 @@ impl OrderDeniedCode {
             }
             Self::InitialMarginCalculationFailed => {
                 "The order initial margin could not be calculated."
+            }
+            Self::NativeCapitalCheckUnavailable => {
+                "Native capital checking is unavailable for reported totals-only balances."
             }
             Self::InitialMarginExceedsFreeBalance => {
                 "The order initial margin exceeds the account free balance."
@@ -919,6 +929,9 @@ mod tests {
             },
             OrderDeniedReason::InitialMarginCalculationFailed {
                 detail: "boom".to_string(),
+            },
+            OrderDeniedReason::NativeCapitalCheckUnavailable {
+                account_id: AccountId::from("BINANCE-001"),
             },
             OrderDeniedReason::InitialMarginExceedsFreeBalance {
                 free_balance: usd(),

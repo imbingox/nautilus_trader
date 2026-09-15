@@ -53,6 +53,101 @@ from nautilus_trader.model import margin_account_from_account_events
 from nautilus_trader.model import wallet_account_from_account_events
 
 
+def test_totals_only_margin_account_reads_switches_and_replay() -> None:
+    """
+    Preserve totals-only balances through reads, representation changes, and replay.
+    """
+    usd = Currency.from_str("USD")
+    total = Money.from_str("19.23 USD")
+    initial = AccountState(
+        account_id=AccountId("BINANCE-PAPI-001"),
+        account_type=AccountType.MARGIN,
+        balances=[],
+        margins=[],
+        is_reported=True,
+        event_id=UUID4(),
+        ts_event=1,
+        ts_init=2,
+        total_only_balances=[total],
+    )
+    account = MarginAccount(initial, calculate_account_state=False)
+
+    assert account.balance_total(usd) == total
+    assert account.balances_total() == {usd: total}
+    assert account.total_only_balances() == {usd: total}
+    assert account.starting_balances() == {usd: total}
+    assert account.currencies() == [usd]
+    assert account.balance(usd) is None
+    assert account.balance_free(usd) is None
+    assert account.balance_locked(usd) is None
+    assert account.balances() == {}
+    assert account.balances_free() == {}
+    assert account.balances_locked() == {}
+
+    balance = AccountBalance(total, Money.from_str("1.23 USD"), Money.from_str("18 USD"))
+    complete = AccountState(
+        account_id=initial.account_id,
+        account_type=AccountType.MARGIN,
+        balances=[balance],
+        margins=[],
+        is_reported=True,
+        event_id=UUID4(),
+        ts_event=3,
+        ts_init=4,
+    )
+    account.apply(complete)
+
+    assert account.balance(usd) == balance
+    assert account.balance_free(usd) == Money.from_str("18 USD")
+    assert account.total_only_balances() == {}
+
+    account.apply(initial)
+    replayed = margin_account_from_account_events(
+        account.to_dict()["events"],
+        calculate_account_state=False,
+    )
+
+    assert account.balance_free(usd) is None
+    assert replayed.total_only_balances() == {usd: total}
+    assert replayed.starting_balances() == {usd: total}
+    assert replayed.to_dict() == account.to_dict()
+
+
+@pytest.mark.parametrize(
+    ("account_class", "calculate_account_state"),
+    [
+        (MarginAccount, True),
+        (CashAccount, True),
+        (CashAccount, False),
+        (BettingAccount, True),
+        (BettingAccount, False),
+        (WalletAccount, True),
+        (WalletAccount, False),
+    ],
+)
+def test_totals_only_account_constructor_rejects_unsupported_combinations(
+    account_class: type,
+    calculate_account_state: bool,
+) -> None:
+    """
+    Reject totals-only balances at unsupported account constructor boundaries.
+    """
+    state = AccountState(
+        account_id=AccountId("BINANCE-PAPI-001"),
+        account_type=AccountType.MARGIN,
+        balances=[],
+        margins=[],
+        is_reported=True,
+        event_id=UUID4(),
+        ts_event=1,
+        ts_init=2,
+        total_only_balances=[Money.from_str("19.23 USD")],
+    )
+
+    with pytest.raises(ValueError, match=r"totals-only|non-wallet account type"):
+        account_class(state, calculate_account_state=calculate_account_state)
+
+
 def test_cash_account_properties_and_balances() -> None:
     """
     Test cash account properties and balances.

@@ -63,6 +63,24 @@ fn test_python_read_only_constructors_registry_and_secret_boundaries() {
                 .iter()
                 .all(|row| row["receipt_status"] == "missing")
         );
+        let e = client
+            .call_method1("account_observations_json", (0,))
+            .unwrap_err();
+        assert!(e.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+        client.call_method0("cancel").unwrap();
+        let canceled: String = client
+            .call_method1("account_observations_json", (1_000,))
+            .unwrap()
+            .extract()
+            .unwrap();
+        let canceled: Value = serde_json::from_str(&canceled).unwrap();
+        assert!(
+            canceled
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| { row["receipt_status"] == "canceled" && row["observation"].is_null() })
+        );
         assert!(client_type.call1((&read_only, PyList::empty(py))).is_err());
         assert!(read_only.getattr("api_key").is_err());
         assert!(read_only.getattr("api_secret").is_err());

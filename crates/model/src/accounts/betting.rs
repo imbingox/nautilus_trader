@@ -22,6 +22,9 @@ use std::{
 
 use ahash::AHashMap;
 use indexmap::IndexMap;
+use nautilus_core::correctness::{
+    CorrectnessResult, CorrectnessResultExt, FAILED, check_predicate_true,
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +53,7 @@ use crate::{
 )]
 pub struct BettingAccount {
     /// The account state shared by every account type.
+    #[serde(deserialize_with = "BaseAccount::deserialize_full_balances")]
     pub base: BaseAccount,
     /// Per-(instrument, currency) locked balances (transient, not persisted).
     #[serde(skip, default)]
@@ -58,12 +62,32 @@ pub struct BettingAccount {
 
 impl BettingAccount {
     /// Creates a new [`BettingAccount`] instance.
+    ///
+    /// # Panics
+    ///
+    /// Panics if balance currencies are duplicated or totals-only balances are provided.
     #[must_use]
     pub fn new(event: AccountState, calculate_account_state: bool) -> Self {
-        Self {
-            base: BaseAccount::new(event, calculate_account_state),
+        Self::new_checked(event, calculate_account_state).expect_display(FAILED)
+    }
+
+    /// Creates a betting account after validating its balance representations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for duplicate currencies or totals-only balances.
+    pub fn new_checked(
+        event: AccountState,
+        calculate_account_state: bool,
+    ) -> CorrectnessResult<Self> {
+        check_predicate_true(
+            event.total_only_balances.is_empty(),
+            "betting accounts do not support totals-only balances",
+        )?;
+        Ok(Self {
+            base: BaseAccount::new_checked(event, calculate_account_state)?,
             balances_locked: AHashMap::new(),
-        }
+        })
     }
 
     #[must_use]
@@ -171,6 +195,11 @@ impl Account for BettingAccount {
 
     fn apply(&mut self, event: AccountState) -> anyhow::Result<()> {
         self.check_event_account_id(&event)?;
+        self.check_event_balances(&event)?;
+        check_predicate_true(
+            event.total_only_balances.is_empty(),
+            "betting accounts do not support totals-only balances",
+        )?;
 
         for balance in &event.balances {
             if balance.total.is_negative() {

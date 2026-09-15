@@ -247,6 +247,20 @@ pub(crate) fn position(symbol: &str) -> Value {
     rows.remove(0)
 }
 
+pub(crate) fn supported_balances() -> Value {
+    let mut rows: Value =
+        serde_json::from_str(include_str!("../test_data/observations/balances.json")).unwrap();
+    let usdt = rows
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|row| row["asset"] == "USDT")
+        .unwrap();
+    usdt["crossMarginBorrowed"] = json!("0.00000000");
+    usdt["crossMarginInterest"] = json!("0.00000000");
+    rows
+}
+
 pub(crate) fn algo() -> Value {
     let rows: Vec<Value> =
         serde_json::from_str(include_str!("../test_data/reports/open_algos.json")).unwrap();
@@ -277,6 +291,9 @@ pub(crate) fn quiet(request: &RecordedRequest) -> Reply {
         "/papi/v1/um/positionRisk" => Reply::json(&json!([position(&request.params["symbol"])])),
         "/papi/v1/um/openOrders"
         | "/papi/v1/um/algo/openAlgoOrders"
+        | "/papi/v1/cm/positionRisk"
+        | "/papi/v1/cm/openOrders"
+        | "/papi/v1/margin/openOrders"
         | "/papi/v1/um/allOrders"
         | "/papi/v1/um/algo/allAlgoOrders"
         | "/papi/v1/um/userTrades" => Reply::json(&json!([])),

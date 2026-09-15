@@ -234,6 +234,57 @@ def test_account_state_info_defaults_empty(account_id: AccountId, uuid: UUID4) -
     assert state.info == {}
 
 
+@pytest.mark.parametrize("amount", ["19.23 USD", "-19.23 USD", "0 USDT", "0.12345678 BTC"])
+def test_account_state_totals_only_roundtrip(amount: str) -> None:
+    """
+    Round-trip totals-only amounts exactly and preserve the legacy default.
+    """
+    total = Money.from_str(amount)
+    state = AccountState(
+        account_id=AccountId("BINANCE-PAPI-001"),
+        account_type=AccountType.MARGIN,
+        balances=[],
+        margins=[],
+        is_reported=True,
+        event_id=UUID4(),
+        ts_event=1,
+        ts_init=2,
+        total_only_balances=[total],
+    )
+    values = state.to_dict()
+    restored = AccountState.from_dict(values)
+
+    assert state.total_only_balances == [total]
+    assert values["total_only_balances"] == [str(total)]
+    assert restored.total_only_balances == [total]
+    assert restored.to_dict() == values
+
+    del values["total_only_balances"]
+    assert AccountState.from_dict(values).total_only_balances == []
+
+
+@pytest.mark.parametrize(
+    "account_type",
+    [AccountType.CASH, AccountType.BETTING, AccountType.WALLET],
+)
+def test_account_state_totals_only_rejects_unsupported_types(account_type: AccountType) -> None:
+    """
+    Reject totals-only amounts for non-margin account events.
+    """
+    with pytest.raises(ValueError, match="totals-only balances require a margin account"):
+        AccountState(
+            account_id=AccountId("SIM-001"),
+            account_type=account_type,
+            balances=[],
+            margins=[],
+            is_reported=True,
+            event_id=UUID4(),
+            ts_event=1,
+            ts_init=2,
+            total_only_balances=[Money.from_str("19.23 USD")],
+        )
+
+
 def test_portfolio_snapshot_valuation_metadata(
     account_id: AccountId,
     audusd_id: InstrumentId,

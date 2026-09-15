@@ -17,13 +17,14 @@
 //!
 //! The [`read_only`] client uses the pinned Binance SDK for signed account observations,
 //! order/fill/position reports, and explicitly incomplete historical snapshots. It accepts
-//! explicit credentials and preloaded one-way UM instrument scope. No economic account
-//! projection or trading is available.
+//! explicit credentials and preloaded one-way UM instrument scope. Supported observations can
+//! produce a diagnostic totals-only account projection and independent PM risk view. Trading is
+//! unavailable.
 //!
 //! Factory-created Rust execution clients support scoped reports after explicit read-only
-//! configuration and instrument preloading. LiveNode startup remains unavailable until the
-//! native account balance mapping is accepted. Public market data and instruments use the
-//! existing `nautilus-binance` adapter.
+//! configuration and instrument preloading. LiveNode startup remains unavailable because the
+//! diagnostic snapshot does not publish a live account or provide PM order admission. Public
+//! market data and instruments use the existing `nautilus-binance` adapter.
 //!
 //! # Feature Flags
 //!

@@ -12,7 +12,8 @@ including `entryPrice`. V2 is not a field-compatible replacement for V1 account 
 
 This result supports the source selection for the observed one-way account. It does not establish
 complete coverage across all account states, accept missing-as-flat behavior in the adapter, or
-enable LiveNode startup. No production code or existing tests were changed.
+enable LiveNode startup. No production code or existing tests were changed during this verification;
+the later read-only implementation uses these conclusions.
 
 ## Evidence collected
 
@@ -86,7 +87,7 @@ not exercise an entirely flat account, multiple simultaneous nonzero positions, 
 with working ordinary/algo orders, a position closing during collection, hedge mode, or recovery
 after a stream gap. No trading operations were used to manufacture these cases.
 
-The next implementation should:
+The implementation requirements derived from this evidence were:
 
 - Use V2 as the primary UM account-observation source and `positionRisk` for required position
   details, matching by account, symbol, and position side and checking signed quantities.
@@ -99,8 +100,9 @@ The next implementation should:
 - Preserve errors for contradictory sources, invalid required fields, and unsupported states.
   A generation number and matching quantities do not make REST responses atomic.
 
-The existing explicit-position-coverage checks, account-projection gate, and LiveNode startup gate
-remain in place. Native balance and PM purchasing-power semantics are outside this verification.
+The later implementation retains explicit position coverage, uses V2 as a wallet-scope source,
+and keeps V1 diagnostic. Native totals-only projection and the PM risk view are documented in the
+adapter README; PM purchasing-power admission and LiveNode startup remain unavailable.
 
 [account-api]: https://developers.binance.com/en/docs/catalog/advanced-trading-derivatives-trading-portfolio-margin/api/rest-api/account#get-um-account-detail-v2
 [change-log]: https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/change-log#2024-08-23

@@ -68,6 +68,10 @@ pub trait Account: 'static + Send {
     fn currencies(&self) -> Vec<Currency>;
     fn starting_balances(&self) -> IndexMap<Currency, Money>;
     fn balances(&self) -> IndexMap<Currency, AccountBalance>;
+    /// Returns reported totals with unavailable free and locked components.
+    fn total_only_balances(&self) -> IndexMap<Currency, Money> {
+        IndexMap::new()
+    }
     /// Applies an account state event to update the account.
     ///
     /// Implementations reject the event before mutating any state, so a rejected event leaves

@@ -480,6 +480,68 @@ fn test_account_when_account_returns_the_account_facade(mut portfolio: Portfolio
 }
 
 #[rstest]
+fn test_totals_only_account_updates_through_portfolio_and_cache(mut portfolio: Portfolio) {
+    let account_id = AccountId::from("BINANCE-PAPI-001");
+    let usd = Currency::USD();
+    let total = Money::from("-19.23 USD");
+    let mut state = get_margin_account(Some(account_id.as_str()));
+    state.balances.clear();
+    state.margins.clear();
+    state.base_currency = None;
+    let state = state.with_total_only_balances(vec![total]).unwrap();
+    portfolio.update_account(&state);
+
+    {
+        let cache = portfolio.cache().borrow();
+        let account = cache.account(&account_id).unwrap();
+        assert_eq!(account.balance_total(Some(usd)), Some(total));
+        assert_eq!(account.balance_free(Some(usd)), None);
+        assert_eq!(account.starting_balances(), IndexMap::from([(usd, total)]));
+        assert!(!account.calculated_account_state());
+    }
+
+    let mut complete = state.clone();
+    complete.event_id = UUID4::new();
+    complete.total_only_balances.clear();
+    complete.balances = vec![AccountBalance::new(total, Money::zero(usd), total)];
+    portfolio.update_account(&complete);
+
+    {
+        let cache = portfolio.cache().borrow();
+        let account = cache.account(&account_id).unwrap();
+        assert_eq!(account.balance_free(Some(usd)), Some(total));
+        assert!(account.total_only_balances().is_empty());
+        assert_eq!(account.event_count(), 2);
+    }
+
+    let mut state = state;
+    state.event_id = UUID4::new();
+    portfolio.update_account(&state);
+    let before = portfolio
+        .cache()
+        .borrow()
+        .account_owned(&account_id)
+        .unwrap();
+    let mut invalid = state;
+    invalid.event_id = UUID4::new();
+    invalid.total_only_balances.push(total);
+    portfolio.update_account(&invalid);
+    let after = portfolio
+        .cache()
+        .borrow()
+        .account_owned(&account_id)
+        .unwrap();
+
+    assert_eq!(after.balance_total(Some(usd)), Some(total));
+    assert_eq!(after.balance_free(Some(usd)), None);
+    assert_eq!(after.event_count(), 3);
+    assert_eq!(after.balances_total(), before.balances_total());
+    assert_eq!(after.balances(), before.balances());
+    assert_eq!(after.total_only_balances(), before.total_only_balances());
+    assert_eq!(after.events(), before.events());
+}
+
+#[rstest]
 fn test_balances_locked_when_no_account_for_venue_returns_none(portfolio: Portfolio, venue: Venue) {
     let result = portfolio.balances_locked(&venue);
     assert_eq!(result, IndexMap::new());

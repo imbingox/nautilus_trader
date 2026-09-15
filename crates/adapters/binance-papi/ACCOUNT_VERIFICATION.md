@@ -3,7 +3,7 @@
 Verification date: 2026-09-13. This follows [RESEARCH.md](RESEARCH.md) and the
 [UM account V2 verification](V2_VERIFICATION.md). Source and offline tests use checkout
 `c3716e2d0431246b90636adcf5bcd746fb283959`. This report records evidence and design decisions;
-it does not implement an account projection or enable LiveNode.
+the subsequent implementation adds a read-only totals-only projection but does not enable LiveNode.
 
 ## Mapping decisions
 
@@ -18,8 +18,9 @@ position PnL calculation does not reproduce the exchange's collateral valuation 
 
 The new evidence supports excluding unrealized PnL from wallet totals and avoiding another
 deduction of the observed negative balance. It also verifies real order/fill linkage, fee signs,
-and funding already reflected in wallet balances. Nonzero cross-Margin borrowing/interest and a
-usable native `free/locked` mapping remain unresolved.
+and funding already reflected in wallet balances. Nonzero cross-Margin borrowing/interest remains
+unsupported. The subsequent totals-only account representation intentionally keeps native
+`free/locked` unavailable.
 
 ## Evidence collected
 
@@ -90,6 +91,80 @@ nonzero CM behavior is not covered.
 The seven-day cross-Margin interest response has `rows=[]` and `total=0`; the negative-balance
 interest response is also empty. These results establish only the queried window's returned
 records, not absence of debt or interest in every account state.
+
+## Authenticated evidence and remaining limits
+
+The 2026-09-13 captures cannot establish every acceptance case for the later implementation. The
+current-build acceptance below resolves the projection and account-wide query gaps from those
+captures. The following limits remain explicit and must not be replaced with synthetic live
+evidence:
+
+- No nonzero borrowing or accrued-interest state was available. The implementation detects and
+  rejects that state; its economic mapping is deliberately unsupported rather than inferred from
+  zero-liability samples.
+- The account was not entirely flat and no live nonzero-to-zero transition was observed. Explicit
+  zero rows and closing behavior have offline integration coverage, but not flat-account live
+  evidence.
+- No real algo parent-trigger-child lifecycle was present. Parent/child/fill correlation and
+  contradictions have offline fixture coverage only.
+- No venue retention boundary was reached. Returned bounded history does not prove full retention
+  or completeness.
+- No 429 or 418 response was manufactured. Gate latching is covered offline, while live error
+  headers remain unavailable through SDK 69.2.1 and automatic recovery stays disabled.
+These are evidence limits, not permission to broaden the supported account state. The unavailable
+live cases remain documented limitations with conservative rejection or incompleteness semantics,
+as applicable.
+
+### Current implementation acceptance attempt
+
+On 2026-09-15, the current acceptance script was run with an owner-only local credential file and
+one preloaded UM instrument. The account refresh exhausted its sixty-second operation budget. All
+nine source slots remained without a response and were marked failed; the order-quota and mass
+status reads were therefore not attempted. Independent unsigned connectivity probes to the PAPI,
+UM futures, and public API hosts also timed out while opening the TCP connection, before TLS or an
+HTTP response.
+
+This attempt provides no authentication result, endpoint-scope result, quota headers, account-state
+evidence, or projection acceptance. It is a network-path limitation of the collection environment,
+not evidence that the credentials, account, or implementation were rejected.
+
+The collection was repeated through the user-provided local mixed proxy after an unsigned PAPI ping
+returned HTTP 200 over the same route. All nine signed account sources then returned HTTP 401 with
+Binance code `-2015`; the refresh failed closed, and the script did not attempt the order-quota or
+mass-status reads. This establishes proxy connectivity and negative authentication/permission
+handling, but `-2015` does not distinguish an invalid key from a disallowed proxy egress IP or
+missing PAPI permission. No account response or quota header was returned.
+
+A second owner-provided key was checked through the same proxy using signed GET requests only. The
+wallet API permission query returned HTTP 200 and reported unrestricted IP access and reading
+enabled, while futures and Portfolio Margin trading permissions were disabled. A Spot account
+`USER_DATA` read succeeded with HTTP 200, but the UM and PAPI account reads both returned HTTP 401
+with code `-2015`. This establishes that the second key is valid and not IP-restricted, and that the
+general reading permission alone does not grant access to those derivatives account routes. It does
+not establish whether Binance can grant PAPI `USER_DATA` access independently of trading authority.
+No product trading permission was enabled and no write request was attempted.
+
+The collection was then repeated with a PAPI-readable key and the account's active
+`GWEIUSDT-PERP.BINANCE` scope. All nine account sources, the order quota, and bounded mass status
+succeeded. All account sources were recent and had no failure, and both the wallet and PM risk
+views were available without issues. The wallet contained four exact native totals-only balances;
+no free or locked amount was synthesized. The mass status contained the one active position, no
+orders or fills in its one-hour window, and retained `reports_complete=false` with its historical
+coverage issue.
+
+The first current-build run exposed an additional asset code, `U`, which correctly made the wallet
+unsupported while the currency was unknown. Binance's read-only asset configuration identifies it
+as United Stables, and public `UUSDT` and `BTCU` metadata assign eight-digit asset and commission
+precision. After registering that currency with eight-digit precision, the exact wallet projection
+succeeded. Observed account-wide request-weight increments were 40 for UM ordinary orders, 40 for
+UM algo orders, 40 for CM orders, and 5 for margin orders, matching the configured reservations.
+
+No credential, amount, or raw private response was added to the repository. The raw evidence
+remains in an owner-only temporary directory. Every authenticated operation was a GET; no product
+trading permission was enabled and no write request was attempted. This accepts the supported
+read-only projection for the sampled active, zero-liability account. Nonzero liability, flat-account
+transition, real algo lifecycle, retention-boundary, and live throttling evidence remain unavailable
+and retain their fail-closed or incomplete behavior.
 
 ## PnL, fees, and funding
 
@@ -188,17 +263,17 @@ Every sampled nonzero PM monetary summary field has meaningful digits beyond two
 constructor is insufficient: require an exact round trip or an explicitly accepted projection
 policy. Preserve the original decimal observations; do not relabel USD as USDT.
 
-The remaining model decision is substantive:
+The subsequent implementation resolves the model decision as follows:
 
 - Existing observation types can retain native assets, liabilities, and PM measurements without a
   core extension. Negative wallet totals are already supported by `AccountBalance`.
-- `AccountBalance` cannot express a known total with unavailable free/locked components. Keep
-  projection unavailable until their mapping is established or the core can represent that state.
+- `AccountState.total_only_balances` and `MarginAccount` represent known native totals while keeping
+  free/locked unavailable. The representation is rejected for locally calculated account state.
 - PM capacity belongs to one account budget across currencies, instruments, and strategies.
   Duplicating it into USDT and USDC free balances would duplicate collateral.
-- The [risk engine](../../risk/src/engine/mod.rs) still uses native free balance for margin checks
-  and can skip the check when that currency is missing. `AccountState.info` does not supply a PM
-  admission check. An adapter gate alone must also resolve interaction with those core checks.
+- The [risk engine](../../risk/src/engine/mod.rs) rejects risk-increasing orders for totals-only
+  margin accounts unless an order is explicitly reduce-only or a validated full-position exit.
+  This is a guard, not PM admission or delegated buying power.
 - [MarginModel](../../model/src/accounts/margin_model.rs) receives instrument, quantity, price,
   and leverage; it has no account/order/reservation context. Before trading, design the minimum
   capability needed for a shared PM check and reservation lifecycle instead of forcing capacity
@@ -218,8 +293,13 @@ Existing adapter and engine tests passed for these failure behaviors:
   boundary, out-of-order, and clock-rollback cases. A recent receipt alone is not economic validity.
 - Unknown statuses and absent/null/empty/invalid fields remain distinguishable. Risk observations
   can change independently of balance observations.
+- The totals-only wallet projection requires exact registered currencies, preserves positive,
+  negative, and explicit zero totals, and rejects missing/null/invalid fields, excess precision,
+  nonzero debt, unsupported product scope, mixed generations, stale receipts, and excessive
+  collection span without returning a partial account.
 - Missing, malformed, or duplicate position coverage cannot synthesize a flat position. An
-  explicitly reported zero position is accepted. Failed current reads do not become empty success.
+  explicitly reported zero position is accepted and closes a cached nonzero position through the
+  execution/portfolio event path exactly once. Failed current reads do not become empty success.
 - Partial or exhausted history stays explicitly incomplete. Pagination, saturated milliseconds,
   time-window boundaries, and request/row budgets have regression coverage.
 - Missing or invalid commission is fatal. Through the execution manager, incomplete history keeps
@@ -230,15 +310,15 @@ Existing adapter and engine tests passed for these failure behaviors:
   offline. No live faults or real algo triggers were manufactured.
 
 [BinancePapiExecutionClient::connect](src/execution.rs) still deliberately rejects LiveNode
-startup. Account projection, order writes, PM admission/reservations, and stream recovery are not
-implemented or accepted by these results. Current mass statuses always have
+startup. A diagnostic account projection is implemented; account publication, order writes, PM
+admission/reservations, and stream recovery are not implemented or accepted. Current mass statuses always have
 `reports_complete=false`; the core suppresses historical position/portfolio effects, but that flag
 is not itself a universal LiveNode startup failure.
 
 Later trading startup acceptance must establish:
 
-1. A verified native wallet/liability and free/locked mapping, or an accepted core representation
-   for unavailable components, with explicit monetary precision policy.
+1. Authenticated acceptance of the totals-only native wallet projection across its required
+   account-wide sources and supported zero-liability scope.
 1. A single PM admission budget with verified capacity and incremental-margin semantics, covering
    concurrent orders and modifications, reservations, fills, rejections, cancellations, and
    recovery of unknown submission outcomes.
@@ -266,8 +346,8 @@ also removed from the test environment. Cargo used `--offline --locked` and comp
 checkout; the evidence is not execution of an old test binary. Private financial analysis used
 the project's `python/.venv` interpreter.
 
-These tests validate existing behavior, not the future balance projection, PM admission capability,
-or live recovery design. No production code or existing tests changed during this verification.
+These counts record the 2026-09-13 evidence checkout, not the subsequent implementation's final
+validation. They do not validate PM admission capability or live recovery design.
 
 [account-api]: https://developers.binance.com/en/docs/catalog/advanced-trading-derivatives-trading-portfolio-margin/api/rest-api/account
 [income-api]: https://developers.binance.com/en/docs/catalog/advanced-trading-derivatives-trading-portfolio-margin/api/rest-api/account#get-um-income-history

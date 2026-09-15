@@ -66,6 +66,19 @@ fn assert_signature(request: &testing::RecordedRequest) {
     assert_eq!(request.params["recvWindow"], "5000");
 }
 
+#[rstest]
+#[case(ObservationSource::UmOpenOrders, 40)]
+#[case(ObservationSource::UmOpenAlgos, 40)]
+#[case(ObservationSource::CmPositions, 1)]
+#[case(ObservationSource::CmOpenOrders, 40)]
+#[case(ObservationSource::MarginOpenOrders, 5)]
+fn account_wide_observation_uses_documented_ip_weight(
+    #[case] source: ObservationSource,
+    #[case] expected: usize,
+) {
+    assert_eq!(PapiRequest::Observation(source).weight(), expected);
+}
+
 #[tokio::test]
 async fn signed_get_preserves_raw_json_and_quota_metadata() {
     let body =
@@ -90,6 +103,7 @@ async fn signed_get_preserves_raw_json_and_quota_metadata() {
     assert_eq!(response.metadata.order_count_1m, Some(3));
     assert_eq!(response.metadata.retry_after_seconds, None);
     assert!(response.metadata.ts_received >= response.metadata.ts_requested);
+    assert!(response.received_at >= response.requested_at);
     assert_signature(&server.requests()[0]);
 }
 
@@ -118,8 +132,11 @@ async fn signing_encodes_client_identity_and_keeps_large_order_ids_exact() {
 #[tokio::test]
 async fn transient_retry_gets_a_new_signature_and_consumes_another_attempt() {
     let count = AtomicUsize::new(0);
+    let first_attempt_at = Arc::new(parking_lot::Mutex::new(None));
+    let observed = Arc::clone(&first_attempt_at);
     let server = MockServer::new(move |_| {
         if count.fetch_add(1, Ordering::SeqCst) == 0 {
+            *observed.lock() = Some(Instant::now());
             Reply::raw(503, r#"{"msg":"unavailable"}"#)
         } else {
             Reply::raw(200, "{}")
@@ -127,10 +144,12 @@ async fn transient_retry_gets_a_new_signature_and_consumes_another_attempt() {
     })
     .await;
     let client = http(&server, testing::gate());
-    client
+    let response = client
         .get(&request(), &budget(), &CancellationToken::new())
         .await
         .unwrap();
+    assert!(response.requested_at <= first_attempt_at.lock().unwrap());
+    assert!(response.received_at >= first_attempt_at.lock().unwrap());
     let requests = server.requests();
     assert_eq!(requests.len(), 2);
     assert_signature(&requests[0]);

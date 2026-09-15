@@ -172,10 +172,10 @@ impl CanonicalScenario {
                 positions: 0,
                 accounts: 1,
                 account_digest:
-                    "blake3:405c9f219087dbff0f0641cfdc5fc41c84296981f4158bc9ea0978a1c81aee2c"
+                    "blake3:f095cdb7132e1716cf0d3f4bfa76c376613cc7e4c78c580c2ddb8f091d5d3526"
                         .to_string(),
                 result_digest:
-                    "blake3:7dd768c892f560c967c2aae291c6b9315d619bafab1b43b6a9f80cfad81e6914"
+                    "blake3:25b306d28e104e713c20ca81294f0ea39fc3927a7f05d39acdf031811b7f7272"
                         .to_string(),
             },
             Self::ScheduledMarketOrders => CanonicalFingerprint {
@@ -188,11 +188,11 @@ impl CanonicalScenario {
                 positions: 32,
                 accounts: 1,
                 account_digest:
-                    "blake3:be57c858fd2d34e157342f64260c4d517abc2f7a5f67dce73d43858ea1b2bf1a"
+                    "blake3:106c74ef3aedb8878c704d162ac733c056cd377fdc494e41e92a4cb35d1b0572"
                         .to_string(),
                 result_digest: expected_result_digest(
-                    "blake3:14fee63698f0b3afd4ed0fe0710733a2c677929efc975d82456c64d4e9e732c1",
-                    "blake3:c2cf16fff2bc490e553c6c2958e4e1d66a3d4d7ddbe413752bd542fcfd7d100e",
+                    "blake3:6618db0903d2218341d743e03fbfbde49585a2586c3e7a4fd4d1d03768797fab",
+                    "blake3:66cf97d621a70f9ea12a6e5801ceb3cd39afe36c8317c76540e62054825e8c21",
                 ),
             },
             Self::PassiveLimitOrders => CanonicalFingerprint {
@@ -205,10 +205,10 @@ impl CanonicalScenario {
                 positions: 0,
                 accounts: 1,
                 account_digest:
-                    "blake3:7702ff4aa9ca1d26061419e9185a5bcfed0418fb0f24725ee36fd7d4323d79f5"
+                    "blake3:d250b77e1d7066cd1b852cfa51d50bf9afc1ed33c049f6c379317f559f569ff3"
                         .to_string(),
                 result_digest:
-                    "blake3:4aaa0bdd015b1d4df4c1c850d3f1527f3d099ac717dd38500625c1d0ed24b403"
+                    "blake3:092ebd71f0d0a0c8fb8eb5437e920365cf015452e5c9b0951a306b74da302805"
                         .to_string(),
             },
             Self::BarEmaCross => CanonicalFingerprint {
@@ -221,11 +221,11 @@ impl CanonicalScenario {
                 positions: 225,
                 accounts: 1,
                 account_digest:
-                    "blake3:ba1b5311a979bcfb6b58a4a9c478b4f00d0c577ce0c5c9cb3328f84ee921d9fc"
+                    "blake3:d4821289bd3204efdff7d8647597dd48b6a51683b89b804cda122044b8592871"
                         .to_string(),
                 result_digest: expected_result_digest(
-                    "blake3:e62f1f8cb2f77dc5c118b02ae0d9481236d1fd69a7f26928482e2406d9556a1e",
-                    "blake3:d269453558b68dd3dae266c1ab44fa454fdb034678fc383eb4f2b3edb4156bc1",
+                    "blake3:701a5b0c44a588f092cc553c2056edf4aaf38a8373556af3d1b681bc0cc9bd32",
+                    "blake3:f4036d1ea3205f82d92d9c31a1f51800bebf1df6d0c25cd53d08a69ff79f0d23",
                 ),
             },
         }

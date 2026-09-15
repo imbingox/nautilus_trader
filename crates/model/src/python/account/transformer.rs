@@ -43,7 +43,10 @@ pub fn cash_account_from_account_events(
         return Err(to_pyvalue_err("No account events"));
     }
     let init_event = account_events[0].clone();
-    let mut cash_account = CashAccount::new(init_event, calculate_account_state, allow_borrowing);
+    let mut cash_account =
+        CashAccount::new_checked(init_event, calculate_account_state, allow_borrowing)
+            .map_err(to_pyvalue_err)?;
+
     for event in account_events.iter().skip(1) {
         cash_account
             .apply(event.clone())
@@ -72,7 +75,9 @@ pub fn betting_account_from_account_events(
         return Err(to_pyvalue_err("No account events"));
     }
     let init_event = account_events[0].clone();
-    let mut betting_account = BettingAccount::new(init_event, calculate_account_state);
+    let mut betting_account =
+        BettingAccount::new_checked(init_event, calculate_account_state).map_err(to_pyvalue_err)?;
+
     for event in account_events.iter().skip(1) {
         betting_account
             .apply(event.clone())
@@ -135,7 +140,9 @@ pub fn margin_account_from_account_events(
         return Err(to_pyvalue_err("No account events"));
     }
     let init_event = account_events[0].clone();
-    let mut margin_account = MarginAccount::new(init_event, calculate_account_state);
+    let mut margin_account =
+        MarginAccount::new_checked(init_event, calculate_account_state).map_err(to_pyvalue_err)?;
+
     for event in account_events.iter().skip(1) {
         margin_account
             .apply(event.clone())
