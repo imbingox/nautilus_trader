@@ -1,9 +1,44 @@
-# NautilusTrader 2.0.0rc5
+# NautilusTrader 2.0.0rc6
 
 Released on TBD (UTC).
 
 ### Enhancements
 
+### Breaking Changes
+
+- Changed Rust `OrderCore.events` to read-only `events()`; construct cores with `OrderCore::new`
+
+### Security
+
+### Fixes
+
+- Fixed backtest rejection of lower-precision order fields within the same fixed-point scale
+- Fixed trailing-stop orders already in the market being accepted despite `reject_stop_orders`
+
+### Internal Improvements
+
+- Improved cache order query benchmark coverage
+- Optimized cache order queries and exchange-rate lookups from bars
+- Optimized average-price calculation for orders with many fills
+- Optimized allocation overhead in Rust cache `orders` and `orders_refs` queries
+- Upgraded `datafusion` crate to v55.1.0
+- Upgraded `smallvec` crate to v1.16.1
+- Upgraded `ty` package (dev) to v0.0.79
+
+### Documentation Updates
+
+### Deprecations
+
+---
+
+# NautilusTrader 2.0.0rc5
+
+Released on 15th September 2026 (UTC).
+
+### Enhancements
+
+- Added `client_id` and `endpoint` filters to actor `subscribe_socket_state`
+- Added a `channel` filter to actor `subscribe_queue_state`
 - Added `HttpClient::get_stream` and `HttpResponseStream` for HTTP bodies consumed without full buffering
 - Added `publish_message(...)`, `subscribe_topic(...)`, and `unsubscribe_topic(...)` for Python `DataActor`, `Strategy`, and `ExecutionAlgorithm`
 - Added `Cache` APIs and Redis/PostgreSQL persistence for `InstrumentClose` data
@@ -18,28 +53,34 @@ Released on TBD (UTC).
 - Added typed external MessageBus streaming for control, execution, and reconciliation messages
 - Added public `ExecutionEventEmitter.try_send_account_state(...)` (#4907), thanks @folknor
 - Added cache-backed claims that route external orders, fills, and reconciliation activity to the strategy
+- Added inbound latency modeling to sandbox execution client (#4865), thanks @ChrisAB
 - Added `SubscribeOptionChain.correlation_id` and `UnsubscribeOptionChain.params` for tracking edits across client routes
 - Added `UnixNanos::saturating_duration_since` for non-negative time differences
 - Added `BacktestEngine::add_data_batch` for typed data batches that replay without per-item `Data` values, thanks @faysou
 - Added Python enum surface (`from_str`, `name`, `value`, `variants`) to `BarIntervalType`
+- Added Python component direct messaging preserving objects across synchronous topic publication
 - Added Python `OrderBook.to_deltas(...)` and `OrderBook.get_all_crossed_levels(...)`
 - Added Python `OrderBook` pickle and deep-copy support and `BookLevel` comparisons
 - Added Python `OrderBookDelta.is_add`, `is_update`, `is_delete`, `is_clear`, and `OrderBookDeltas.is_snapshot`
 - Added Python `activation_utc` and `expiration_utc` properties to expiring instruments
 - Added Python `symbol` and `venue` properties to regular and synthetic instruments
+- Added Python bindings for subscription, execution, and historical data messages
 - Added Cap'n Proto serialization for all instrument types and `InstrumentAny`
 - Added Binance USD-M Futures RPI order support (#4927), thanks @AlphaTraderK
+- Added Binance USD-M weekly delivery contract support
 - Added Bybit self-match prevention, set with `smp_type` on the execution client config or per order
 - Added Hyperliquid definite rejection events for submit, modify, and cancel command paths
 - Added Hyperliquid local denial of over-decimal order prices when `normalize_prices` is disabled
 - Added Kraken Futures `makerProtectionMillis` decoding for Maker Protection markets
 - Added Kraken execution `max_retries` configuration (#4902), thanks @folknor
 - Added OKX raw HTTP account configuration queries (#4943), thanks @silarin
+- Added OKX USD-to-USDC spot migration support with `spot_trade_quote_ccy` and `activate_feature`
+- Added OKX `smart_iceberg` algo order type and `auto_conversion` order category decoding
 - Added Polymarket collateral-sized limit BUY orders with exact limit price preservation
+- Added Polymarket Deposit Wallet split, merge, and redeem position operations
 - Added Polymarket limit order modification support
 - Added Polymarket parent event IDs and raw Gamma market and event metadata
 - Added Polymarket resolution subscriptions for data-only clients (#4895), thanks @mystic-io
-- Added inbound latency modeling to sandbox execution client (#4865), thanks @ChrisAB
 
 ### Breaking Changes
 
@@ -49,16 +90,22 @@ Released on TBD (UTC).
 - Removed Coinbase `CreateOrderRequest.reduce_only`; reduce-only orders are rejected before submission
 - Removed the dormant `PortfolioStatistic::calculate_from_orders` trait method; no analyzer supplied order data to statistics
 - Removed public Rust and Python `ForwardPrice` APIs; option chains now fetch reference prices internally
+- Removed the unused OKX enums `OKXAccountMode` and `OKXTakeProfitKind`, which mapped no venue field
 - Replaced `RetryManager.execute_with_retry*` methods with `invocation(...).execute().await`
 - Replaced the Rust `DurationNanos` `u64` alias with a newtype; use constructors and accessors
 - Replaced `OKXHttpError::JsonError` and generic HTTP errors with typed transport and response failures
+- Renamed `nautilus-serialization` Cargo feature `display` to `arrow-display`
 - Renamed blockchain log parsing modules to `hypersync::log` and `rpc::log`; update Rust imports
 - Renamed Cargo binary targets to kebab-case, including `to_json` to `to-json`, `to_parquet` to `to-parquet`, and `node_wallet` to `node-wallet`; update any `cargo run --bin` invocation to the new name
 - Renamed Rust `Data::Delta`, `Data::Deltas`, and `Data::Depth10` variants to `Data::BookDelta`, `Data::BookDeltas`, and `Data::BookDepth10`; JSON and SBE wire formats are unchanged
 - Renamed `StrategyConfig.external_order_claims` to `external_order_instrument_ids`; use `Strategy.set_external_order_instrument_ids()` after registration to replace active claims
+- Changed actor state subscription signatures; pass filters before `priority`, or use `priority=` in Python
+- Changed Rust state unsubscribe methods to require filters; pass `None` for unfiltered subscriptions
+- Changed `QueueStateChanged` and `SocketStateChanged` topics; use actor filters or switchboard patterns
+- Changed Rust `ExecutionClientFactory::create` to require the node's clock after the cache argument
 - Changed Rust mixed-scale addition/subtraction to panic; use `checked_add`/`checked_sub` for fallible handling
 - Changed Rust `BinaryOption` constructors to require an `event_id` argument; pass `None` when unknown
-- Changed`OrderCanceled::new` to require an optional cancellation reason (#4903), thanks @folknor
+- Changed `OrderCanceled::new` to require an optional cancellation reason (#4903), thanks @folknor
 - Changed FFI `orderbook_deltas_is_snapshot` to use `F_SNAPSHOT` instead of the first delta action
 - Changed `PortfolioAnalyzer.realized_pnls()` to return records in ascending event-time order rather than position-derived records followed by recorded ones
 - Changed registered PnL statistics to run on every analyzed currency, including runs that closed no trades, where they receive an empty list; `Win Rate` and its peers now report NaN for such runs rather than being absent
@@ -79,20 +126,27 @@ Released on TBD (UTC).
 
 ### Security
 
+- Added a committed Cargo cooldown publication-date database for offline crate-age checks
 - Added zeroizing secret storage and consistent credential redaction across adapter configuration, signing, and transport paths
 - Fixed DeFi fixed-point arithmetic and comparison errors in model types, thanks for reporting @uziii2208
 
 ### Fixes
 
+- Fixed managed GTD expiry after cancel rejections (#4974), thanks @folknor
+- Fixed cancel rejections being dropped when order acceptance arrives first
+- Fixed Python `MessageBus.publish()` reentry from subscribers and listeners, and external serialization reentry
+- Fixed live node builders losing client registrations after a failed build
+- Fixed Python live node cleanup masking run errors and skipping signal handler restoration after a cleanup failure
 - Fixed `Money` ordering panics for mixed currencies, thanks for reporting @folknor
 - Fixed sell-balance checks when order quantities and account balances use different fixed-point scales
 - Fixed `LiveTimer` successor and time bar interval overflows causing runtime panics
+- Fixed spurious data command errors on `LiveNode` disposal (#4979), thanks for reporting @luk911
 - Fixed `AroonOscillator` oldest-low scans and tied extremes (#4914), thanks @haeganm
 - Fixed WMA and HMA accepting periods above 8192 (#4887), thanks @pucedoteth
 - Fixed `SortinoRatio` for single-day return samples (#4934), thanks @raunak2007
 - Fixed `ZScore` rounding for constant windows and handling of non-finite dispersion
 - Fixed `BollingerBands` quote and trade outputs to use actual price units
-- Fixed engine panic on startup when the PostgreSQL cache held an `OrderCanceled`, `OrderDenied`, `OrderEmulated`, `OrderExpired`, `OrderPendingCancel`, `OrderPendingUpdate`, `OrderRejected`, `OrderReleased`, `OrderTriggered`, or `OrderUpdated` event (#4917)
+- Fixed engine panic on startup when the PostgreSQL cache held an `OrderCanceled`, `OrderDenied`, `OrderEmulated`, `OrderExpired`, `OrderPendingCancel`, `OrderPendingUpdate`, `OrderRejected`, `OrderReleased`, `OrderTriggered`, or `OrderUpdated` event (#4917), thanks for reporting @luk911
 - Fixed PostgreSQL general cache writes failing on existing keys (#4935), thanks @raunak2007
 - Fixed PostgreSQL cache load failing on a persisted `OrderFillVoided` event
 - Fixed `reconciliation` being persisted as `false` for every order event that carries the flag, so reconciled orders no longer restore as though they were not reconciled
@@ -100,15 +154,21 @@ Released on TBD (UTC).
 - Fixed `released_price`, `due_post_only`, `protection_price`, `causation_id`, `correction_id`, `is_reopened`, and fill `info` being dropped when an order event was persisted to PostgreSQL
 - Fixed cancellation reasons being dropped from `OrderCanceled` events (#4903), thanks @folknor
 - Fixed partial fills after hedging position flips being rejected (#4908), thanks @folknor
+- Fixed position close averages carrying the prior episode's state across reversal fills (#4967), thanks @folknor
+- Fixed NETTING reduce-only fills against `EXTERNAL` positions (#4975), thanks for reporting @qu1zzyboy
 - Fixed reconciliation races between terminal order reports and streamed fills
+- Fixed cached fill echoes aborting live order reconciliation before later fills and snapshot corrections
+- Fixed live position reconciliation clearing deferred retry counters during another position's fallback
 - Fixed zero-sized fills panicking or affecting execution reconciliation (#4957), thanks for reporting @Karrenbelt
 - Fixed position commissions and realized PnL after fill-void replay
 - Fixed OTO exit sizing for commission-adjusted positions, child size increments, and minimum quantities
 - Fixed deferred order updates and fills using stale state in backtest and sandbox matching
 - Fixed backtest option expiry before same-timestamp index updates (#4966), thanks for reporting @davidsblom
 - Fixed canceled OCO orders filling and OTO orders activating before their parent fills
+- Fixed execution algorithm spawn reductions being lost when spawned children cancel or expire (#4968), thanks @folknor
 - Fixed market-to-limit remainder prices and maker classification
 - Fixed L2/L3 `LastPrice` stop triggers and maintenance when trade execution is disabled
+- Fixed backtest order queue positions being lost across order book snapshots (#4942), thanks @cuishuang
 - Fixed backtest reduce-only resizing and cancellation propagation to linked OUO orders
 - Fixed cash account locked balances after partial order fills
 - Fixed cash account backtests accepting futures contracts, thanks for reporting @folknor
@@ -116,6 +176,7 @@ Released on TBD (UTC).
 - Fixed SBE market data decoding panics for malformed instrument and trade identifiers
 - Fixed nanosecond precision loss when `TestDataProvider` parses timestamps
 - Fixed `BacktestNode.run_streaming()` loading all records when more than one data config was used (#4897), thanks @abhijeetvichare76
+- Fixed backtest client hiding warnings for unsupported data requests (#4945), thanks @matvt-cell
 - Fixed stale or terminal single and list order submissions reaching execution clients
 - Fixed TWD, 1INCH, CAKE, and SHIB currency lookup panics
 - Fixed retiring `DataActor`, `Strategy`, and `ExecutionAlgorithm` instances retaining active or pending data subscriptions
@@ -130,6 +191,7 @@ Released on TBD (UTC).
 - Fixed Python `OrderBook` aggregation to raise `ValueError` for invalid precision and quantity overflow
 - Fixed Python `Price` and `Quantity` `from_mantissa_exponent` methods to raise `ValueError` on invalid inputs
 - Fixed Python `Money.zero` aborting for valid currencies with 17 or 18 decimal precision
+- Fixed Architect AX closed-order tracking cache retention and undocumented orders-WS heartbeat frames
 - Fixed Betfair fill report queries ignoring instrument and order filters
 - Fixed Betfair order status queries ignoring instrument filters and time bounds for closed orders
 - Fixed Binance Futures order books exceeding requested depths of 5, 10, or 20 levels, thanks for reporting @xsidorov
@@ -137,15 +199,25 @@ Released on TBD (UTC).
 - Fixed Binance Spot cancel report matching and failed cancel-replace recovery (#4930), thanks @abhijeetvichare76
 - Fixed Binance execution rejection classification and bounded HTTP read retries
 - Fixed Binance Spot `MIN_NOTIONAL` and `NOTIONAL` filters being omitted from instrument constraints
+- Fixed Binance Spot book subscriptions accepting depths outside 5, 10, or 20 levels
+- Fixed Binance Spot SBE order decoders misreading fields and timestamps (#4965), thanks @abhijeetvichare76
+- Fixed Binance Spot SBE new-order-full decoder accepting short blocks (#4972), thanks @abhijeetvichare76
+- Fixed Binance USD-M CN equity perpetuals being rejected from the instrument catalog (#4980), thanks @graceyangfan
 - Fixed Binance `taker_sell_base_volume` returning incorrectly scaled values
 - Fixed Bybit funding settlements being treated as fills (#4937), thanks for reporting @luk911
 - Fixed Bybit incorrect book quotes and zero sizes from deleted levels, thanks for reporting @xsidorov
 - Fixed Bybit quote and book cleanup after unsubscribe or subscription failure, thanks for reporting @xsidorov
+- Fixed Bybit REST and WebSocket executions dropping split-settlement, dividend, and unrecognized exec types
+- Fixed Bybit decoding of `RPI` TIF, `FUND` accounts, and extra V5 create, cancel, and status enums
 - Fixed Derive accepting trade amounts that convert to zero-sized fills
 - Fixed Derive order queries without venue order IDs (#4958), thanks for reporting @Aviksaikat
 - Fixed Hyperliquid shared REST quotas and WebSocket rate and capacity limits
 - Fixed Hyperliquid WebSocket post deadlines across queueing, transport writes, and replies
+- Fixed Hyperliquid reconciliation to fail closed on undecodable mass-status rows
+- Fixed Hyperliquid quote-denominated orders submitting quote amounts as base sizes
+- Fixed Hyperliquid instrument refresh so newly listed markets can trade without restart (#4969), thanks @riven314
 - Fixed Kraken Futures silently returning partial catalogs when instrument precision is unsupported
+- Fixed Kraken Futures order-state convergence for unreported open orders and partial-fill cancels
 - Fixed Kraken Futures `iocWouldNotExecute` order outcomes staying ambiguous instead of rejecting
 - Fixed Kraken Spot available balances excluding funds held by the venue (#4922), thanks @zhaow-de
 - Fixed Kraken Spot instrument fees to use account rates when credentials are configured (#4890), thanks @matvt-cell
@@ -154,6 +226,11 @@ Released on TBD (UTC).
 - Fixed OKX retries to honor `Retry-After`, preserve request identity, and avoid ambiguous order replay
 - Fixed OKX execution connecting with missing instruments for a configured type or family
 - Fixed OKX WebSocket connection timeout being shorter than the network default (#4956), thanks for reporting @BioxMech
+- Fixed OKX book recovery after reconnect, rejected subscriptions, and missing snapshots
+- Fixed OKX private WebSocket re-authentication after reconnect
+- Fixed OKX reconnect subscriptions exceeding the venue message size
+- Fixed OKX option order price type deserialization to the `pxUsd` and `pxVol` wire values
+- Fixed OKX depth-400 book channel gating from VIP5 to VIP4 per current venue requirements
 - Fixed Polymarket resolution subscriptions losing transiently unavailable closed markets
 - Fixed Polymarket precision loss in financial data and execution reports
 - Fixed Polymarket invalid numeric values silently producing zero prices, quantities, or fees
@@ -166,8 +243,10 @@ Released on TBD (UTC).
 - Added crate feature documentation checks for README and Rustdoc lists
 - Added early Cargo dependency cooldown checks to builds and pre-flight
 - Added Cargo convention checks for redundant README keys, uninherited workspace fields, and binary target naming
+- Added Rust client bridges for custom Python data and execution adapters
 - Added experimental executable component bindings for plug-ins
 - Added acceptance tests running the documentation guides and resolving their documented imports
+- Added deterministic simulation testing (DST) transports for HTTP and WebSocket I/O
 - Replaced Reqwest HTTP execution with Hyper and removed direct Reqwest dependencies
 - Improved contingent order handling to respect venue receipt in backtest and sandbox execution
 - Improved Betfair execution client test synchronization (#4866), thanks @folknor
@@ -193,38 +272,49 @@ Released on TBD (UTC).
 - Standardized uv commands, CI, Docker, and documentation on the default `python/.venv` project environment
 - Upgraded Rust (MSRV) to 1.98.1
 - Upgraded `cargo-hawk` tool to v0.1.14
+- Upgraded `cargo-llvm-cov` tool to v0.9.1
+- Upgraded `cargo-nextest` tool to v0.9.144
 - Upgraded `prek` tool to v0.5.2
-- Upgraded `uv` tool to v0.12.9
+- Upgraded `shfmt` pre-commit hook to v3.14.1
+- Upgraded `uv` tool to v0.12.13
 - Upgraded `typos` pre-commit hook to v1.50.1
-- Upgraded `zizmor` pre-commit hook to v1.30.0
-- Upgraded `alloy-primitives` crate to v1.7.2
+- Upgraded `zizmor` pre-commit hook to v1.30.1
+- Upgraded `alloy-primitives` crate to v1.7.3
 - Upgraded `flate2` crate to v1.1.10
 - Upgraded `indexmap` crate to v2.14.2
 - Upgraded `rcgen` crate to v0.14.10
 - Upgraded `arrow`, `arrow-row`, and `parquet` crates to v59.3.0
 - Upgraded `aws-lc-rs` crate to v1.18.1
+- Upgraded `capnp` crate to v0.27.2
 - Upgraded `databento` crate to v0.61.0
+- Upgraded `hypersync-client` crate to v1.4.1
 - Upgraded `redis` crate to v1.7.0
+- Upgraded `rstest` crate to v0.27.0
 - Upgraded `rust_decimal` crate to v1.43.0
+- Upgraded `rustls` crate to v0.23.45 (fixes RUSTSEC-2026-0285)
 - Upgraded `smallvec` crate to v1.16.0
+- Upgraded `tabled` crate to v0.22.0
 - Upgraded `tokio-rustls` crate to v0.26.5
-- Upgraded `toml` crate to v1.1.5
+- Upgraded `toml` crate to v1.1.6
+- Upgraded `uuid` crate to v1.26.1
 - Upgraded `kaleido` package to v1.4.0
 - Upgraded `linkify-it-py` package to v2.2.0
+- Upgraded `numpy` package to v2.5.3
 - Upgraded `plotly` package to v7.0.0
-- Upgraded `cargo-llvm-cov` to v0.9.1
-- Upgraded `ruff` package (dev) and pre-commit hook to v0.16.6
+- Upgraded `ruff` package (dev) and pre-commit hook to v0.16.7
 - Upgraded `simplejson` package to v4.1.2
 - Upgraded `ty` package (dev) to v0.0.78
 
 ### Documentation Updates
 
+- Added Cargo cooldown publication-date database guidance to the environment setup guide
 - Added a troubleshooting section for import errors caused by installing the 1.x line
 - Added the NumPy and pandas prerequisites the wheel does not install
 - Added an environment report snippet to the bug report template
 - Added an explicit statement that the documentation covers v2 only
 - Added Kraken Futures Maker Protection held-order semantics to the integration guide
 - Added OKX RPI minimum-notional thresholds and amend rejection rules
+- Added OKX USD-to-USDC spot migration guidance for `spot_trade_quote_ccy` and `activate_feature`
 - Changed install commands to require `--pre` for the v2 wheel (#4919), thanks for reporting @pcoughlin
 - Changed the getting started and tutorial guides to run on bundled sample data without a download
 - Simplified documented `StrategyConfig` and `DataActorConfig` subclassing to keyword-only fields
@@ -232,7 +322,10 @@ Released on TBD (UTC).
 - Updated persistence catalog migration commands to kebab-case binary names
 - Updated migration guidance for order books and instrument inspection
 - Updated Makefile help output to match the startup log header
+- Updated managed GTD expiry guidance for cancel rejections, retries, and callback timing
+- Updated Bybit risk-events docs for split-settlement, dividend, and unrecognized exec types
 - Updated Hyperliquid guide for rejection events, price guard, and trigger-order resting
+- Updated Hyperliquid guide for quote-denominated quantities and orders-section scanning
 - Restructured execution documentation around algorithms, policies, reconciliation, and live recovery
 - Standardized Rust documentation links and added offline link coverage
 - Standardized admonition severity levels to match the documented taxonomy

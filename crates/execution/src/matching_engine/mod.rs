@@ -66,7 +66,9 @@ use nautilus_model::{
     orders::{MarketOrder, Order, OrderAny, OrderCore},
     position::{Position, PositionReplayEvent},
     types::{
-        Currency, Money, Price, Quantity, fixed::FIXED_PRECISION, price::PriceRaw,
+        Currency, Money, Price, Quantity,
+        fixed::{FIXED_PRECISION, raw_scales_match},
+        price::PriceRaw,
         quantity::QuantityRaw,
     },
 };
@@ -2984,7 +2986,8 @@ impl OrderMatchingEngine {
             }
 
             // Check for valid order quantity precision
-            if order.quantity().precision != self.instrument.size_precision() {
+            if !order_precision_valid(order.quantity().precision, self.instrument.size_precision())
+            {
                 break 'validate Some(
                     format!(
                         "Invalid order quantity precision for order {}, was {} when {} size precision is {}",
@@ -2999,7 +3002,7 @@ impl OrderMatchingEngine {
 
             // Check for valid order display quantity precision
             if let Some(display_qty) = order.display_qty()
-                && display_qty.precision != self.instrument.size_precision()
+                && !order_precision_valid(display_qty.precision, self.instrument.size_precision())
             {
                 break 'validate Some(
                     format!(
@@ -3015,7 +3018,7 @@ impl OrderMatchingEngine {
 
             // Check for valid order price precision
             if let Some(price) = order.price()
-                && price.precision != self.instrument.price_precision()
+                && !order_precision_valid(price.precision, self.instrument.price_precision())
             {
                 break 'validate Some(
                     format!(
@@ -3031,7 +3034,10 @@ impl OrderMatchingEngine {
 
             // Check for valid order trigger price precision
             if let Some(trigger_price) = order.trigger_price()
-                && trigger_price.precision != self.instrument.price_precision()
+                && !order_precision_valid(
+                    trigger_price.precision,
+                    self.instrument.price_precision(),
+                )
             {
                 break 'validate Some(
                     format!(
@@ -3872,28 +3878,67 @@ impl OrderMatchingEngine {
     }
 
     fn process_trailing_stop_order(&mut self, order: &mut OrderAny) {
-        if let Some(trigger_price) = order.trigger_price()
-            && self.core.is_stop_matched_with_trigger_type(
-                order.order_side(),
-                trigger_price,
-                order.trigger_type().unwrap_or(TriggerType::Default),
-            )
+        let side = order.order_side();
+        let trigger_type = order.trigger_type().unwrap_or(TriggerType::Default);
+
+        if let Some(activation_price) = order.activation_price()
+            && self.core.is_touch_triggered(side, activation_price)
+            && self.config.reject_stop_orders
         {
             self.generate_order_rejected(
-                    order,
-                    format!(
-                        "{} {} order trigger px of {} was in the market: bid={}, ask={}, but rejected because of configuration",
-                        order.order_type(),
-                        order.order_side(),
-                        trigger_price,
-                        self.core
-                            .bid
-                            .map_or_else(|| "None".to_string(), |p| p.to_string()),
-                        self.core
-                            .ask
-                            .map_or_else(|| "None".to_string(), |p| p.to_string())
-                    ).into(),
-                );
+                order,
+                format!(
+                    "{} {} order activation px of {} was in the market: bid={}, ask={}, but rejected because of configuration",
+                    order.order_type(),
+                    side,
+                    activation_price,
+                    self.core
+                        .bid
+                        .map_or_else(|| "None".to_string(), |p| p.to_string()),
+                    self.core
+                        .ask
+                        .map_or_else(|| "None".to_string(), |p| p.to_string())
+                )
+                .into(),
+            );
+            return;
+        }
+
+        let activates_now = match order.activation_price() {
+            Some(activation_price) => self.core.is_touch_triggered(side, activation_price),
+            None => self
+                .get_trailing_activation_price(
+                    trigger_type,
+                    side,
+                    self.core.bid,
+                    self.core.ask,
+                    self.core.last,
+                )
+                .is_some(),
+        };
+
+        if activates_now
+            && let Some(trigger_price) = order.trigger_price()
+            && self
+                .core
+                .is_stop_matched_with_trigger_type(side, trigger_price, trigger_type)
+        {
+            self.generate_order_rejected(
+                order,
+                format!(
+                    "{} {} order trigger px of {} was in the market: bid={}, ask={}, but rejected because of configuration",
+                    order.order_type(),
+                    side,
+                    trigger_price,
+                    self.core
+                        .bid
+                        .map_or_else(|| "None".to_string(), |p| p.to_string()),
+                    self.core
+                        .ask
+                        .map_or_else(|| "None".to_string(), |p| p.to_string())
+                )
+                .into(),
+            );
             return;
         }
 
@@ -5027,7 +5072,7 @@ impl OrderMatchingEngine {
                     .unwrap_or(initial_total_filled)
                     .checked_add(capped_fill_qty)
                     .expect("Overflow occurred when adding reduce-only target quantity");
-                reduce_only_target.precision = order.quantity().precision;
+                reduce_only_target.precision = self.instrument.size_precision();
 
                 if order.quantity() != reduce_only_target {
                     self.generate_order_updated(order, reduce_only_target, None, None, None);
@@ -5128,7 +5173,7 @@ impl OrderMatchingEngine {
                         .unwrap_or(initial_total_filled)
                         .checked_add(leaves_qty)
                         .expect("Overflow occurred when adding reduce-only target quantity");
-                    reduce_only_target.precision = order.quantity().precision;
+                    reduce_only_target.precision = self.instrument.size_precision();
 
                     if order.quantity() != reduce_only_target {
                         self.generate_order_updated(order, reduce_only_target, None, None, None);
@@ -6132,7 +6177,7 @@ impl OrderMatchingEngine {
         let size_prec = self.instrument.size_precision();
         let instrument_id = self.instrument.id();
 
-        if quantity.precision != size_prec {
+        if !order_precision_valid(quantity.precision, size_prec) {
             self.generate_order_modify_rejected(
                 order.trader_id(),
                 order.strategy_id(),
@@ -6149,7 +6194,7 @@ impl OrderMatchingEngine {
         }
 
         if let Some(px) = price
-            && px.precision != price_prec
+            && !order_precision_valid(px.precision, price_prec)
         {
             self.generate_order_modify_rejected(
                 order.trader_id(),
@@ -6167,7 +6212,7 @@ impl OrderMatchingEngine {
         }
 
         if let Some(tp) = trigger_price
-            && tp.precision != price_prec
+            && !order_precision_valid(tp.precision, price_prec)
         {
             self.generate_order_modify_rejected(
                 order.trader_id(),
@@ -6868,6 +6913,10 @@ enum PostMatchOrderAction {
     NoMaintenance,
 }
 
+fn order_precision_valid(actual: u8, expected: u8) -> bool {
+    actual <= expected && raw_scales_match(actual, expected)
+}
+
 fn post_match_order_action<F>(
     order: &OrderAny,
     support_gtd_orders: bool,
@@ -7024,7 +7073,7 @@ mod tests {
 
     use super::{
         BarTickSizes, OrderFilled, OrderMatchingEngine, Position, PositionId, PostMatchOrderAction,
-        post_match_order_action,
+        order_precision_valid, post_match_order_action,
     };
     use crate::{
         matching_engine::config::OrderMatchingEngineConfig,
@@ -7059,6 +7108,21 @@ mod tests {
                 volume.raw() - total_raw,
             );
         }
+    }
+
+    #[rstest]
+    #[case::lower(0, FIXED_PRECISION, true)]
+    #[case::equal(FIXED_PRECISION, FIXED_PRECISION, true)]
+    #[case::excess(3, 2, false)]
+    #[case::native_equal(18, 18, true)]
+    #[case::native_lower(17, 18, false)]
+    #[case::native_shared_lower(FIXED_PRECISION, 18, false)]
+    fn test_order_precision_valid(
+        #[case] actual: u8,
+        #[case] expected: u8,
+        #[case] accepted: bool,
+    ) {
+        assert_eq!(order_precision_valid(actual, expected), accepted);
     }
 
     #[rstest]

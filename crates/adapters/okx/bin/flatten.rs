@@ -395,6 +395,7 @@ async fn close_position(client: &OKXHttpClient, open: &OpenPosition) -> anyhow::
             px_vol: None,
             reduce_only: Some(true),
             tgt_ccy: None,
+            trade_quote_ccy: None,
             attach_algo_ords: None,
             outcome: None,
             slippage_pct: None,
@@ -495,7 +496,7 @@ fn new_flatten_client_order_id() -> anyhow::Result<String> {
     let suffix: String = UUID4::new()
         .to_string()
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .take(31)
         .collect();
     let cl_ord_id = format!("F{suffix}");
@@ -621,6 +622,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::similar_names,
+        reason = "position_side and position_size mirror OKX position field naming"
+    )]
     fn stub_position(
         position_side: OKXPositionSide,
         position_size: &str,

@@ -136,7 +136,7 @@ same platform produces bitwise-identical:
 
 ### Required conditions
 
-The contract holds only when every row below is satisfied:
+The contract holds **only when every row below is satisfied**:
 
 | Source of nondeterminism | Required condition                                                       | Failure when bypassed                                                                                                                                  |
 | ------------------------ | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -216,11 +216,22 @@ The transitive closure of `nautilus-live` contains 16 in-scope crates:
 The hook also covers `backtest`, bringing the total to 17 crates.
 
 Adapter crates and infrastructure crates (Redis, Postgres) are out of scope unless an audited
-slice is listed here. The OKX public Spot state slice routes state-affecting clock reads and timers
-through the DST seams and sorts reconnect and bulk-unsubscribe subscription commands. The static
-hook covers `book_sync.rs`, `data.rs`, `http/client.rs`, `websocket/client.rs`, and
-`websocket/handler.rs` in `crates/adapters/okx/src`. These files also serve paths outside the proven
-slice: static coverage alone does not establish their runtime eligibility.
+slice is listed here. Audited OKX DST-path production files route state-affecting clock reads and
+timers through the DST seams and sort reconnect and bulk-unsubscribe subscription commands. The
+static hook covers `book_sync.rs`, `common/parse.rs`, `common/task.rs`, `data.rs`, `execution.rs`,
+`http/client.rs`, `http/models.rs`, `websocket/client.rs`, `websocket/dispatch.rs`,
+`websocket/handler.rs`, `websocket/messages.rs`, and `websocket/parse.rs` in
+`crates/adapters/okx/src`. These files also serve paths outside a proven runtime slice: static
+coverage alone does not establish their runtime eligibility.
+
+Focused Madsim tests in `crates/adapters/okx/tests/integration/dst.rs` cover subscribe-wire bytes for public
+WebSocket quotes, trades, and books, business WebSocket bars, and multi-instrument quote reconnect
+in topic order. Reconnect also clears quote and funding caches in `data.rs` so a new generation
+cannot reuse prior values. Private-path tests cover the login frame (key, passphrase, and
+signature derived from the simulated wall clock), single order-submit wire fields, and
+batch order-submit wire fields in input order. Complete request-to-wire-to-domain fresh-process
+comparison stays in the downstream DST harness. Other public channels, private data, and execution
+share the DST facades and convention gate but remain unproven runtime slices.
 
 ## Simulated HTTP and WebSocket transport
 
@@ -701,29 +712,30 @@ adapter runs across fresh processes.
 
 ### Simulation smoke gate
 
-The dedicated workflow and local pre-flight use the same DST targets:
+The nightly workflow and local pre-flight use the same DST targets:
 
-| Entry point                 | Relevant order                                            | Purpose                                                  |
-| --------------------------- | --------------------------------------------------------- | -------------------------------------------------------- |
-| `.github/workflows/dst.yml` | `check-code-sim` > `cargo-test-sim`                       | Runs the nightly and manually dispatched DST smoke gate. |
-| `make pre-flight`           | `check-code-sim` > `cargo-test-sim` > `cargo-test-extras` | Fails early on DST lint before the Rust test suites.     |
+| Entry point                           | Relevant order                                            | Purpose                                                  |
+| ------------------------------------- | --------------------------------------------------------- | -------------------------------------------------------- |
+| `.github/workflows/nightly-tests.yml` | `check-code-sim` > `cargo-test-sim`                       | Runs the nightly and manually dispatched DST smoke gate. |
+| `make pre-flight`                     | `check-code-sim` > `cargo-test-sim` > `cargo-test-extras` | Fails early on DST lint before the Rust test suites.     |
 
 `check-code-sim` runs pinned stable Clippy with `--features simulation` and `cfg(madsim)` across
 `nautilus-common`, `nautilus-core`, `nautilus-event-store`, `nautilus-network`,
 `nautilus-execution`, and `nautilus-live`. A separate `--no-default-features` leg compiles and lints
-the audited OKX public Spot state slice without enabling OKX's default `high-precision` feature in
-the standard-precision core leg.
+the OKX adapter without enabling OKX's default `high-precision` feature in the standard-precision
+core leg.
 
-`cargo-test-sim` uses two feature-coherent nextest invocations:
+`cargo-test-sim` uses three feature-coherent nextest invocations:
 
 | Precision | Packages                                                                                                              | Features                    | Selection                                                                                      |
 | --------- | --------------------------------------------------------------------------------------------------------------------- | --------------------------- | ---------------------------------------------------------------------------------------------- |
 | Standard  | `nautilus-common`, `nautilus-core`, `nautilus-event-store`, `nautilus-network`, `nautilus-execution`, `nautilus-live` | `simulation`                | All compatible common, event-store, network, and execution tests; focused live and core tests. |
+| Standard  | `nautilus-okx`                                                                                                        | `simulation`                | Integration `dst` tests only, without OKX's default `high-precision` feature.                  |
 | High      | `nautilus-common`, `nautilus-execution`                                                                               | `simulation,high-precision` | All tests in both packages.                                                                    |
 
 Nextest compiles the selected library and test targets, so the gate does not run a separate Cargo
 build. The invocations resolve each feature set once across their package sets. Together they
-exercise seam-routed `QuantityRaw` and `PriceRaw` paths at both fixed-point widths: `u64` and `u128`.
+exercise seam-routed `QuantityRaw` (`u64` / `u128`) and `PriceRaw` (`i64` / `i128`) paths at both fixed-point widths.
 
 #### Common tests
 
@@ -767,9 +779,9 @@ reconnect, unsupported endpoint and Sockudo rejection, and jitter reset checks. 
 cancellation, redirect policy, and HTTPS/proxy rejection.
 
 `#[madsim::test]` uses a varying seed by default and reports it on failure. Set `MADSIM_TEST_SEED`
-to replay a schedule. The nightly gate in `.github/workflows/dst.yml` selects five consecutive
-seeds from `GITHUB_RUN_NUMBER * MADSIM_TEST_NUM`. The jitter runtime-reset test
-pins its own seed and complements the cross-seed network checks.
+to replay a schedule. The `dst smoke (cfg madsim)` job in `.github/workflows/nightly-tests.yml`
+selects five consecutive seeds from `GITHUB_RUN_NUMBER * MADSIM_TEST_NUM`. The jitter runtime-reset
+test pins its own seed and complements the cross-seed network checks.
 
 #### Execution tests
 
@@ -781,11 +793,17 @@ runtime. `default_std_rng()` therefore takes its host-RNG fallback in these test
 
 The focused `nautilus-core` selection pins `wall_clock_now` against virtual time.
 
+#### OKX adapter tests
+
+The standard-precision OKX leg runs the integration `dst` tests under `simulation` without the
+crate's default `high-precision` feature. Those `#[madsim::test]` cases cover public WebSocket
+quotes, trades, and books, business WebSocket bars, and multi-instrument quote reconnect order.
+
 #### Overall gate coverage
 
-`#[madsim::test]` cases in `nautilus-common`, `nautilus-core`, `nautilus-network`, and
-`nautilus-live` provide deterministic-scheduler coverage. The complete gate catches drift in the
-cfg-gated seams but does not verify end-to-end adapter determinism.
+`#[madsim::test]` cases in `nautilus-common`, `nautilus-core`, `nautilus-network`,
+`nautilus-live`, and `nautilus-okx` provide deterministic-scheduler coverage. The complete gate
+catches drift in the cfg-gated seams but does not verify end-to-end adapter determinism.
 
 ## Further reading
 

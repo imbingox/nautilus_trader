@@ -119,6 +119,12 @@ impl HyperliquidHttpClient {
     ///
     /// This is required for parsing orders, fills, and positions into reports.
     /// Any existing instrument with the same symbol will be replaced.
+    ///
+    /// The venue asset index is taken from the instrument's `info` map so an
+    /// instrument arriving on the message bus becomes submittable without
+    /// refetching venue metadata. An instrument without the key keeps its
+    /// existing asset index, if any, because guessing one would route orders to
+    /// the wrong asset.
     #[pyo3(name = "cache_instrument")]
     fn py_cache_instrument(&self, py: Python<'_>, instrument: Py<PyAny>) -> PyResult<()> {
         self.cache_instrument(&pyobject_to_instrument_any(py, instrument)?);
@@ -498,7 +504,9 @@ impl HyperliquidHttpClient {
     /// # Errors
     ///
     /// Returns an error if credentials are missing, order validation fails, serialization fails,
-    /// or the API returns an error.
+    /// or the API returns an error. Also returns an error for any quote-denominated quantity:
+    /// this raw path has no cached market data for a quote-to-base conversion, so such orders
+    /// must be submitted through the execution client instead.
     #[pyo3(name = "submit_orders")]
     fn py_submit_orders<'py>(
         &self,

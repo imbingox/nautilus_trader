@@ -14,7 +14,8 @@ recommended values, see
 
 ## Reconciliation model
 
-Only the `LiveExecutionEngine` performs reconciliation, since backtesting controls both sides.
+Live execution reconciles local state against venue reports. Backtesting controls both order
+execution and the resulting state, so it does not need venue reconciliation.
 
 Two scenarios:
 
@@ -27,12 +28,76 @@ and gives reconciliation the retained order and position state needed to interpr
 windows.
 :::
 
+### Component responsibilities
+
+`LiveNode` owns the `ExecutionManager` and schedules recurring reconciliation. The manager tracks
+activity, retries, and fill identities, interprets cached state, and prepares reconciliation events.
+`ExecutionEngine` applies events to orders and positions and handles individual execution reports.
+
+The UML diagram shows ownership and dependencies. A filled diamond denotes ownership; dashed arrows
+point from a caller to a component it uses. The kernel owns the engine and shared cache; it is omitted
+here to focus on reconciliation.
+
+```mermaid
+classDiagram
+    direction LR
+
+    namespace nautilus_live {
+        class LiveNode
+        class ExecutionManager
+    }
+    namespace nautilus_execution {
+        class ExecutionEngine
+    }
+    namespace nautilus_common {
+        class ExecutionClient {
+            <<interface>>
+        }
+        class Cache
+    }
+
+    LiveNode *-- ExecutionManager : owns
+    LiveNode ..> ExecutionClient : requests recurring reports
+    LiveNode ..> ExecutionEngine : dispatches through kernel
+    ExecutionManager ..> ExecutionClient : polls reports for standalone checks
+    ExecutionManager ..> ExecutionEngine : applies startup events
+    ExecutionManager ..> Cache : reads state and registers external orders
+    ExecutionEngine ..> ExecutionClient : routes commands and requests reports
+    ExecutionEngine ..> Cache : updates orders and positions
+```
+
+The live client facade shares one adapter instance between the node and engine. Pending report
+requests can retain client borrows while the event loop handles other work. Instrument updates are
+deferred until those borrows are released, then flushed on request completion or cancellation.
+
+Within `nautilus-live`, the source modules divide these responsibilities as follows:
+
+| Module                        | Responsibility                                                           |
+| ----------------------------- | ------------------------------------------------------------------------ |
+| `node/mod.rs`                 | Node lifecycle, event loop, and event dispatch.                          |
+| `node/reconciliation.rs`      | Recurring report tasks, deadlines, cancellation, and result handling.    |
+| `execution/manager.rs`        | Reconciliation state, decisions, and individual reconciliation checks.   |
+| `execution/reconciliation.rs` | Shared types, state-independent decisions, and targeted report requests. |
+
+The separate `nautilus_execution::reconciliation` module supplies report-to-event and arithmetic
+operations shared with the execution engine.
+
+At startup, the manager publishes raw reports, applies order and fill events, verifies historical
+fill application, and then evaluates positions against the updated cache. During continuous
+position checks, the node coordinates authoritative fill queries and dispatch before asking the
+manager to generate synthetic events. Activity revisions detect local changes during requests or
+callbacks; applying authoritative fills defers synthetic reconciliation until a fresh position report.
+
+The manager remains available without the `node` feature. Standalone callers can use its individual
+polling methods and apply the returned events themselves. Standalone position polling directly
+returns synthetic discrepancy events; the node adds the authoritative-fill recovery sequence.
+
 ### Execution-client origins
 
 An **execution-client origin** is a write-once binding between an order and the client responsible
 for its execution.
 
-**An origin is recorded:**
+An origin is recorded:
 
 - From an explicit client on submission, or from the final client selected after routing and venue
   validation and before transport.
@@ -41,7 +106,7 @@ for its execution.
 - When external orders are materialized from runtime venue reports and the report's account
   matches exactly one registered client that handles the instrument venue.
 
-**An origin may be absent for:**
+An origin may be absent for:
 
 - Cache data written before resolved origins were persisted.
 - External orders whose runtime report does not identify exactly one registered client by account
@@ -100,15 +165,15 @@ authoritative position report can reconcile the current venue position separatel
 
 ### External order creation
 
-When a report references an order that is absent from the cache, the engine creates an *external
-order*. This covers venue-initiated ADL, liquidation, or settlement, orders placed by another
+When a report references an order that is absent from the cache, the engine creates an **external
+order**. This covers venue-initiated ADL, liquidation, or settlement, orders placed by another
 process, and orders not yet observed locally.
 
 The naming distinguishes configuration intent from live ownership state:
 
 - `external_order_instrument_ids` is the serializable strategy configuration intent. It names the
   instruments whose external orders should be assigned to the strategy when it is registered.
-- An external order claim is an active cache entry that maps one `InstrumentId` to one `StrategyId`.
+- An **external order claim** is an active cache entry that maps one `InstrumentId` to one `StrategyId`.
   The code uses `external_order_claims` for the collection of these live entries.
 
 Live strategy registration materializes the configured instrument IDs with
@@ -144,11 +209,49 @@ Positions then update through the normal event pipeline.
 See [Claiming external orders](../strategies.md#claiming-external-orders) for strategy configuration
 and runtime updates.
 
+### Reducing external positions
+
+A strategy can use reduce-only fills to reduce inherited `EXTERNAL` inventory under NETTING.
+
+#### Position selection
+
+Existing cached position links remain authoritative. Without a cached link, a reduce-only fill
+uses the strategy's own open position when available. If that position is absent or closed, the
+engine looks for positions that meet all of these conditions:
+
+- Belong to `EXTERNAL` and use NETTING.
+- Are open on the opposite side of the fill.
+- Match the fill's instrument and account.
+
+The engine selects a fallback only when **exactly one** position matches. The fill quantity must
+not exceed that position's quantity, though the order's remaining quantity can be larger.
+If no safe fallback exists, an otherwise valid fill updates the order but neither opens nor
+updates a position.
+
+#### Ownership and events
+
+After a successful reduction, the engine links the order to the external position so subsequent
+fills use the same target. The position retains `EXTERNAL` ownership:
+
+- `OrderFilled` keeps the reducing strategy's ID and identifies the external position.
+- `PositionChanged` and `PositionClosed` use the `EXTERNAL` strategy's event topic.
+
+#### Linked reduction checks
+
+When applying position economics, each linked reduction must match the external position's account
+and reduce its open quantity without flipping or reopening it. If a fill violates these checks,
+the engine rejects it **before changing the order or position**.
+
+[Order-only fill projection](#order-only-fill-projection) bypasses these reduction checks because
+it repairs order history without changing the position.
+
 ## Reconciliation configuration
 
-Unless `reconciliation` is set to false, the execution engine reconciles state for each
-venue at startup. The `reconciliation_lookback_mins` parameter controls how far back the
-engine requests history.
+Unless `reconciliation` is set to false, the live node runs startup reconciliation for each
+execution client. The `reconciliation_lookback_mins` parameter controls how far back it requests
+history through the execution engine. Startup enablement and polling intervals belong to the node's
+`LiveExecutionEngineConfig`; the manager receives the thresholds, retry limits, filters, and lookbacks
+used to make reconciliation decisions.
 
 :::tip
 Leave `reconciliation_lookback_mins` unset to use the adapter's documented default. Many adapters
@@ -406,8 +509,10 @@ state.
 
 **Order consistency checks** (when cache state differs from venue state):
 
+:::info[Full-history checks]
 The *Not found* rows apply only in full-history mode (`open_check_open_only=False`);
 open-only mode is the default.
+:::
 
 | Cache status       | Venue status | Resolution   | Rationale                                                           |
 | ------------------ | ------------ | ------------ | ------------------------------------------------------------------- |
@@ -421,7 +526,6 @@ open-only mode is the default.
 | `PARTIALLY_FILLED` | `CANCELED`   | `CANCELED`   | Order canceled at venue with fills preserved.                       |
 | `PARTIALLY_FILLED` | *Not found*  | `CANCELED`   | Order doesn't exist but had fills (reconciles fill history).        |
 
-:::note
 **Runtime reconciliation caveats:**
 
 - **Open-only mode**: venue "open orders" endpoints exclude closed orders by design, making
@@ -436,10 +540,8 @@ open-only mode is the default.
   query limitations or timing delays.
 - **Position report failures**: if a venue position query fails, the engine skips cached
   positions for that venue during the cycle instead of treating missing reports as flat.
-- **`FILLED` orders** that are "not found" at the venue are silently ignored. Venues commonly
+- **Completed orders**: `FILLED` orders that are "not found" at the venue are silently ignored. Venues commonly
   drop completed orders from their query results.
-
-:::
 
 **Retry coordination.** The in-flight loop increments its own per-order retry count against
 `inflight_check_retries` and mirrors that value into missing-order tracking. The open-order loop
@@ -519,7 +621,7 @@ These scenarios apply when the mass status does not declare a `lookback_start`:
 | **Flat position**                         | The venue reports flat regardless of fill history.      | Makes no adjustment.                                    |
 | **No fills**                              | The report set contains no fills.                       | Returns the empty fill set.                             |
 
-**Concepts:**
+Concepts:
 
 - **Zero-crossing**: position quantity crosses through zero (FLAT), marking a lifecycle boundary.
 - **Lifecycle**: a sequence of fills between zero-crossings representing one open-close cycle.

@@ -114,6 +114,15 @@ impl CacheView {
         Self { inner }
     }
 
+    /// Tries to borrow the cache without panicking when an engine owns a mutable borrow.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cache is mutably borrowed.
+    pub fn try_borrow(&self) -> Result<Ref<'_, Cache>, std::cell::BorrowError> {
+        self.inner.try_borrow()
+    }
+
     /// Borrows the cache immutably.
     ///
     /// # Panics
@@ -4912,6 +4921,9 @@ impl Cache {
 
     /// Indexes the `position_id` with the other given IDs.
     ///
+    /// A cached `EXTERNAL` position retains its ownership when an order from another strategy
+    /// is linked to it. Otherwise, the supplied `strategy_id` applies.
+    ///
     /// # Errors
     ///
     /// Returns an error if indexing position ID in the backing database fails. The complete index
@@ -4964,10 +4976,17 @@ impl Cache {
         venue: &Venue,
         strategy_id: &StrategyId,
     ) {
+        let strategy_id = self
+            .positions
+            .get(position_id)
+            .map(|position| position.borrow().strategy_id)
+            .filter(StrategyId::is_external)
+            .unwrap_or(*strategy_id);
+
         // Index: PositionId -> StrategyId
         self.index
             .position_strategy
-            .insert(*position_id, *strategy_id);
+            .insert(*position_id, strategy_id);
 
         // Every position has a reverse-order bucket, including orderless positions.
         self.index.position_orders.entry(*position_id).or_default();
@@ -4975,7 +4994,7 @@ impl Cache {
         // Index: StrategyId -> set[PositionId]
         self.index
             .strategy_positions
-            .entry(*strategy_id)
+            .entry(strategy_id)
             .or_default()
             .insert(*position_id);
 
@@ -5889,18 +5908,20 @@ impl Cache {
     ///
     /// # Panics
     ///
-    /// Panics if any `client_order_id` in the set is not found in the cache.
+    /// Panics if any `client_order_id` in the input is not found in the cache.
     fn get_orders_for_ids(
         &self,
-        client_order_ids: &AHashSet<ClientOrderId>,
+        client_order_ids: impl IntoIterator<Item = ClientOrderId>,
         side: Option<OrderSide>,
     ) -> Vec<OrderRef<'_>> {
+        const UNCACHED_SORT_MAX_LEN: usize = 32;
+
         let mut orders = Vec::new();
 
         for client_order_id in client_order_ids {
             let order_cell = self
                 .orders
-                .get(client_order_id)
+                .get(&client_order_id)
                 .unwrap_or_else(|| panic!("Order {client_order_id} not found"));
             let order = OrderRef::new(order_cell.borrow());
 
@@ -5910,8 +5931,15 @@ impl Cache {
         }
 
         // Sort so callers receive a deterministic Vec across runs; the
-        // underlying client_order_ids set is AHash-backed.
-        orders.sort_by_key(|o| o.client_order_id());
+        // underlying ID sources are AHash-backed.
+        let key = |order: &OrderRef<'_>| order.client_order_id();
+
+        if orders.len() <= UNCACHED_SORT_MAX_LEN {
+            orders.sort_by_key(key);
+        } else {
+            orders.sort_by_cached_key(key);
+        }
+
         orders
     }
 
@@ -6591,8 +6619,17 @@ impl Cache {
         account_id: Option<&AccountId>,
         side: Option<OrderSide>,
     ) -> Vec<OrderRef<'_>> {
-        let client_order_ids = self.client_order_ids(venue, instrument_id, strategy_id, account_id);
-        self.get_orders_for_ids(&client_order_ids, side)
+        if venue.is_none()
+            && instrument_id.is_none()
+            && strategy_id.is_none()
+            && account_id.is_none()
+        {
+            return self.get_orders_for_ids(self.index.orders.iter().copied(), side);
+        }
+
+        let client_order_ids =
+            self.iter_client_order_ids(venue, instrument_id, strategy_id, account_id);
+        self.get_orders_for_ids(client_order_ids, side)
     }
 
     /// Returns borrows of all orders matching the optional filter parameters.
@@ -6622,7 +6659,7 @@ impl Cache {
     ) -> Vec<OrderRef<'_>> {
         let client_order_ids =
             self.client_order_ids_open(venue, instrument_id, strategy_id, account_id);
-        self.get_orders_for_ids(&client_order_ids, side)
+        self.get_orders_for_ids(client_order_ids.iter().copied(), side)
     }
 
     /// Returns borrows of all open orders matching the optional filter parameters.
@@ -6652,7 +6689,7 @@ impl Cache {
     ) -> Vec<OrderRef<'_>> {
         let client_order_ids =
             self.client_order_ids_closed(venue, instrument_id, strategy_id, account_id);
-        self.get_orders_for_ids(&client_order_ids, side)
+        self.get_orders_for_ids(client_order_ids.iter().copied(), side)
     }
 
     /// Returns borrows of all closed orders matching the optional filter parameters.
@@ -6685,7 +6722,7 @@ impl Cache {
     ) -> Vec<OrderRef<'_>> {
         let client_order_ids =
             self.client_order_ids_active_local(venue, instrument_id, strategy_id, account_id);
-        self.get_orders_for_ids(&client_order_ids, side)
+        self.get_orders_for_ids(client_order_ids.iter().copied(), side)
     }
 
     /// Returns borrows of all locally active orders matching the optional filter parameters.
@@ -6715,7 +6752,7 @@ impl Cache {
     ) -> Vec<OrderRef<'_>> {
         let client_order_ids =
             self.client_order_ids_emulated(venue, instrument_id, strategy_id, account_id);
-        self.get_orders_for_ids(&client_order_ids, side)
+        self.get_orders_for_ids(client_order_ids.iter().copied(), side)
     }
 
     /// Returns borrows of all emulated orders matching the optional filter parameters.
@@ -6745,7 +6782,7 @@ impl Cache {
     ) -> Vec<OrderRef<'_>> {
         let client_order_ids =
             self.client_order_ids_inflight(venue, instrument_id, strategy_id, account_id);
-        self.get_orders_for_ids(&client_order_ids, side)
+        self.get_orders_for_ids(client_order_ids.iter().copied(), side)
     }
 
     /// Returns borrows of all in-flight orders matching the optional filter parameters.
@@ -6767,7 +6804,9 @@ impl Cache {
     #[must_use]
     pub fn orders_for_position(&self, position_id: &PositionId) -> Vec<OrderRef<'_>> {
         match self.index.position_orders.get(position_id) {
-            Some(client_order_ids) => self.get_orders_for_ids(client_order_ids, None),
+            Some(client_order_ids) => {
+                self.get_orders_for_ids(client_order_ids.iter().copied(), None)
+            }
             None => Vec::new(),
         }
     }
@@ -7155,14 +7194,14 @@ impl Cache {
             strategy_id,
             account_id,
         );
-        self.get_orders_for_ids(&filtered, side)
+        self.get_orders_for_ids(filtered.iter().copied(), side)
     }
 
     /// Returns references to all orders with the `exec_spawn_id`.
     #[must_use]
     pub fn orders_for_exec_spawn(&self, exec_spawn_id: &ClientOrderId) -> Vec<OrderRef<'_>> {
         match self.index.exec_spawn_orders.get(exec_spawn_id) {
-            Some(ids) => self.get_orders_for_ids(ids, None),
+            Some(ids) => self.get_orders_for_ids(ids.iter().copied(), None),
             None => Vec::new(),
         }
     }
@@ -7989,6 +8028,7 @@ impl Cache {
         let mut bid_quotes = AHashMap::new();
         let mut ask_quotes = AHashMap::new();
         let mut quote_sources = AHashMap::new();
+        let mut bar_quotes = None;
 
         for (instrument_id, instrument) in &self.instruments {
             if instrument_id.venue != *venue {
@@ -7998,11 +8038,6 @@ impl Cache {
             let Some(base_currency) = instrument.base_currency() else {
                 continue;
             };
-            let pair = Ustr::from(&format!(
-                "{}/{}",
-                base_currency.code,
-                instrument.quote_currency().code
-            ));
 
             let (bid_price, ask_price) = if let Some(ticks) = self.quotes.get(instrument_id) {
                 if let Some(tick) = ticks.front() {
@@ -8011,40 +8046,21 @@ impl Cache {
                     continue; // Empty ticks vector
                 }
             } else {
-                // Multiple bar types may exist per instrument: select the most recently added
-                // bar per side, preferring the greatest ts_init for determinism and breaking
-                // ties by bar type.
-                let mut latest_bid: Option<(&BarType, &Bar)> = None;
-                let mut latest_ask: Option<(&BarType, &Bar)> = None;
-
-                for (bar_type, bars) in &self.bars {
-                    if bar_type.instrument_id() != *instrument_id {
-                        continue;
-                    }
-
-                    let Some(bar) = bars.front() else {
-                        continue;
-                    };
-
-                    let slot = match bar_type.spec().price_type {
-                        PriceType::Bid => &mut latest_bid,
-                        PriceType::Ask => &mut latest_ask,
-                        _ => continue,
-                    };
-
-                    if slot.is_none_or(|(current_type, current)| {
-                        (current.ts_init, current_type) < (bar.ts_init, bar_type)
-                    }) {
-                        *slot = Some((bar_type, bar));
-                    }
-                }
-
-                match (latest_bid, latest_ask) {
+                let quotes = bar_quotes.get_or_insert_with(|| self.build_bar_quote_table(venue));
+                match (
+                    quotes.get(&(*instrument_id, PriceType::Bid)),
+                    quotes.get(&(*instrument_id, PriceType::Ask)),
+                ) {
                     (Some((_, bid_bar)), Some((_, ask_bar))) => (bid_bar.close, ask_bar.close),
                     _ => continue,
                 }
             };
 
+            let pair = Ustr::from(&format!(
+                "{}/{}",
+                base_currency.code,
+                instrument.quote_currency().code
+            ));
             let preference = (
                 bid_price.is_positive() && ask_price.is_positive(),
                 instrument.instrument_class() == InstrumentClass::Spot,
@@ -8064,6 +8080,40 @@ impl Cache {
         }
 
         (bid_quotes, ask_quotes)
+    }
+
+    fn build_bar_quote_table(
+        &self,
+        venue: &Venue,
+    ) -> AHashMap<(InstrumentId, PriceType), (&BarType, &Bar)> {
+        let mut quotes: AHashMap<_, (&BarType, &Bar)> = AHashMap::new();
+
+        for (bar_type, bars) in &self.bars {
+            let instrument_id = bar_type.instrument_id();
+            let price_type = bar_type.spec().price_type;
+
+            if instrument_id.venue != *venue
+                || !matches!(price_type, PriceType::Bid | PriceType::Ask)
+            {
+                continue;
+            }
+
+            let Some(bar) = bars.front() else {
+                continue;
+            };
+
+            // Select the newest front bar per side, breaking timestamp ties by bar type
+            quotes
+                .entry((instrument_id, price_type))
+                .and_modify(|current| {
+                    if (current.1.ts_init, current.0) < (bar.ts_init, bar_type) {
+                        *current = (bar_type, bar);
+                    }
+                })
+                .or_insert((bar_type, bar));
+        }
+
+        quotes
     }
 
     /// Returns the mark exchange rate for the given currency pair, or `None` if not set.

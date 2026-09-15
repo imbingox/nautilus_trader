@@ -317,6 +317,7 @@ mod tests {
 
     use nautilus_common::{
         cache::Cache,
+        clock::TestClock,
         factories::ExecutionClientFactory,
         messages::execution::{
             GenerateFillReportsBuilder, GenerateOrderStatusReportBuilder,
@@ -347,6 +348,7 @@ mod tests {
                 "BINANCE_PAPI",
                 &BinancePapiExecutionClientConfig::default(),
                 Rc::new(RefCell::new(Cache::default())).into(),
+                Rc::new(RefCell::new(TestClock::new())),
             )
             .unwrap()
     }
@@ -381,6 +383,7 @@ mod tests {
                 "PAPI-READ-007",
                 &config,
                 cache.into(),
+                Rc::new(RefCell::new(TestClock::new())),
             )
             .unwrap()
     }

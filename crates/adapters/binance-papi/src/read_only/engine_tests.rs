@@ -87,8 +87,7 @@ async fn incomplete_history_keeps_exact_explicit_fees_without_position_or_portfo
 
     let result = ctx
         .manager
-        .reconcile_execution_mass_status(snapshot.mass_status, Rc::clone(&ctx.engine))
-        .await;
+        .reconcile_execution_mass_status(&snapshot.mass_status, &ctx.engine);
     msgbus::deregister_any(endpoint);
 
     let expected_fee = Money::from_decimal(
@@ -147,8 +146,7 @@ async fn incomplete_history_cannot_estimate_missing_venue_commission() {
     let mut ctx = EngineContext::new(ReadClient::new(reader));
     let result = ctx
         .manager
-        .reconcile_execution_mass_status(snapshot.mass_status, Rc::clone(&ctx.engine))
-        .await;
+        .reconcile_execution_mass_status(&snapshot.mass_status, &ctx.engine);
     assert!(
         !result
             .events

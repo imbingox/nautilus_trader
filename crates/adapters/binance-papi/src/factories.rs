@@ -15,9 +15,14 @@
 
 //! Factory for Binance Portfolio Margin execution clients.
 
+use std::{cell::RefCell, rc::Rc};
+
+#[cfg(test)]
+use nautilus_common::clock::TestClock;
 use nautilus_common::{
     cache::CacheView,
     clients::ExecutionClient,
+    clock::Clock,
     factories::{ClientConfig, ExecutionClientFactory},
 };
 use nautilus_execution::client::core::ExecutionClientCore;
@@ -61,6 +66,7 @@ impl ExecutionClientFactory for BinancePapiExecutionClientFactory {
         name: &str,
         config: &dyn ClientConfig,
         cache: CacheView,
+        _clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
         let config = config
             .as_any()
@@ -98,8 +104,6 @@ impl ExecutionClientFactory for BinancePapiExecutionClientFactory {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
-
     use nautilus_binance::config::BinanceDataClientConfig;
     use nautilus_common::cache::Cache;
     use nautilus_model::identifiers::{AccountId, Venue};
@@ -119,6 +123,7 @@ mod tests {
                 "PAPI-CUSTOM",
                 &config,
                 Rc::new(RefCell::new(Cache::default())).into(),
+                Rc::new(RefCell::new(TestClock::new())),
             )
             .unwrap();
         assert_eq!(client.client_id(), ClientId::from("PAPI-CUSTOM"));
@@ -136,6 +141,7 @@ mod tests {
             BINANCE_PAPI,
             &BinanceDataClientConfig::default(),
             Rc::new(RefCell::new(Cache::default())).into(),
+            Rc::new(RefCell::new(TestClock::new())),
         );
         assert!(
             result

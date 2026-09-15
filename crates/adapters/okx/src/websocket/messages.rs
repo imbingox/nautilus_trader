@@ -16,8 +16,6 @@
 //! Data structures modeling OKX WebSocket request and response payloads.
 
 use derive_builder::Builder;
-#[cfg(test)]
-use nautilus_core::string::secret::REDACTED;
 use nautilus_core::string::secret::SecretString;
 use nautilus_model::{
     data::{Data, FundingRateUpdate, InstrumentStatus, OrderBookDeltas},
@@ -1095,7 +1093,7 @@ pub struct OKXOrderMsg {
     pub tag: Option<String>,
     /// Trade mode.
     pub td_mode: OKXTradeMode,
-    /// Target currency (base_ccy or quote_ccy). Empty for margin modes.
+    /// Target currency (`base_ccy` or `quote_ccy`). Empty for margin modes.
     #[serde(default, deserialize_with = "deserialize_target_currency_as_none")]
     pub tgt_ccy: Option<OKXTargetCurrency>,
     /// Take-profit order price.
@@ -1146,7 +1144,7 @@ pub struct OKXAlgoOrderMsg {
     pub inst_id: Ustr,
     /// Instrument type.
     pub inst_type: OKXInstrumentType,
-    /// Algo order type (trigger, move_order_stop, oco, iceberg, twap).
+    /// Algo order type (trigger, `move_order_stop`, oco, iceberg, twap).
     pub ord_type: OKXAlgoOrderType,
     /// Order state.
     pub state: OKXAlgoOrderStatus,
@@ -1230,7 +1228,7 @@ pub struct OKXAlgoOrderMsg {
     /// Currency.
     #[serde(default, deserialize_with = "deserialize_empty_ustr_as_none")]
     pub ccy: Option<Ustr>,
-    /// Target currency (base_ccy or quote_ccy).
+    /// Target currency (`base_ccy` or `quote_ccy`).
     #[serde(default, deserialize_with = "deserialize_target_currency_as_none")]
     pub tgt_ccy: Option<OKXTargetCurrency>,
     /// Fee amount.
@@ -1318,7 +1316,7 @@ pub struct WsPostOrderParams {
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pos_side: Option<OKXPositionSide>,
-    /// Order type: limit, market, post_only, fok, ioc, etc.
+    /// Order type: limit, market, `post_only`, fok, ioc, etc.
     pub ord_type: OKXOrderType,
     /// Order size.
     pub sz: String,
@@ -1347,6 +1345,10 @@ pub struct WsPostOrderParams {
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tgt_ccy: Option<OKXTargetCurrency>,
+    /// Quote currency used for trading. Only applicable to SPOT.
+    #[builder(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trade_quote_ccy: Option<Ustr>,
     /// Order tag for categorization.
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1515,7 +1517,7 @@ pub struct WsCancelAlgoOrderParams {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_core::time::get_atomic_clock_realtime;
+    use nautilus_core::{string::secret::REDACTED, time::get_atomic_clock_realtime};
     use rstest::rstest;
     use rust_decimal::Decimal;
 
@@ -2329,6 +2331,49 @@ mod tests {
 
         let json = serde_json::to_string(&params).unwrap();
         assert!(!json.contains("slippagePct"));
+        assert!(!json.contains("tradeQuoteCcy"));
+    }
+
+    #[rstest]
+    fn test_ws_post_order_params_serializes_trade_quote_ccy_usd() {
+        use super::WsPostOrderParamsBuilder;
+        use crate::common::enums::{OKXOrderType, OKXSide, OKXTradeMode};
+
+        let params = WsPostOrderParamsBuilder::default()
+            .inst_id_code(20459u64)
+            .td_mode(OKXTradeMode::Cash)
+            .side(OKXSide::Buy)
+            .ord_type(OKXOrderType::Limit)
+            .sz("0.01".to_string())
+            .px("100000".to_string())
+            .trade_quote_ccy("USD")
+            .build()
+            .unwrap();
+
+        let json: serde_json::Value = serde_json::to_value(&params).unwrap();
+        assert_eq!(json["instIdCode"], 20459);
+        assert_eq!(json["tradeQuoteCcy"], "USD");
+        assert!(json.get("instId").is_none());
+    }
+
+    #[rstest]
+    fn test_ws_post_order_params_serializes_trade_quote_ccy_usdc() {
+        use super::WsPostOrderParamsBuilder;
+        use crate::common::enums::{OKXOrderType, OKXSide, OKXTradeMode};
+
+        let params = WsPostOrderParamsBuilder::default()
+            .inst_id_code(20459u64)
+            .td_mode(OKXTradeMode::Cash)
+            .side(OKXSide::Buy)
+            .ord_type(OKXOrderType::Limit)
+            .sz("0.01".to_string())
+            .px("100000".to_string())
+            .trade_quote_ccy("USDC")
+            .build()
+            .unwrap();
+
+        let json: serde_json::Value = serde_json::to_value(&params).unwrap();
+        assert_eq!(json["tradeQuoteCcy"], "USDC");
     }
 
     #[rstest]
@@ -2649,7 +2694,7 @@ mod tests {
             "asks": [["16.7", "100", "1"]],
             "bids": [["16.65", "100", "1"]],
             "ts": "1780044924909",
-            "seqId": 1779935772619784_u64,
+            "seqId": 1_779_935_772_619_784_u64,
         }))
         .unwrap();
         assert_eq!(msg.asks[0].price, "16.7");

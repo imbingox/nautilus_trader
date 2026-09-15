@@ -32,7 +32,7 @@ use std::{
 
 use async_trait::async_trait;
 use nautilus_common::{
-    actor::{DataActor, DataActorCore, data_actor::DataActorConfig},
+    actor::{DataActor, DataActorCore, data_actor::DataActorConfig, registry::get_actor_unchecked},
     cache::CacheView,
     clients::{DataClient, ExecutionClient},
     clock::Clock,
@@ -40,7 +40,7 @@ use nautilus_common::{
     enums::Environment,
     factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
     live::{dst, runner::get_exec_event_sender},
-    logging::logger::LoggerConfig,
+    logging::{logger::LoggerConfig, logging_sync_to_disk, writer::FileWriterConfig},
     messages::{
         ExecutionEvent,
         execution::{
@@ -57,15 +57,15 @@ use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_live::{
     builder::LiveNodeBuilder,
     config::{LiveExecutionEngineConfig, LiveNodeConfig},
-    node::{LiveNode, LiveNodeHandle, NodeState},
+    node::{LiveNode, LiveNodeHandle, NodeRunMode, NodeState},
 };
 use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
     enums::{AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce},
     events::{OrderEventAny, account::state::AccountState},
     identifiers::{
-        AccountId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, StrategyId, TradeId,
-        TraderId, Venue, VenueOrderId,
+        AccountId, ActorId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, StrategyId,
+        TradeId, TraderId, Venue, VenueOrderId,
     },
     instruments::{Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt},
     orders::{
@@ -190,6 +190,7 @@ struct ClaimingTestStrategy {
 impl ClaimingTestStrategy {
     fn new(strategy_id: StrategyId, instrument_id: InstrumentId) -> Self {
         let external_order_instrument_ids = vec![instrument_id];
+
         Self {
             core: StrategyCore::new(StrategyConfig {
                 strategy_id: Some(strategy_id),
@@ -314,6 +315,7 @@ pub(crate) mod serial_tests {
         connected: Arc<AtomicBool>,
         disconnect_attempted: Arc<AtomicBool>,
         factory_trader_id: Arc<Mutex<Option<TraderId>>>,
+        factory_clock_id: Arc<Mutex<Option<usize>>>,
         mass_status_requested: Arc<AtomicBool>,
         mass_status: Arc<Mutex<Option<ExecutionMassStatus>>>,
         registered_external_orders: Arc<Mutex<Vec<ClientOrderId>>>,
@@ -522,8 +524,10 @@ pub(crate) mod serial_tests {
             _name: &str,
             _config: &dyn ClientConfig,
             _cache: CacheView,
+            clock: Rc<RefCell<dyn Clock>>,
         ) -> anyhow::Result<Box<dyn ExecutionClient>> {
             *self.state.factory_trader_id.lock() = Some(trader_id);
+            *self.state.factory_clock_id.lock() = Some(Rc::as_ptr(&clock).cast::<()>() as usize);
             Ok(Box::new(StartupMassStatusExecutionClient::new(
                 self.state.clone(),
                 self.behavior,
@@ -595,6 +599,7 @@ pub(crate) mod serial_tests {
             _name: &str,
             _config: &dyn ClientConfig,
             _cache: CacheView,
+            _clock: Rc<RefCell<dyn Clock>>,
         ) -> anyhow::Result<Box<dyn ExecutionClient>> {
             Ok(Box::new(LifecycleExecutionClient {
                 state: self.state.clone(),
@@ -723,6 +728,7 @@ pub(crate) mod serial_tests {
             ) {
                 return Ok(());
             }
+
             self.state.connected.store(false, Ordering::Relaxed);
             Ok(())
         }
@@ -752,20 +758,25 @@ pub(crate) mod serial_tests {
     }
 
     #[rstest]
-    fn test_execution_factory_receives_live_node_trader_id() {
+    fn test_execution_factory_receives_live_node_trader_id_and_clock() {
         let trader_id = TraderId::from("NODE-TRADER-001");
+
         let config = LiveNodeConfig {
             trader_id,
             ..Default::default()
         };
 
-        let (_node, state) = live_node_with_startup_mass_status_client(
+        let (node, state) = live_node_with_startup_mass_status_client(
             "TraderIdentityNode",
             config,
             StartupMassStatusBehavior::Unavailable,
         );
 
         assert_eq!(*state.factory_trader_id.lock(), Some(trader_id));
+        assert_eq!(
+            *state.factory_clock_id.lock(),
+            Some(Rc::as_ptr(&node.kernel().clock()).cast::<()>() as usize),
+        );
     }
 
     #[async_trait(?Send)]
@@ -955,6 +966,7 @@ pub(crate) mod serial_tests {
             ) {
                 return Ok(());
             }
+
             self.state.connected.store(false, Ordering::Relaxed);
             Ok(())
         }
@@ -989,6 +1001,7 @@ pub(crate) mod serial_tests {
             timeout_disconnection: Duration::from_millis(50),
             ..Default::default()
         };
+
         let data_state = LifecycleClientState::default();
         let exec_state = LifecycleClientState::default();
         let node = LiveNodeBuilder::from_config(config)
@@ -1197,6 +1210,7 @@ pub(crate) mod serial_tests {
             _name: &str,
             _config: &dyn ClientConfig,
             _cache: CacheView,
+            _clock: Rc<RefCell<dyn Clock>>,
         ) -> anyhow::Result<Box<dyn ExecutionClient>> {
             Ok(Box::new(BlockingReportExecutionClient::new(self)))
         }
@@ -1345,6 +1359,7 @@ pub(crate) mod serial_tests {
             let client_order_id = cmd
                 .client_order_id
                 .expect("targeted report command must carry a client order ID");
+
             let request_count = {
                 let mut ids = self.state.targeted_order_report_ids.lock();
                 ids.push(client_order_id);
@@ -1371,6 +1386,7 @@ pub(crate) mod serial_tests {
             }
 
             let mut responses = self.fill_report_responses.lock();
+
             let reports = if responses.len() > 1 {
                 responses.pop_front().unwrap()
             } else {
@@ -1449,6 +1465,7 @@ pub(crate) mod serial_tests {
 
     fn add_reconciliation_test_account(node: &LiveNode) {
         let account_id = AccountId::from("BLOCKING-REPORT-001");
+
         let account = MarginAccount::new(
             AccountState::new(
                 account_id,
@@ -1658,6 +1675,7 @@ pub(crate) mod serial_tests {
             timeout_disconnection: Duration::from_millis(50),
             ..Default::default()
         };
+
         let factory = StartupMassStatusExecutionClientFactory::new(
             state,
             StartupMassStatusBehavior::Available,
@@ -1774,6 +1792,95 @@ pub(crate) mod serial_tests {
     }
 
     #[rstest]
+    #[case::graceful(false)]
+    #[case::cancelled(true)]
+    #[tokio::test]
+    async fn test_dispose_after_run_releases_subscription_without_channel_error(
+        #[case] cancel_run: bool,
+    ) {
+        let directory = std::env::temp_dir().join(format!("nautilus-shutdown-{}", UUID4::new()));
+
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecutionEngineConfig {
+                reconciliation: false,
+                ..Default::default()
+            },
+            delay_post_stop: Duration::ZERO,
+            logging: LoggerConfig {
+                fileout_level: log::LevelFilter::Info,
+                file_config: Some(FileWriterConfig {
+                    directory: Some(directory.to_str().unwrap().to_string()),
+                    file_name: Some("shutdown".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut node = LiveNode::build("ShutdownNode".to_string(), Some(config)).unwrap();
+        let actor_id = ActorId::from("SHUTDOWN-ACTOR");
+        node.add_actor(TestActor::new(DataActorConfig {
+            actor_id: Some(actor_id),
+            log_commands: true,
+            ..Default::default()
+        }))
+        .unwrap();
+
+        get_actor_unchecked::<TestActor>(&actor_id.inner()).subscribe_quotes(
+            InstrumentId::from("ETHUSDT.BYBIT"),
+            None,
+            None,
+        );
+        let handle = node.handle();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            if cancel_run {
+                tokio::select! {
+                    result = node.run_with_mode(NodeRunMode::Hosted) => {
+                        panic!("Run completed before cancellation: {result:?}");
+                    }
+                    () = wait_until_async(
+                        || async { handle.is_running() },
+                        Duration::from_secs(2),
+                    ) => {}
+                }
+            } else {
+                let stop = async {
+                    wait_until_async(|| async { handle.is_running() }, Duration::from_secs(2))
+                        .await;
+                    handle.stop();
+                };
+
+                let (result, ()) = tokio::join!(node.run_with_mode(NodeRunMode::Hosted), stop);
+                result.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            node.state(),
+            if cancel_run {
+                NodeState::Running
+            } else {
+                NodeState::Stopped
+            },
+        );
+
+        node.dispose();
+        assert_eq!(node.state(), NodeState::Stopped);
+        log::error!(target: "nautilus_live::runner", "Shutdown log capture control");
+        logging_sync_to_disk().unwrap();
+        let output = std::fs::read_to_string(directory.join("shutdown.log")).unwrap();
+        drop(node);
+        std::fs::remove_dir_all(directory).unwrap();
+
+        assert_eq!(output.matches("Unsubscribe(Quotes(").count(), 1);
+        assert_eq!(output.matches("Shutdown log capture control").count(), 1);
+        assert_eq!(output.matches("Failed to send data command").count(), 0);
+    }
+
+    #[rstest]
     fn test_add_actor() {
         let mut node = LiveNode::build("TestNode".to_string(), None).unwrap();
 
@@ -1824,6 +1931,7 @@ pub(crate) mod serial_tests {
             exec_algorithm_id: Some(ExecAlgorithmId::from("TEST_ALGO")),
             ..Default::default()
         };
+
         let algo = TestExecutionAlgorithm::new(config);
 
         let result = node.add_exec_algorithm(algo);
@@ -1839,6 +1947,7 @@ pub(crate) mod serial_tests {
             exec_algorithm_id: Some(ExecAlgorithmId::from("MY_ALGO")),
             ..Default::default()
         };
+
         let algo = TestExecutionAlgorithm::new(config);
 
         node.add_exec_algorithm(algo).unwrap();
@@ -2084,6 +2193,7 @@ pub(crate) mod serial_tests {
             timeout_disconnection: Duration::ZERO,
             ..Default::default()
         };
+
         let mut node =
             LiveNode::build("ZeroTimeoutNoClientsNode".to_string(), Some(config)).unwrap();
         let handle = node.handle();
@@ -2260,12 +2370,14 @@ pub(crate) mod serial_tests {
             timeout_disconnection: Duration::ZERO,
             ..Default::default()
         };
+
         let mut node = LiveNode::build("LifecycleNode".to_string(), Some(config)).unwrap();
         node.add_strategy(TestStrategy::new(StrategyConfig {
             strategy_id: Some(StrategyId::from("LIFECYCLE-001")),
             ..Default::default()
         }))
         .unwrap();
+
         let handle = node.handle();
 
         node.start().await.unwrap();
@@ -2296,6 +2408,7 @@ pub(crate) mod serial_tests {
             timeout_disconnection: Duration::ZERO,
             ..Default::default()
         };
+
         let mut node = LiveNode::build("NoBackingNode".to_string(), Some(config)).unwrap();
         let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
         let instrument_id = instrument.id();
@@ -2329,6 +2442,7 @@ pub(crate) mod serial_tests {
             delay_post_stop: Duration::from_millis(50),
             ..Default::default()
         };
+
         let mut node = LiveNode::build("TestNode".to_string(), Some(config)).unwrap();
         let handle = node.handle();
 
@@ -2369,6 +2483,7 @@ pub(crate) mod serial_tests {
             delay_post_stop: Duration::from_millis(50),
             ..Default::default()
         };
+
         let mut node = LiveNode::build("TestNode".to_string(), Some(config)).unwrap();
         let handle = node.handle();
 
@@ -2404,6 +2519,7 @@ pub(crate) mod serial_tests {
             delay_post_stop: Duration::from_millis(50),
             ..Default::default()
         };
+
         let mut node = LiveNode::build("TestNode".to_string(), Some(config)).unwrap();
         let handle = node.handle();
         let trader_id = node.kernel().trader_id();
@@ -2421,6 +2537,7 @@ pub(crate) mod serial_tests {
                 Duration::from_secs(5),
             )
             .await;
+
             let command = ShutdownSystem::new(
                 trader_id,
                 ustr::Ustr::from("TestComponent"),
@@ -2453,6 +2570,7 @@ pub(crate) mod serial_tests {
             delay_post_stop: Duration::from_millis(50),
             ..Default::default()
         };
+
         let mut node = LiveNode::build("TestNode".to_string(), Some(config)).unwrap();
         let handle = node.handle();
         let state_handle = handle.clone();
@@ -2480,6 +2598,7 @@ pub(crate) mod serial_tests {
             delay_post_stop: Duration::from_millis(50),
             ..Default::default()
         };
+
         let mut node = LiveNode::build("TestNode".to_string(), Some(config)).unwrap();
         let handle = node.handle();
 
@@ -2517,6 +2636,7 @@ pub(crate) mod serial_tests {
             timeout_disconnection: Duration::from_millis(50),
             ..Default::default()
         };
+
         let (mut node, state) = live_node_with_startup_mass_status_client(
             "StartupMassStatusUnavailableNode",
             config,
@@ -2553,6 +2673,7 @@ pub(crate) mod serial_tests {
             timeout_disconnection: Duration::from_millis(50),
             ..Default::default()
         };
+
         let instrument = crypto_perpetual_ethusdt();
         let instrument_id = instrument.id();
         let venue_client_id = ClientId::from("VENUE-CLIENT");
@@ -2569,6 +2690,7 @@ pub(crate) mod serial_tests {
             venue_order_id,
             OrderStatus::Accepted,
         );
+
         let mut mass_status = ExecutionMassStatus::new(
             source_client_id,
             source_account_id,
@@ -2655,6 +2777,7 @@ pub(crate) mod serial_tests {
         let client_order_id = ClientOrderId::from("O-MISMATCHED-SOURCE");
         let venue_order_id = VenueOrderId::from("V-MISMATCHED-SOURCE");
         let state = StartupMassStatusClientState::default();
+
         let mut mass_status = ExecutionMassStatus::new(
             ClientId::from(reported_client_id),
             AccountId::from(reported_account_id),
@@ -2723,6 +2846,7 @@ pub(crate) mod serial_tests {
         let client_order_id = ClientOrderId::from("O-UNTRUSTED-SOURCE");
         let venue_order_id = VenueOrderId::from("V-UNTRUSTED-SOURCE");
         let state = StartupMassStatusClientState::default();
+
         let mut mass_status = ExecutionMassStatus::new(
             source_client_id,
             source_account_id,
@@ -2782,6 +2906,7 @@ pub(crate) mod serial_tests {
         let client_order_id = ClientOrderId::from("O-DISAPPEARING-SOURCE");
         let venue_order_id = VenueOrderId::from("V-DISAPPEARING-SOURCE");
         let state = StartupMassStatusClientState::default();
+
         let mut mass_status = ExecutionMassStatus::new(
             source_client_id,
             source_account_id,
@@ -2806,12 +2931,14 @@ pub(crate) mod serial_tests {
         add_accepted_test_order(&node, client_order_id, venue_order_id, source_client_id);
 
         let exec_engine = node.kernel().exec_engine().clone();
+
         let handler = ShareableMessageHandler::from_typed(move |_report: &OrderStatusReport| {
             exec_engine
                 .borrow_mut()
                 .deregister_client(source_client_id)
                 .expect("source execution client should still be registered");
         });
+
         let raw_pattern: msgbus::MStr<msgbus::Pattern> =
             MessagingSwitchboard::reconciliation_raw_order_status_report_topic().into();
         msgbus::subscribe_any(raw_pattern, handler.clone(), None);
@@ -2852,6 +2979,7 @@ pub(crate) mod serial_tests {
             timeout_disconnection: Duration::from_millis(50),
             ..Default::default()
         };
+
         let (mut node, state) = live_node_with_startup_mass_status_client(
             "StrategyStartFailureNode",
             config,
@@ -2863,12 +2991,14 @@ pub(crate) mod serial_tests {
             ..Default::default()
         }))
         .unwrap();
+
         node.add_strategy(FailingStartStrategy::new(StrategyConfig {
             strategy_id: Some(StrategyId::from("FAILING-START-001")),
             order_id_tag: Some("002".to_string()),
             ..Default::default()
         }))
         .unwrap();
+
         let handle = node.handle();
 
         let err = node.start().await.expect_err("strategy start should fail");
@@ -2903,6 +3033,7 @@ pub(crate) mod serial_tests {
             timeout_disconnection: Duration::from_millis(50),
             ..Default::default()
         };
+
         let (mut node, state) = live_node_with_startup_mass_status_client(
             "StrategyStopDuringStartNode",
             config,
@@ -2989,6 +3120,7 @@ pub(crate) mod serial_tests {
             },
             ..Default::default()
         };
+
         let data_state = FailingDisconnectDataClientState::default();
         let exec_state = StartupMassStatusClientState::default();
         let mut node = LiveNodeBuilder::from_config(config)
@@ -3040,6 +3172,7 @@ pub(crate) mod serial_tests {
             timeout_disconnection: Duration::from_millis(50),
             ..Default::default()
         };
+
         let (mut node, state) = live_node_with_startup_mass_status_client(
             "RunStartupMassStatusUnavailableNode",
             config,
@@ -3076,6 +3209,7 @@ pub(crate) mod serial_tests {
             timeout_disconnection: Duration::from_millis(50),
             ..Default::default()
         };
+
         let (mut node, state) = live_node_with_startup_mass_status_client(
             "StartStartupMassStatusErrorNode",
             config,
@@ -3106,6 +3240,7 @@ pub(crate) mod serial_tests {
             timeout_disconnection: Duration::from_millis(50),
             ..Default::default()
         };
+
         let (mut node, state) = live_node_with_startup_mass_status_client(
             "StartupMassStatusErrorNode",
             config,
@@ -3141,6 +3276,7 @@ pub(crate) mod serial_tests {
             timeout_disconnection: Duration::from_millis(50),
             ..Default::default()
         };
+
         let (mut node, state) = live_node_with_startup_mass_status_client(
             "StartupMassStatusTimeoutNode",
             config,
@@ -3187,6 +3323,7 @@ pub(crate) mod serial_tests {
             delay_post_stop: Duration::from_millis(50),
             ..Default::default()
         };
+
         let mut node = LiveNode::build("MaintenanceTestNode".to_string(), Some(config)).unwrap();
         let handle = node.handle();
 
@@ -3223,6 +3360,7 @@ pub(crate) mod serial_tests {
             delay_post_stop: Duration::from_millis(50),
             ..Default::default()
         };
+
         let mut node = LiveNode::build("QueueMonitorUnsetNode".to_string(), Some(config)).unwrap();
         let handle = node.handle();
         let received = Rc::new(RefCell::new(Vec::<QueueStateChanged>::new()));
@@ -3233,7 +3371,7 @@ pub(crate) mod serial_tests {
         });
 
         msgbus::subscribe_any(
-            MessagingSwitchboard::queue_state_changed_topic().into(),
+            MessagingSwitchboard::queue_state_changed_pattern(None),
             handler,
             None,
         );
@@ -3270,6 +3408,7 @@ pub(crate) mod serial_tests {
             delay_post_stop: Duration::from_millis(50),
             ..Default::default()
         };
+
         let query_order_received = Arc::new(AtomicBool::new(false));
         let blocking_order_report_requested = Arc::new(AtomicBool::new(false));
         let position_report_requested = Arc::new(AtomicBool::new(false));
@@ -3369,6 +3508,7 @@ pub(crate) mod serial_tests {
             delay_post_stop: Duration::from_millis(50),
             ..Default::default()
         };
+
         let query_order_received = Arc::new(AtomicBool::new(false));
         let blocking_order_report_requested = Arc::new(AtomicBool::new(false));
         let position_report_requested = Arc::new(AtomicBool::new(false));
@@ -3432,6 +3572,7 @@ pub(crate) mod serial_tests {
             delay_post_stop: Duration::from_millis(50),
             ..Default::default()
         };
+
         let query_order_received = Arc::new(AtomicBool::new(false));
         let blocking_order_report_requested = Arc::new(AtomicBool::new(false));
         let position_report_requested = Arc::new(AtomicBool::new(false));
@@ -3500,6 +3641,7 @@ pub(crate) mod serial_tests {
             delay_post_stop: Duration::from_millis(50),
             ..Default::default()
         };
+
         let query_order_received = Arc::new(AtomicBool::new(false));
         let blocking_order_report_requested = Arc::new(AtomicBool::new(false));
         let position_report_requested = Arc::new(AtomicBool::new(false));
@@ -3612,6 +3754,7 @@ pub(crate) mod serial_tests {
             delay_post_stop: Duration::from_millis(50),
             ..Default::default()
         };
+
         let query_order_received = Arc::new(AtomicBool::new(false));
         let blocking_order_report_requested = Arc::new(AtomicBool::new(false));
         let position_report_requested = Arc::new(AtomicBool::new(false));
@@ -3687,6 +3830,7 @@ pub(crate) mod serial_tests {
             delay_post_stop: Duration::from_millis(50),
             ..Default::default()
         };
+
         let query_order_received = Arc::new(AtomicBool::new(false));
         let blocking_order_report_requested = Arc::new(AtomicBool::new(false));
         let position_report_requested = Arc::new(AtomicBool::new(false));
@@ -3750,6 +3894,7 @@ pub(crate) mod serial_tests {
             delay_post_stop: Duration::ZERO,
             ..Default::default()
         };
+
         let state = BlockingReportClientState::default();
         let factory = BlockingReportExecutionClientFactory::configurable(
             ClientId::from("BLOCKING-REPORT"),
@@ -3807,6 +3952,7 @@ pub(crate) mod serial_tests {
             delay_post_stop: Duration::ZERO,
             ..Default::default()
         };
+
         let state = BlockingReportClientState::default();
         let factory = BlockingReportExecutionClientFactory::configurable(
             ClientId::from("BLOCKING-REPORT"),
@@ -3872,6 +4018,7 @@ pub(crate) mod serial_tests {
             delay_post_stop: Duration::ZERO,
             ..Default::default()
         };
+
         let state = BlockingReportClientState::default();
         let factory = BlockingReportExecutionClientFactory::configurable(
             ClientId::from("BLOCKING-REPORT"),
@@ -3952,6 +4099,7 @@ pub(crate) mod serial_tests {
                 Duration::from_secs(2),
             )
             .await;
+
             stop_handle.stop();
         });
 
@@ -4007,6 +4155,7 @@ pub(crate) mod serial_tests {
             delay_post_stop: Duration::ZERO,
             ..Default::default()
         };
+
         let client_order_id = ClientOrderId::from("O-PARTIAL-DISCARD");
         let venue_order_id = VenueOrderId::from("V-PARTIAL-DISCARD");
         let partial_state = BlockingReportClientState::default();
@@ -4111,6 +4260,7 @@ pub(crate) mod serial_tests {
             delay_post_stop: Duration::ZERO,
             ..Default::default()
         };
+
         let state = BlockingReportClientState::default();
         let factory = BlockingReportExecutionClientFactory::configurable(
             ClientId::from("BLOCKING-REPORT"),
@@ -4215,10 +4365,12 @@ pub(crate) mod serial_tests {
         } else {
             factory.with_order_reports(vec![report])
         };
+
         let mut config = reconciliation_node_config(1);
         if timeout_retry {
             config.timeout_reconciliation = Duration::from_millis(100);
         }
+
         let mut node = reconciliation_node("TerminalFillRaceNode", config, factory);
         add_accepted_test_order(
             &node,
@@ -4275,6 +4427,7 @@ pub(crate) mod serial_tests {
                     Duration::from_secs(2),
                 )
                 .await;
+
                 fill_release.notify_one();
             } else {
                 fill_release.notify_one();
@@ -4294,6 +4447,7 @@ pub(crate) mod serial_tests {
                 Duration::from_secs(2),
             )
             .await;
+
             driver_handle.stop();
         };
 
@@ -4356,6 +4510,7 @@ pub(crate) mod serial_tests {
             Money::from("0.75 USDT"),
             UnixNanos::from(1_000_000),
         );
+
         let mut mass_status = ExecutionMassStatus::new(
             source_client_id,
             account_id,
@@ -4391,6 +4546,7 @@ pub(crate) mod serial_tests {
                 Duration::from_secs(2),
             )
             .await;
+
             driver_handle.stop();
         };
 
@@ -4654,6 +4810,7 @@ pub(crate) mod serial_tests {
                 ));
             }
         }
+
         let cache = node.kernel().cache();
         let handle = node.handle();
         let driver_handle = handle.clone();
@@ -4672,15 +4829,18 @@ pub(crate) mod serial_tests {
                 sample ^= sample << 13;
                 sample ^= sample >> 7;
                 sample ^= sample << 17;
+
                 let stream_index = if index < STREAMED_ORDER_COUNT {
                     index
                 } else {
                     sample as usize % STREAMED_ORDER_COUNT
                 };
+
                 sender
                     .send(ExecutionEvent::Order(streamed[stream_index].clone()))
                     .unwrap();
             }
+
             wait_until_async(
                 || async { fill_report_count.load(Ordering::Relaxed) >= 1 },
                 Duration::from_secs(2),
@@ -4699,6 +4859,7 @@ pub(crate) mod serial_tests {
                 Duration::from_secs(2),
             )
             .await;
+
             wait_until_async(
                 || async { driver_handle.metrics_snapshot().exec_events.queue_depth == 0 },
                 Duration::from_secs(2),

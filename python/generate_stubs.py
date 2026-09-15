@@ -126,6 +126,7 @@ class ClassMethodFixup:
     staticmethods: set[str] = field(default_factory=set)
     classmethods: set[str] = field(default_factory=set)
     renames: dict[str, str] = field(default_factory=dict)
+    bound_receivers: dict[str, str] = field(default_factory=dict)
     injected_staticmethods: dict[str, str] = field(default_factory=dict)
     injected_classmethods: dict[str, str] = field(default_factory=dict)
     signature_defaults: dict[str, dict[str, str]] = field(default_factory=dict)
@@ -165,6 +166,9 @@ MODULE_FIXUPS: dict[str, StubFixup] = {
 # every regeneration; the redundant `as` alias marks them as explicit re-exports so
 # `from <module> import <symbol>` type-checks. Keyed by stub path suffix.
 EXTRA_REEXPORTS: dict[str, tuple[str, ...]] = {
+    "nautilus_trader/live/__init__.pyi": (
+        "from nautilus_trader.live.providers import InstrumentProvider as InstrumentProvider",
+    ),
     "nautilus_trader/analysis/__init__.pyi": (
         "from nautilus_trader.analysis.config import GridLayout as GridLayout",
         (
@@ -1486,7 +1490,7 @@ def consume_rust_method_signature(
     return RUST_FN_RE.search(signature), i
 
 
-def register_rust_method_fixup(
+def register_rust_method_fixup(  # noqa: C901 - Keep Rust method classification in one pass
     class_name: str,
     attrs: list[str],
     method_match: re.Match[str],
@@ -1530,6 +1534,15 @@ def register_rust_method_fixup(
         return
 
     if not is_staticmethod:
+        if not any(attr.startswith("#[new") for attr in attrs):
+            receiver = re.match(
+                r"\s*(\w+)\s*:\s*&?\s*(?:pyo3::)?Bound\s*<\s*'\w+\s*,\s*Self\s*>\s*(?:,|$)",
+                params,
+            )
+
+            if receiver:
+                for name in method_names:
+                    fixup.bound_receivers[name] = receiver.group(1)
         return
 
     fixup.staticmethods.update(method_names)
@@ -1961,12 +1974,16 @@ def rewrite_stub_method_block(
         or method_name in fixup.staticmethods
         or method_name in fixup.classmethods
         or method_name in fixup.renames
+        or method_name in fixup.bound_receivers
     )
 
     if not needs_fixup:
         return method_block
 
     decorators, signature_text, remainder = split_method_block(method_block)
+
+    if method_name in fixup.bound_receivers:
+        signature_text = drop_named_stub_param(signature_text, fixup.bound_receivers[method_name])
 
     if method_name in fixup.renames:
         new_name = fixup.renames[method_name]

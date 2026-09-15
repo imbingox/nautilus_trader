@@ -434,6 +434,13 @@ Interactive Brokers execution factories now use no-argument constructors. Custom
 factories must accept `TraderId` in their `ExecutionClientFactory::create` or
 `SimulatedExecutionClientFactory::create` implementation.
 
+`ExecutionClientFactory::create` also requires `clock: Rc<RefCell<dyn Clock>>` after the cache
+argument, matching `DataClientFactory::create`. Pass the owning node's clock when calling an
+execution factory directly. `SimulatedExecutionClientFactory` keeps its existing signature.
+The Python execution client bridge uses the supplied clock. Existing native execution adapters
+continue to use their realtime clocks internally; this signature change does not add test-clock
+support to those adapters.
+
 The v1 fill, fee, latency, margin, and simulation-module config and factory wrappers are also
 removed. This includes `Importable*ModelConfig`, `MarginModelConfig`, and their factories, which
 loaded Python or Cython classes by import path. Construct the current model or module directly,
@@ -794,6 +801,14 @@ Account for these differences from v1:
   the operand with `Decimal(str(value))`.
 - `Order.to_dict()` returns `avg_px` and `slippage` as strings, matching how the other decimal
   fields already serialize. Wrap the value in `Decimal(...)` before doing arithmetic on it.
+
+### Rust order history
+
+Rust callers construct `OrderCore` with `OrderCore::new`, apply events with `OrderCore::apply`, and
+inspect history with `OrderCore::events()`. Direct field access to `events` and struct-literal
+construction are no longer available. Use `OrderCore::prepend_events` to retain history when transforming an order;
+it preserves event order without applying state transitions. Use `OrderAny::from_events` to reconstruct
+an order from replacement history. The serialized order format is unchanged.
 
 ### PostgreSQL schema changes
 

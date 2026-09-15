@@ -1,6 +1,6 @@
 [project]
 name = "nautilus-trader-papi"
-version = "2.0.0rc5"
+version = "2.0.0rc6"
 description = "Production-grade Rust-native trading engine with deterministic event-driven architecture"
 authors = [{ name = "Nautech Systems", email = "info@nautechsystems.io" }]
 classifiers = [
@@ -67,7 +67,7 @@ include = ["**/*.pyi"]
 required-version = ">=0.12,<0.13"
 environments = ["sys_platform != 'win32' or platform_machine == 'AMD64'"]
 exclude-newer = "7 days"
-exclude-newer-package = { ruff = "2026-09-04T00:00:00Z" }
+exclude-newer-package = { ruff = "2026-09-11T00:00:00Z" }
 # Block sdist builds for every third-party package in python/uv.lock so
 # unexpected loss of wheel publishing fails `uv lock` instead of silently
 # building from source. Kept in sync with python/uv.lock by
@@ -147,7 +147,7 @@ no-build-package = [
 ]
 
 [dependency-groups]
-dev = ["maturin==1.15.0", "ruff>=0.16.6", "ty>=0.0.78"]
+dev = ["maturin==1.15.0", "ruff>=0.16.7", "ty>=0.0.79"]
 test = [
   "pytest>=9.1.1",
   "pytest-asyncio>=1.4.0",
@@ -396,12 +396,6 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
   "TC001",
   "TC003",
 ] # Root-relative form used by repository-wide checks
-"memray_tests/**/*.py" = [
-  "S101",
-] # Memory tests use assertions like the main test suite
-"python/memray_tests/**/*.py" = [
-  "S101",
-] # Root-relative form used by repository-wide checks
 "tests/unit/persistence/test_option_greeks_replay.py" = ["ERA001"]
 "python/tests/unit/persistence/test_option_greeks_replay.py" = [
   "ERA001",
@@ -477,4 +471,7 @@ filterwarnings = [
   "error::EncodingWarning",
   # Plotly reads its bundled validator JSON without an explicit encoding
   'ignore::EncodingWarning:^plotly\.validator_cache$',
+  # pytest-memray opens binary Memray captures through Python
+  'ignore::EncodingWarning:^pytest_memray\.plugin$',
+  'ignore::EncodingWarning:^pytest_memray\.marks$',
 ]

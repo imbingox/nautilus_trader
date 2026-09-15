@@ -217,11 +217,15 @@ SIM_FILTERSET := package(nautilus-common) + package(nautilus-event-store) + \
 	(package(nautilus-core) & test(~virtual_time))
 SIM_HIGH_PRECISION_PACKAGES := -p nautilus-common -p nautilus-execution
 
-# Pass the simulation cfg through `--config` rather than RUSTFLAGS, because the env var replaces
-# the .cargo/config.toml rustflags while this joins with them, keeping -Dwarnings and the Linux
-# link flags. It must sit on each subcommand's own command line, since cargo does not inherit a
-# global `--config` into external subcommands such as clippy and nextest.
-SIM_CARGO_CONFIG := --config 'target."cfg(all())".rustflags=["--cfg","madsim"]'
+# The simulation cfg travels through RUSTFLAGS, not `--config` target rustflags:
+# an exported RUSTFLAGS replaces every config rustflags value, and CI exports
+# RUSTFLAGS="-D warnings" from setup-rust-toolchain, which silently dropped the
+# cfg and compiled all cfg(madsim) code out of the build. Prepending composes
+# with inherited flags so the cfg survives any environment. The env var also
+# displaces the .cargo/config.toml rustflags for these lanes (the Linux link
+# flags); CI already built under that override, and no sim-lane target needs
+# them to link.
+SIM_RUSTFLAGS := --cfg madsim
 
 CARGO_BUILD_JOB_TARGETS := install install-debug build build-debug build-wheel py-stubs check-code \
 	check-code-sim check-code-standard-precision \
@@ -450,10 +454,11 @@ check-code-standard-precision:  #-- Run clippy on lib/test targets with standard
 	@printf "$(GREEN)Standard-precision checks passed$(RESET)\n"
 
 .PHONY: check-code-sim
+check-code-sim: export RUSTFLAGS := $(SIM_RUSTFLAGS) $(RUSTFLAGS)
 check-code-sim:  #-- Run clippy on DST simulation lib/test targets
 	$(info $(M) Running DST simulation code quality checks...)
-	@cargo clippy --locked $(SIM_CARGO_CONFIG) $(SIM_PACKAGES) --lib --tests --features simulation --profile nextest -- -D warnings
-	@cargo clippy --locked $(SIM_CARGO_CONFIG) $(SIM_ADAPTER_PACKAGES) --lib --tests --no-default-features --features simulation --profile nextest -- -D warnings
+	@cargo clippy --locked $(SIM_PACKAGES) --lib --tests --features simulation --profile nextest -- -D warnings
+	@cargo clippy --locked $(SIM_ADAPTER_PACKAGES) --lib --tests --no-default-features --features simulation --profile nextest -- -D warnings
 	@printf "$(GREEN)DST simulation checks passed$(RESET)\n"
 
 .PHONY: check-all-targets
@@ -634,7 +639,7 @@ docsrs-check: export DOCS_RS=1
 docsrs-check: export RUSTDOCFLAGS=--cfg docsrs -D warnings
 docsrs-check: check-hack-installed #-- Check documentation builds for docs.rs compatibility
 	cargo +$(DOCSRS_TOOLCHAIN) hack --workspace --ignore-private --ignore-unknown-features \
-		--features arrow,capnp,cloud,defi,display \
+		--features arrow,arrow-display,capnp,cloud,defi \
 		--features example-databento,examples,ffi,high-precision,host \
 		--features hypersync,indicators,live,node,persistence,plugin \
 		--features postgres,redis,replay,sbe,simulation,streaming,test-support \
@@ -1021,24 +1026,28 @@ endif
 
 # DST simulation smoke test. Nextest compiles every selected lib/test target
 # before applying its filter, so the standard-precision run is also the compile
-# gate without a separate build. Two feature-coherent runs execute every test
-# that is sim-compatible today: all of nautilus-common, nautilus-event-store,
-# nautilus-network, and nautilus-execution. Transport-bound and thread-blocking
-# tests are gated out at the source. The lane also runs the LiveNode startup
-# reconciliation timeout regression and the cross-crate seam pinning tests in
-# nautilus-core.
+# gate without a separate build. Feature-coherent runs execute every test that
+# is sim-compatible today: all of nautilus-common, nautilus-event-store,
+# nautilus-network, and nautilus-execution, plus nautilus-okx integration dst
+# tests without the crate's default high-precision feature. Transport-bound and
+# thread-blocking tests are gated out at the source. The lane also runs the
+# LiveNode startup reconciliation timeout regression and the cross-crate seam
+# pinning tests in nautilus-core.
 # Precision-sensitive common and execution tests also run under `high-precision`,
 # so the seam-routed code paths are exercised under both `QuantityRaw` /
 # `PriceRaw` widths (u64 vs u128). See docs/concepts/dst.md for the full
 # DST scope.
 .PHONY: cargo-test-sim
 cargo-test-sim: export RUST_BACKTRACE=1
+cargo-test-sim: export RUSTFLAGS := $(SIM_RUSTFLAGS) $(RUSTFLAGS)
 cargo-test-sim: check-nextest-installed
 cargo-test-sim:  #-- Run DST simulation smoke tests (cfg madsim + simulation feature)
 	$(info $(M) Running in-scope DST tests under simulation...)
-	cargo nextest run --locked $(SIM_CARGO_CONFIG) $(SIM_PACKAGES) --lib --tests --features simulation -E '$(SIM_FILTERSET)' $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) $(NEXTEST_OUTPUT_ARGS)
+	cargo nextest run --locked $(SIM_PACKAGES) --lib --tests --features simulation -E '$(SIM_FILTERSET)' $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) $(NEXTEST_OUTPUT_ARGS)
+	$(info $(M) Running OKX DST integration tests under simulation...)
+	cargo nextest run --locked $(SIM_ADAPTER_PACKAGES) --test integration --no-default-features --features simulation -E 'test(dst::)' $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) $(NEXTEST_OUTPUT_ARGS)
 	$(info $(M) Running precision-sensitive DST tests under simulation + high-precision...)
-	cargo nextest run --locked $(SIM_CARGO_CONFIG) $(SIM_HIGH_PRECISION_PACKAGES) --lib --tests --features "simulation,high-precision" $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) $(NEXTEST_OUTPUT_ARGS)
+	cargo nextest run --locked $(SIM_HIGH_PRECISION_PACKAGES) --lib --tests --features "simulation,high-precision" $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) $(NEXTEST_OUTPUT_ARGS)
 
 .PHONY: cargo-test-core-debug
 cargo-test-core-debug: export RUST_BACKTRACE=1
@@ -1375,7 +1384,7 @@ pytest-doctest: build-debug  #-- Run supported Python doctests
 .PHONY: pytest-memray
 pytest-memray: build-debug  #-- Run Python memory leak tests with Memray
 	$(info $(M) Running Python memory leak tests...)
-	$Q cd python && $(PYTHON_TEST_ENV) VIRTUAL_ENV= uv run --no-sync pytest -qq -rfE memray_tests/
+	$Q cd python && $(PYTHON_TEST_ENV) VIRTUAL_ENV= uv run --no-sync pytest -qq -rfE tests/memleak/
 
 .PHONY: ty
 ty: build-debug  #-- Type-check Python examples

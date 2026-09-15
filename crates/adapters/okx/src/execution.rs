@@ -15,11 +15,7 @@
 
 //! Live execution client implementation for the OKX adapter.
 
-use std::{
-    future::Future,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{future::Future, sync::Arc};
 
 use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
@@ -27,7 +23,10 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, pin_mut};
 use nautilus_common::{
     clients::ExecutionClient,
-    live::runner::get_exec_event_sender,
+    live::{
+        dst::time::{self, Duration, Instant},
+        runner::get_exec_event_sender,
+    },
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
         GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
@@ -193,6 +192,10 @@ impl OKXExecutionClient {
             "okx-business-user-streams",
         ));
 
+        http_client.set_spot_trade_quote_ccy(config.spot_trade_quote_ccy.clone());
+        ws_private.set_spot_trade_quote_ccy(config.spot_trade_quote_ccy.clone());
+        ws_business.set_spot_trade_quote_ccy(config.spot_trade_quote_ccy.clone());
+
         let trade_mode = Self::derive_default_trade_mode(core.account_type, &config);
         let clock = get_atomic_clock_realtime();
         let emitter = ExecutionEventEmitter::new(
@@ -251,7 +254,7 @@ impl OKXExecutionClient {
     fn trade_mode_for_order(
         &self,
         instrument_id: InstrumentId,
-        params: &Option<Params>,
+        params: Option<&Params>,
     ) -> OKXTradeMode {
         if let Some(td_mode_str) = get_param_as_string(params, "td_mode") {
             match td_mode_str.parse::<OKXTradeMode>() {
@@ -702,7 +705,7 @@ impl OKXExecutionClient {
             cache.try_order_owned(&cmd.client_order_id)?
         };
         let ws_private = self.ws_private.clone();
-        let trade_mode = self.trade_mode_for_order(cmd.instrument_id, &cmd.params);
+        let trade_mode = self.trade_mode_for_order(cmd.instrument_id, cmd.params.as_ref());
 
         let emitter = self.emitter.clone();
         let clock = self.clock;
@@ -725,13 +728,13 @@ impl OKXExecutionClient {
         let is_reduce_only = context.is_reduce_only;
         let is_quote_quantity = context.is_quote_quantity;
 
-        let px_usd = get_param_as_string(&cmd.params, "px_usd");
-        let px_vol = get_param_as_string(&cmd.params, "px_vol");
-        let outcome = get_param_as_string(&cmd.params, "outcome");
-        let slippage_pct = get_param_as_string(&cmd.params, "slippage_pct");
-        let rpi = get_param_as_bool(&cmd.params, "rpi");
-        let rpi_taker_access = get_param_as_bool(&cmd.params, "rpi_taker_access");
-        let rpi_px_round = get_param_as_bool(&cmd.params, "rpi_px_round");
+        let px_usd = get_param_as_string(cmd.params.as_ref(), "px_usd");
+        let px_vol = get_param_as_string(cmd.params.as_ref(), "px_vol");
+        let outcome = get_param_as_string(cmd.params.as_ref(), "outcome");
+        let slippage_pct = get_param_as_string(cmd.params.as_ref(), "slippage_pct");
+        let rpi = get_param_as_bool(cmd.params.as_ref(), "rpi");
+        let rpi_taker_access = get_param_as_bool(cmd.params.as_ref(), "rpi_taker_access");
+        let rpi_px_round = get_param_as_bool(cmd.params.as_ref(), "rpi_px_round");
 
         self.spawn_task("submit_order", async move {
             let result = ws_private
@@ -786,7 +789,7 @@ impl OKXExecutionClient {
             cache.try_order_owned(&cmd.client_order_id)?
         };
         let http_client = self.http_client.clone();
-        let trade_mode = self.trade_mode_for_order(cmd.instrument_id, &cmd.params);
+        let trade_mode = self.trade_mode_for_order(cmd.instrument_id, cmd.params.as_ref());
 
         let emitter = self.emitter.clone();
         let clock = self.clock;
@@ -804,9 +807,9 @@ impl OKXExecutionClient {
         let time_in_force = context.time_in_force;
         let price = context.price;
         let is_post_only = context.is_post_only;
-        let rpi = get_param_as_bool(&cmd.params, "rpi");
-        let rpi_taker_access = get_param_as_bool(&cmd.params, "rpi_taker_access");
-        let rpi_px_round = get_param_as_bool(&cmd.params, "rpi_px_round");
+        let rpi = get_param_as_bool(cmd.params.as_ref(), "rpi");
+        let rpi_taker_access = get_param_as_bool(cmd.params.as_ref(), "rpi_taker_access");
+        let rpi_px_round = get_param_as_bool(cmd.params.as_ref(), "rpi_px_round");
 
         self.spawn_task("submit_order_http", async move {
             let result = http_client
@@ -858,7 +861,7 @@ impl OKXExecutionClient {
             cache.try_order_owned(&cmd.client_order_id)?
         };
         let http_client = self.http_client.clone();
-        let trade_mode = self.trade_mode_for_order(cmd.instrument_id, &cmd.params);
+        let trade_mode = self.trade_mode_for_order(cmd.instrument_id, cmd.params.as_ref());
 
         let emitter = self.emitter.clone();
         let clock = self.clock;
@@ -879,7 +882,8 @@ impl OKXExecutionClient {
         let trailing_offset_type = order.trailing_offset_type();
         let activation_price = order.activation_price();
 
-        let close_fraction = get_param_as_string(&cmd.params, "close_fraction");
+        let close_fraction = get_param_as_string(cmd.params.as_ref(), "close_fraction");
+
         let reduce_only = if close_fraction.is_some() {
             Some(true)
         } else {
@@ -1278,7 +1282,7 @@ impl OKXExecutionClient {
         let interval = Duration::from_millis(10);
 
         loop {
-            tokio::time::sleep(interval).await;
+            time::sleep(interval).await;
 
             if self.core.cache().account(&account_id).is_some() {
                 log::info!("Account {account_id} registered");
@@ -1398,11 +1402,25 @@ impl OKXExecutionClient {
                 );
             }
 
+            if instrument_types.contains(&OKXInstrumentType::Spot)
+                && let Err(e) = self
+                    .http_client
+                    .refresh_account_trade_quote_ccy_lists(OKXInstrumentType::Spot, None)
+                    .await
+            {
+                log::warn!("Failed to refresh account tradeQuoteCcyList: {e}");
+            }
+
+            let trade_quote_ccy_lists = self.http_client.trade_quote_ccy_lists_snapshot();
             self.ws_private.cache_instruments(&all_instruments);
             self.ws_private
                 .cache_inst_id_codes(all_inst_id_codes.clone());
+            self.ws_private
+                .cache_trade_quote_ccy_lists(trade_quote_ccy_lists.clone());
             self.ws_business.cache_instruments(&all_instruments);
             self.ws_business.cache_inst_id_codes(all_inst_id_codes);
+            self.ws_business
+                .cache_trade_quote_ccy_lists(trade_quote_ccy_lists);
             self.core.set_instruments_initialized();
         }
 
@@ -2255,7 +2273,7 @@ impl ExecutionClient for OKXExecutionClient {
                 return Ok(());
             }
 
-            let trade_mode = self.trade_mode_for_order(cmd.instrument_id, &cmd.params);
+            let trade_mode = self.trade_mode_for_order(cmd.instrument_id, cmd.params.as_ref());
             if let Err(reason) = validate_order(&*order, trade_mode, OrderSubmission::Single) {
                 self.emitter.emit_order_denied(&order, &reason.to_string());
                 return Ok(());
@@ -2293,7 +2311,7 @@ impl ExecutionClient for OKXExecutionClient {
         }
 
         let inst_type = okx_instrument_type_from_symbol(cmd.instrument_id.symbol.as_str());
-        let trade_mode = self.trade_mode_for_order(cmd.instrument_id, &cmd.params);
+        let trade_mode = self.trade_mode_for_order(cmd.instrument_id, cmd.params.as_ref());
 
         // Validate all orders before emitting any submitted events
         let orders = self.core.get_orders_for_list(&cmd.order_list)?;
@@ -2327,10 +2345,10 @@ impl ExecutionClient for OKXExecutionClient {
 
         // Build batch payload and emit submitted events
         let mut batch_orders = Vec::new();
-        let outcome = get_param_as_string(&cmd.params, "outcome");
-        let rpi = get_param_as_bool(&cmd.params, "rpi");
-        let rpi_taker_access = get_param_as_bool(&cmd.params, "rpi_taker_access");
-        let rpi_px_round = get_param_as_bool(&cmd.params, "rpi_px_round");
+        let outcome = get_param_as_string(cmd.params.as_ref(), "outcome");
+        let rpi = get_param_as_bool(cmd.params.as_ref(), "rpi");
+        let rpi_taker_access = get_param_as_bool(cmd.params.as_ref(), "rpi_taker_access");
+        let rpi_px_round = get_param_as_bool(cmd.params.as_ref(), "rpi_px_round");
 
         for order in &orders {
             let context = OrderContext::from(order);
@@ -2431,10 +2449,10 @@ impl ExecutionClient for OKXExecutionClient {
             .map(|(venue_order_id, _)| venue_order_id)
             .or(cmd.venue_order_id);
 
-        let new_px_usd = get_param_as_string(&cmd.params, "px_usd");
-        let new_px_vol = get_param_as_string(&cmd.params, "px_vol");
-        let rpi_taker_access = get_param_as_bool(&cmd.params, "rpi_taker_access");
-        let rpi_px_round = get_param_as_bool(&cmd.params, "rpi_px_round");
+        let new_px_usd = get_param_as_string(cmd.params.as_ref(), "px_usd");
+        let new_px_vol = get_param_as_string(cmd.params.as_ref(), "px_vol");
+        let rpi_taker_access = get_param_as_bool(cmd.params.as_ref(), "rpi_taker_access");
+        let rpi_px_round = get_param_as_bool(cmd.params.as_ref(), "rpi_px_round");
 
         let emitter = self.emitter.clone();
         let clock = self.clock;
@@ -3200,8 +3218,8 @@ fn log_algo_batch_cancel_failure(failure: CommandFailure, contexts: &[AlgoCancel
     }
 }
 
-fn get_param_as_string(params: &Option<Params>, key: &str) -> Option<String> {
-    params.as_ref().and_then(|p| {
+fn get_param_as_string(params: Option<&Params>, key: &str) -> Option<String> {
+    params.and_then(|p| {
         p.get(key).and_then(|v| {
             v.as_str()
                 .map(ToString::to_string)
@@ -3210,8 +3228,8 @@ fn get_param_as_string(params: &Option<Params>, key: &str) -> Option<String> {
     })
 }
 
-fn get_param_as_bool(params: &Option<Params>, key: &str) -> Option<bool> {
-    params.as_ref().and_then(|params| params.get_bool(key))
+fn get_param_as_bool(params: Option<&Params>, key: &str) -> Option<bool> {
+    params.and_then(|params| params.get_bool(key))
 }
 
 fn supports_algo_orders(instrument_type: OKXInstrumentType) -> bool {
@@ -3672,7 +3690,7 @@ mod tests {
             Value::String(td_mode_value.to_string()),
         );
 
-        let result = get_param_as_string(&Some(params), "td_mode")
+        let result = get_param_as_string(Some(&params), "td_mode")
             .and_then(|s| s.parse::<OKXTradeMode>().ok());
 
         assert_eq!(result, Some(expected));
@@ -3683,7 +3701,7 @@ mod tests {
         let mut params = Params::new();
         params.insert("td_mode".to_string(), Value::String("invalid".to_string()));
 
-        let result = get_param_as_string(&Some(params), "td_mode")
+        let result = get_param_as_string(Some(&params), "td_mode")
             .and_then(|s| s.parse::<OKXTradeMode>().ok());
 
         assert_eq!(result, None);
@@ -3691,7 +3709,7 @@ mod tests {
 
     #[rstest]
     fn test_td_mode_param_absent_falls_through() {
-        let result = get_param_as_string(&None, "td_mode");
+        let result = get_param_as_string(None, "td_mode");
 
         assert_eq!(result, None);
     }
@@ -3702,7 +3720,7 @@ mod tests {
         params.insert("close_fraction".to_string(), Value::String("1".to_string()));
         let params = Some(params);
 
-        let close_fraction = get_param_as_string(&params, "close_fraction");
+        let close_fraction = get_param_as_string(params.as_ref(), "close_fraction");
         let is_reduce_only = false;
         let reduce_only = if close_fraction.is_some() {
             Some(true)
@@ -3718,7 +3736,7 @@ mod tests {
     fn test_close_fraction_absent_preserves_reduce_only() {
         let params: Option<Params> = None;
 
-        let close_fraction = get_param_as_string(&params, "close_fraction");
+        let close_fraction = get_param_as_string(params.as_ref(), "close_fraction");
         let is_reduce_only = false;
         let reduce_only = if close_fraction.is_some() {
             Some(true)
@@ -3734,7 +3752,7 @@ mod tests {
     fn test_close_fraction_absent_with_reduce_only_true() {
         let params: Option<Params> = None;
 
-        let close_fraction = get_param_as_string(&params, "close_fraction");
+        let close_fraction = get_param_as_string(params.as_ref(), "close_fraction");
         let is_reduce_only = true;
         let reduce_only = if close_fraction.is_some() {
             Some(true)
@@ -4326,11 +4344,11 @@ mod tests {
             Some(instrument.id()),
         );
         assert_eq!(
-            private_cache.load().get(&symbol).map(|i| i.id()),
+            private_cache.load().get(&symbol).map(Instrument::id),
             Some(instrument.id()),
         );
         assert_eq!(
-            business_cache.load().get(&symbol).map(|i| i.id()),
+            business_cache.load().get(&symbol).map(Instrument::id),
             Some(instrument.id()),
         );
     }

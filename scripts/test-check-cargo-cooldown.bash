@@ -38,10 +38,12 @@ cp "${fixture_repo}/Cargo.lock" "${fixture_repo}/${fuzz_path}/Cargo.lock"
 
 cat > "${fake_bin}/curl" << 'FAKE_CURL'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >> "${COOLDOWN_NETWORK_LOG:?}"
 echo "Cargo cooldown consumer check unexpectedly accessed the network" >&2
 exit 1
 FAKE_CURL
 chmod +x "${fake_bin}/curl"
+export COOLDOWN_NETWORK_LOG="${test_root}/network.log"
 
 git -C "$fixture_repo" init --quiet
 git -C "$fixture_repo" config user.email test@example.com
@@ -50,10 +52,127 @@ git -C "$fixture_repo" config commit.gpgsign false
 git -C "$fixture_repo" add -A
 git -C "$fixture_repo" commit --quiet -m baseline
 
+if [[ ! -f "$REPO_ROOT/.supply-chain/crate-dates.json" ]]; then
+  echo "Cooldown database is missing" >&2
+  exit 1
+fi
+if git -C "$REPO_ROOT" check-ignore -q .supply-chain/crate-dates.json; then
+  echo "Cooldown database is ignored" >&2
+  exit 1
+fi
+if ! grep -Fq 'crate-dates' "$REPO_ROOT/.pre-commit-config.yaml"; then
+  echo "cargo-cooldown hook does not watch the publication-date database" >&2
+  exit 1
+fi
+
+command -v python3 > /dev/null || {
+  echo "Required test command not on PATH: python3" >&2
+  exit 1
+}
+
+db_count=$(
+  python3 - "$REPO_ROOT" "${test_root}/actual-locks" << 'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+lock_list = pathlib.Path(sys.argv[2])
+db = json.loads((root / ".supply-chain/crate-dates.json").read_text())
+keys = set((db.get("entries") or {}).keys())
+lock_keys = set()
+for rel in lock_list.read_text().splitlines():
+    name = ver = src = None
+    for line in (root / rel).read_text().splitlines():
+        if line.startswith("[[package]]"):
+            if name and ver and src and "crates.io" in src:
+                lock_keys.add(f"{name}@{ver}")
+            name = ver = src = None
+            continue
+        if line.startswith('name = "') and line.endswith('"'):
+            name = line[len('name = "') : -1]
+        elif line.startswith('version = "') and line.endswith('"'):
+            ver = line[len('version = "') : -1]
+        elif line.startswith('source = "') and line.endswith('"'):
+            src = line[len('source = "') : -1]
+    if name and ver and src and "crates.io" in src:
+        lock_keys.add(f"{name}@{ver}")
+missing = sorted(lock_keys - keys)
+extra = sorted(keys - lock_keys)
+if missing or extra:
+    sys.stderr.write(
+        f"Cooldown database does not match tracked registry versions "
+        f"(missing {len(missing)}, extra {len(extra)})\n"
+    )
+    sys.exit(1)
+print(len(lock_keys))
+PY
+)
+
+status=0
+output=$(cd "$REPO_ROOT" &&
+  PATH="${fake_bin}:${PATH}" bash scripts/check-cargo-cooldown.sh --all) || status=$?
+if ((status != 0)) ||
+  [[ "$output" != *"Publication dates: ${db_count} from the cooldown database, 0 from crates.io"* ]]; then
+  printf 'Offline full cooldown check did not use the committed database: %s\n' "$output" >&2
+  exit 1
+fi
+
 output=$(cd "$fixture_repo" &&
   PATH="${fake_bin}:${PATH}" bash scripts/check-cargo-cooldown.sh --all)
-if [[ "$output" != "No resolved registry crate versions" ]]; then
+if [[ "$output" != "No resolved registry crate versions"* ]]; then
   printf 'Unexpected Cargo cooldown result: %s\n' "$output" >&2
+  exit 1
+fi
+
+hook_entry=$(awk '
+  $0 ~ /- id: cargo-cooldown$/ { in_hook = 1; next }
+  in_hook && $1 == "entry:" { sub(/^[[:space:]]*entry: /, ""); print; exit }
+' "$REPO_ROOT/.pre-commit-config.yaml")
+read -r -a hook_command <<< "$hook_entry"
+[[ ${#hook_command[@]} -gt 0 ]] || exit 1
+
+mkdir -p "${fixture_repo}/.supply-chain"
+cat >> "${fixture_repo}/Cargo.lock" << 'LOCK'
+
+[[package]]
+name = "cooldown-fixture"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+LOCK
+cat > "${fixture_repo}/.supply-chain/crate-dates.json" << 'DATABASE'
+{"schema":1,"entries":{"cooldown-fixture@1.0.0":{"published":"2020-01-01T00:00:00Z","verified_at":"2020-01-01T00:00:00Z"}}}
+DATABASE
+git -C "$fixture_repo" add Cargo.lock .supply-chain/crate-dates.json
+
+status=0
+output=$(cd "$fixture_repo" && PATH="${fake_bin}:${PATH}" \
+  "${hook_command[@]}") || status=$?
+if ((status != 0)) || [[ -s "$COOLDOWN_NETWORK_LOG" ]] ||
+  [[ "$output" != *"Publication dates: 1 from the cooldown database, 0 from crates.io"* ]]; then
+  printf 'Cooldown hook re-fetched a date added since the base: %s\n' "$output" >&2
+  exit 1
+fi
+
+python3 - "${fixture_repo}/.supply-chain/crate-dates.json" << 'PY'
+import datetime
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+data = json.loads(path.read_text())
+data["entries"]["cooldown-fixture@1.0.0"]["published"] = (
+    datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+)
+path.write_text(json.dumps(data) + "\n")
+PY
+status=0
+output=$(cd "$fixture_repo" && PATH="${fake_bin}:${PATH}" \
+  "${hook_command[@]}") || status=$?
+if ((status != 1)) || [[ -s "$COOLDOWN_NETWORK_LOG" ]] ||
+  [[ "$output" != *"FAIL: 1 crate(s) within the 3-day cooldown"* ]]; then
+  printf 'Cooldown hook did not reject a fresh recorded crate offline: %s\n' "$output" >&2
   exit 1
 fi
 

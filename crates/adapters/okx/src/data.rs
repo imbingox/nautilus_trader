@@ -29,6 +29,7 @@ use nautilus_common::{
     live::{
         dst::time::{self, Duration, Instant},
         runner::get_data_event_sender,
+        sender::EventSender,
     },
     messages::{
         DataEvent,
@@ -110,7 +111,7 @@ pub struct OKXDataClient {
     is_connected: AtomicBool,
     transports_started: bool,
     tasks: TaskGroup,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: EventSender<DataEvent>,
     // Shared instrument cache keyed by raw symbol so stream tasks, reconciliation,
     // and request paths all read and write one source of truth
     instruments_by_symbol: Arc<AtomicMap<Ustr, InstrumentAny>>,
@@ -254,7 +255,7 @@ impl OKXDataClient {
     }
 
     fn vip_level(&self) -> Option<OKXVipLevel> {
-        self.ws_public.as_ref().map(|ws| ws.vip_level())
+        self.ws_public.as_ref().map(OKXWebSocketClient::vip_level)
     }
 
     fn public_ws(&self) -> anyhow::Result<&OKXWebSocketClient> {
@@ -269,7 +270,7 @@ impl OKXDataClient {
             .context("business websocket client not available (credentials required)")
     }
 
-    fn send_data(sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>, data: Data) {
+    fn send_data(sender: &EventSender<DataEvent>, data: Data) {
         if let Err(e) = sender.send(DataEvent::Data(data)) {
             log::error!("Failed to emit data event: {e}");
         }
@@ -349,7 +350,7 @@ impl OKXDataClient {
     #[expect(clippy::too_many_arguments)]
     fn handle_ws_message(
         message: OKXWsMessage,
-        data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data_sender: &EventSender<DataEvent>,
         instruments_by_symbol: &Arc<AtomicMap<Ustr, InstrumentAny>>,
         http_client: &OKXHttpClient,
         config: &OKXDataClientConfig,
@@ -367,6 +368,14 @@ impl OKXDataClient {
         tasks: &TaskSpawner,
         clock: &AtomicTime,
     ) {
+        // Book recovery must run on the socket that owns the failed channel:
+        // the public websocket for market-data books, the business websocket
+        // for spread books.
+        let recovery_ws = match book_channel_scope {
+            BookChannelScope::Public => recovery_ws,
+            BookChannelScope::Business => business_ws,
+        };
+
         match message {
             OKXWsMessage::BookData { arg, action, data } => {
                 let Some(inst_id) = arg.inst_id else {
@@ -408,6 +417,7 @@ impl OKXDataClient {
                             book_channels,
                             book_sync,
                             recovery_ws,
+                            book_channel_scope,
                             snapshot_timeout,
                             tasks,
                         ) {
@@ -461,6 +471,7 @@ impl OKXDataClient {
                             book_channels,
                             book_sync,
                             recovery_ws,
+                            book_channel_scope,
                             snapshot_timeout,
                             tasks,
                         ) {
@@ -784,8 +795,15 @@ impl OKXDataClient {
                     && channel.is_book()
                     && let Some(instrument) = instruments_by_symbol.get_cloned(&inst_id)
                 {
-                    let instrument_id = instrument.id();
-                    book_sync.remove(instrument_id);
+                    spawn_book_recovery(
+                        instrument.id(),
+                        book_channels,
+                        book_sync,
+                        recovery_ws,
+                        book_channel_scope,
+                        snapshot_timeout,
+                        tasks,
+                    );
                 }
             }
             OKXWsMessage::Error(e) => {
@@ -797,6 +815,8 @@ impl OKXDataClient {
             }
             OKXWsMessage::Reconnected => {
                 log::info!("Websocket reconnected");
+                quote_cache.clear();
+                funding_cache.clear();
 
                 if book_channel_scope == BookChannelScope::Public {
                     book_sync.reset_sequences(book_channels, book_channel_scope);
@@ -811,7 +831,14 @@ impl OKXDataClient {
                     );
 
                     if pending_count > 0 {
-                        spawn_snapshot_health_monitor(book_sync.clone(), tasks, snapshot_timeout);
+                        spawn_book_recovery_monitor(
+                            book_sync.clone(),
+                            recovery_ws.cloned(),
+                            Arc::clone(book_channels),
+                            book_channel_scope,
+                            snapshot_timeout,
+                            tasks,
+                        );
                     }
                 }
             }
@@ -1178,12 +1205,18 @@ impl OKXDataClient {
     }
 }
 
+/// Maximum book resubscription attempts claimed from the [`BookSyncTracker`]
+/// budget per recovery episode before the instrument is abandoned.
+const BOOK_RECOVERY_MAX_ATTEMPTS: u32 = 8;
+
+#[expect(clippy::too_many_arguments)]
 fn handle_book_sequence_outcome(
     outcome: BookSequenceOutcome,
     instrument_id: InstrumentId,
     book_channels: &Arc<AtomicMap<InstrumentId, OKXBookChannel>>,
     book_sync: &BookSyncTracker,
     recovery_ws: Option<&OKXWebSocketClient>,
+    scope: BookChannelScope,
     snapshot_timeout: Duration,
     tasks: &TaskSpawner,
 ) -> bool {
@@ -1200,35 +1233,121 @@ fn handle_book_sequence_outcome(
                  prev_seq_id={prev_seq_id:?}, seq_id={seq_id}; requesting a fresh snapshot"
             );
 
-            let Some(channel) = book_channels.get_cloned(&instrument_id) else {
-                log::warn!("Cannot recover book sequence for unsubscribed {instrument_id}");
-                return false;
-            };
-            let Some(ws) = recovery_ws.cloned() else {
-                log::error!("No public websocket available to recover book for {instrument_id}");
-                return false;
-            };
-            let channels = Arc::clone(book_channels);
-            let recovery_cancel = tasks.cancellation_token();
-
-            spawn_task(tasks, async move {
-                if recovery_cancel.is_cancelled()
-                    || channels.get_cloned(&instrument_id) != Some(channel)
-                {
-                    return;
-                }
-
-                if let Err(e) = ws.resubscribe_book_channel(instrument_id, channel).await {
-                    log::error!("Failed to recover book sequence for {instrument_id}: {e}");
-                }
-            });
-
-            if !snapshot_timeout.is_zero() {
-                spawn_snapshot_health_monitor(book_sync.clone(), tasks, snapshot_timeout);
-            }
+            spawn_book_recovery(
+                instrument_id,
+                book_channels,
+                book_sync,
+                recovery_ws,
+                scope,
+                snapshot_timeout,
+                tasks,
+            );
             false
         }
     }
+}
+
+/// Spawns a single budgeted book resubscription attempt for `instrument_id`.
+///
+/// Whether or not the send succeeds, a fresh snapshot deadline is armed so a
+/// lost, rejected, or snapshot-less resubscribe is retried by
+/// [`spawn_book_recovery_monitor`] when the deadline expires.
+fn spawn_book_recovery(
+    instrument_id: InstrumentId,
+    book_channels: &Arc<AtomicMap<InstrumentId, OKXBookChannel>>,
+    book_sync: &BookSyncTracker,
+    recovery_ws: Option<&OKXWebSocketClient>,
+    scope: BookChannelScope,
+    snapshot_timeout: Duration,
+    tasks: &TaskSpawner,
+) {
+    let Some(channel) = book_channels.get_cloned(&instrument_id) else {
+        log::warn!("Cannot recover book for unsubscribed {instrument_id}");
+        return;
+    };
+
+    let Some(ws) = recovery_ws.cloned() else {
+        log::error!("No websocket available to recover book for {instrument_id}");
+        return;
+    };
+
+    let channels = Arc::clone(book_channels);
+    let tracker = book_sync.clone();
+    let recovery_cancel = tasks.cancellation_token();
+    let spawner = tasks.clone();
+
+    spawn_task(tasks, async move {
+        if recovery_cancel.is_cancelled() || channels.get_cloned(&instrument_id) != Some(channel) {
+            return;
+        }
+
+        let Some(attempt) =
+            tracker.next_recovery_attempt(instrument_id, BOOK_RECOVERY_MAX_ATTEMPTS)
+        else {
+            log::error!(
+                "Book recovery for {instrument_id} abandoned after \
+                 {BOOK_RECOVERY_MAX_ATTEMPTS} attempts"
+            );
+            return;
+        };
+
+        if let Err(e) = ws.resubscribe_book_channel(instrument_id, channel).await {
+            log::warn!("Book recovery attempt {attempt} for {instrument_id} failed: {e}");
+        }
+
+        if !snapshot_timeout.is_zero() {
+            tracker.arm_pending_snapshot(instrument_id, snapshot_timeout, Instant::now());
+            spawn_book_recovery_monitor(
+                tracker,
+                Some(ws),
+                channels,
+                scope,
+                snapshot_timeout,
+                &spawner,
+            );
+        }
+    });
+}
+
+/// Spawns a one-shot monitor that retries recovery for every book instrument
+/// whose armed snapshot deadline expires on this socket's channels.
+fn spawn_book_recovery_monitor(
+    book_sync: BookSyncTracker,
+    recovery_ws: Option<OKXWebSocketClient>,
+    book_channels: Arc<AtomicMap<InstrumentId, OKXBookChannel>>,
+    scope: BookChannelScope,
+    snapshot_timeout: Duration,
+    tasks: &TaskSpawner,
+) {
+    let task_cancel = tasks.cancellation_token();
+    let spawner = tasks.clone();
+
+    spawn_task(tasks, async move {
+        tokio::select! {
+            biased;
+            () = task_cancel.cancelled() => {}
+            () = time::sleep(snapshot_timeout) => {
+                let expired = book_sync.expired_pending_snapshots(
+                    &book_channels,
+                    scope,
+                    Instant::now(),
+                );
+                handle_book_sync_signals(expired.clone());
+
+                for signal in expired {
+                    spawn_book_recovery(
+                        signal.instrument_id,
+                        &book_channels,
+                        &book_sync,
+                        recovery_ws.as_ref(),
+                        scope,
+                        snapshot_timeout,
+                        &spawner,
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// Guards instrument definitions: serializes diff-update-publish sequences
@@ -1242,7 +1361,7 @@ struct InstrumentUpdateLock {
 
 fn dispatch_parsed_data(
     msg: NautilusWsMessage,
-    data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: &EventSender<DataEvent>,
     instruments_by_symbol: &Arc<AtomicMap<Ustr, InstrumentAny>>,
 ) {
     match msg {
@@ -1280,10 +1399,7 @@ fn dispatch_parsed_data(
     }
 }
 
-fn emit_funding_rates(
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
-    updates: Vec<FundingRateUpdate>,
-) {
+fn emit_funding_rates(sender: &EventSender<DataEvent>, updates: Vec<FundingRateUpdate>) {
     for update in updates {
         if let Err(e) = sender.send(DataEvent::FundingRate(update)) {
             log::error!("Failed to emit funding rate event: {e}");
@@ -1292,7 +1408,7 @@ fn emit_funding_rates(
 }
 
 fn emit_instrument_status(
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &EventSender<DataEvent>,
     instrument_id: InstrumentId,
     status_action: MarketStatusAction,
     is_live: bool,
@@ -1313,23 +1429,6 @@ fn emit_instrument_status(
     if let Err(e) = sender.send(DataEvent::InstrumentStatus(status)) {
         log::error!("Failed to emit instrument status event: {e}");
     }
-}
-
-fn spawn_snapshot_health_monitor(
-    book_sync: BookSyncTracker,
-    tasks: &TaskSpawner,
-    timeout: Duration,
-) {
-    let task_cancel = tasks.cancellation_token();
-    spawn_task(tasks, async move {
-        tokio::select! {
-            biased;
-            () = task_cancel.cancelled() => {}
-            () = time::sleep(timeout) => {
-                handle_book_sync_signals(book_sync.expired_pending_snapshots(Instant::now()));
-            }
-        }
-    });
 }
 
 fn handle_book_sync_signals(signals: Vec<BookSyncSignal>) {
@@ -1413,7 +1512,7 @@ fn publish_instrument_updates(
     ws_public: Option<&OKXWebSocketClient>,
     ws_business: Option<&OKXWebSocketClient>,
     instrument_update_lock: &InstrumentUpdateLock,
-    data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: &EventSender<DataEvent>,
 ) {
     cache_instrument_updates(
         changed,
@@ -1633,7 +1732,7 @@ async fn reconcile_instruments(
     instrument_update_lock: &InstrumentUpdateLock,
     ws_public: Option<&OKXWebSocketClient>,
     ws_business: Option<&OKXWebSocketClient>,
-    data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: &EventSender<DataEvent>,
 ) -> anyhow::Result<InstrumentReconciliation> {
     let seq_before = instrument_update_lock.write_seq.load(Ordering::SeqCst);
     let fetched = fetch_configured_instruments(http_client, config).await?;
@@ -1866,7 +1965,7 @@ impl DataClient for OKXDataClient {
             return Ok(());
         }
 
-        let raw_depth = cmd.depth.map_or(0, |d| d.get());
+        let raw_depth = cmd.depth.map_or(0, std::num::NonZero::get);
         let depth = resolve_book_depth(raw_depth);
         if depth != raw_depth {
             log::debug!("Clamped book depth {raw_depth} to {depth} (OKX supports 50 or 400)");
@@ -2051,7 +2150,7 @@ impl DataClient for OKXDataClient {
 
     fn subscribe_option_greeks(&mut self, cmd: SubscribeOptionGreeks) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
-        let conventions = parse_greeks_conventions_from_params(&cmd.params);
+        let conventions = parse_greeks_conventions_from_params(cmd.params.as_ref());
         self.option_greeks_subs.insert(instrument_id, conventions);
 
         let family = extract_inst_family(instrument_id.symbol.inner().as_str())?;
@@ -2848,12 +2947,12 @@ impl DataClient for OKXDataClient {
 /// Returns the default set `{Bs, Pa}` when the key is absent, unparsable, or
 /// yields no valid entries so every subscription defaults to both conventions.
 pub(crate) fn parse_greeks_conventions_from_params(
-    params: &Option<Params>,
+    params: Option<&Params>,
 ) -> AHashSet<OKXGreeksType> {
     let default_set: AHashSet<OKXGreeksType> =
         [OKXGreeksType::Bs, OKXGreeksType::Pa].into_iter().collect();
 
-    let Some(value) = params.as_ref().and_then(|p| p.get("greeks_convention")) else {
+    let Some(value) = params.and_then(|p| p.get("greeks_convention")) else {
         return default_set;
     };
 
@@ -2956,7 +3055,7 @@ mod tests {
 
         dispatch_parsed_data(
             NautilusWsMessage::InstrumentStatus(status),
-            &sender,
+            &sender.into(),
             &instruments_by_symbol,
         );
 
@@ -2968,7 +3067,7 @@ mod tests {
     }
 
     #[rstest]
-    fn rejected_book_subscription_clears_sync_and_preserves_reconnect_intent() {
+    fn rejected_book_subscription_preserves_channel_and_sync_state() {
         let instrument_id = InstrumentId::from("OMI-USD.OKX");
         let mut pair = currency_pair_btcusdt();
         pair.id = instrument_id;
@@ -2980,7 +3079,10 @@ mod tests {
         let book_channels = Arc::new(AtomicMap::new());
         book_channels.insert(instrument_id, OKXBookChannel::Book);
         let book_sync = BookSyncTracker::default();
-        book_sync.record_subscription(instrument_id, Instant::now());
+        let subscribed_at = Instant::now()
+            .checked_sub(Duration::from_secs(6))
+            .expect("subscription timestamp");
+        book_sync.record_subscription(instrument_id, subscribed_at);
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let http = offline_http_client();
         let update_lock = InstrumentUpdateLock::default();
@@ -2998,7 +3100,7 @@ mod tests {
                 code: "60018".to_string(),
                 msg: "Channel does not exist".to_string(),
             },
-            &sender,
+            &sender.into(),
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -3022,12 +3124,170 @@ mod tests {
             Some(&OKXBookChannel::Book),
             "rejected subscription must preserve the channel selected for reconnect"
         );
-        assert!(
+        assert_eq!(
             book_sync
-                .stale_books(Duration::ZERO, Instant::now())
-                .is_empty(),
-            "rejected subscription must remove book synchronization state"
+                .stale_books(Duration::from_secs(5), Instant::now())
+                .len(),
+            1,
+            "rejected subscription must keep book synchronization state for recovery"
         );
+    }
+
+    #[rstest]
+    fn reconnect_clears_quote_and_funding_caches() {
+        let instrument_id = InstrumentId::from("OMI-USD.OKX");
+        let mut pair = currency_pair_btcusdt();
+        pair.id = instrument_id;
+        pair.raw_symbol = Symbol::from("OMI-USD");
+        let instrument = InstrumentAny::CurrencyPair(pair);
+
+        let instruments_by_symbol = Arc::new(AtomicMap::new());
+        instruments_by_symbol.insert(Ustr::from("OMI-USD"), instrument);
+        let book_channels = Arc::new(AtomicMap::new());
+        let book_sync = BookSyncTracker::default();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let http = offline_http_client();
+        let update_lock = InstrumentUpdateLock::default();
+        let mut quote_cache = QuoteCache::new();
+        quote_cache
+            .process(
+                instrument_id,
+                Some(Price::from("1.0")),
+                Some(Price::from("1.1")),
+                Some(Quantity::from("1")),
+                Some(Quantity::from("2")),
+                UnixNanos::from(1),
+                UnixNanos::from(2),
+            )
+            .expect("seed quote cache");
+        let mut funding_cache =
+            AHashMap::from([(Ustr::from("OMI-USD"), (Ustr::from("0.0001"), 1))]);
+        let index_ticker_map = Arc::new(AtomicMap::new());
+        let option_greeks_subs = Arc::new(AtomicMap::new());
+        let task_group = TaskGroup::new();
+        let tasks = task_group.spawner().expect("task spawner");
+
+        OKXDataClient::handle_ws_message(
+            OKXWsMessage::Reconnected,
+            &sender.clone().into(),
+            &instruments_by_symbol,
+            &http,
+            &OKXDataClientConfig::default(),
+            &update_lock,
+            &book_channels,
+            &book_sync,
+            None,
+            None,
+            &mut quote_cache,
+            &mut funding_cache,
+            &index_ticker_map,
+            &option_greeks_subs,
+            BookChannelScope::Public,
+            Duration::ZERO,
+            &tasks,
+            get_atomic_clock_realtime(),
+        );
+
+        assert!(
+            quote_cache.is_empty(),
+            "reconnect must drop quotes from the previous generation"
+        );
+        assert!(
+            funding_cache.is_empty(),
+            "reconnect must drop funding rates from the previous generation"
+        );
+
+        OKXDataClient::handle_ws_message(
+            OKXWsMessage::ChannelData {
+                channel: OKXWsChannel::BboTbt,
+                inst_id: Some(Ustr::from("OMI-USD")),
+                data: json!([{
+                    "asks": [{
+                        "price": "1.2",
+                        "size": "3",
+                        "liquidated_orders_count": "0",
+                        "orders_count": "1"
+                    }],
+                    "bids": [],
+                    "seqId": 1,
+                    "ts": "3"
+                }]),
+            },
+            &sender.clone().into(),
+            &instruments_by_symbol,
+            &http,
+            &OKXDataClientConfig::default(),
+            &update_lock,
+            &book_channels,
+            &book_sync,
+            None,
+            None,
+            &mut quote_cache,
+            &mut funding_cache,
+            &index_ticker_map,
+            &option_greeks_subs,
+            BookChannelScope::Public,
+            Duration::ZERO,
+            &tasks,
+            get_atomic_clock_realtime(),
+        );
+
+        assert!(
+            receiver.try_recv().is_err(),
+            "partial BBO after reconnect must not invent a quote from the previous generation"
+        );
+        assert!(quote_cache.is_empty());
+
+        OKXDataClient::handle_ws_message(
+            OKXWsMessage::ChannelData {
+                channel: OKXWsChannel::BboTbt,
+                inst_id: Some(Ustr::from("OMI-USD")),
+                data: json!([{
+                    "asks": [{
+                        "price": "1.2",
+                        "size": "3",
+                        "liquidated_orders_count": "0",
+                        "orders_count": "1"
+                    }],
+                    "bids": [{
+                        "price": "1.0",
+                        "size": "4",
+                        "liquidated_orders_count": "0",
+                        "orders_count": "1"
+                    }],
+                    "seqId": 2,
+                    "ts": "4"
+                }]),
+            },
+            &sender.into(),
+            &instruments_by_symbol,
+            &http,
+            &OKXDataClientConfig::default(),
+            &update_lock,
+            &book_channels,
+            &book_sync,
+            None,
+            None,
+            &mut quote_cache,
+            &mut funding_cache,
+            &index_ticker_map,
+            &option_greeks_subs,
+            BookChannelScope::Public,
+            Duration::ZERO,
+            &tasks,
+            get_atomic_clock_realtime(),
+        );
+
+        match receiver.try_recv().expect("complete BBO after reconnect") {
+            DataEvent::Data(Data::Quote(quote)) => {
+                assert_eq!(quote.instrument_id, instrument_id);
+                assert_eq!(quote.bid_price, Price::from("1.0"));
+                assert_eq!(quote.ask_price, Price::from("1.2"));
+                assert_eq!(quote.bid_size, Quantity::from("4"));
+                assert_eq!(quote.ask_size, Quantity::from("3"));
+            }
+            other => panic!("Expected DataEvent::Data(Data::Quote), was {other:?}"),
+        }
     }
 
     #[rstest]
@@ -3069,7 +3329,7 @@ mod tests {
         let mut handle = |message| {
             OKXDataClient::handle_ws_message(
                 message,
-                &sender,
+                &sender.clone().into(),
                 &instruments_by_symbol,
                 &http,
                 &OKXDataClientConfig::default(),
@@ -3118,7 +3378,7 @@ mod tests {
 
     #[rstest]
     fn parse_conventions_returns_both_when_params_missing() {
-        let result = parse_greeks_conventions_from_params(&None);
+        let result = parse_greeks_conventions_from_params(None);
         assert_eq!(result, both());
     }
 
@@ -3126,7 +3386,7 @@ mod tests {
     fn parse_conventions_returns_both_when_key_absent() {
         let mut params = Params::new();
         params.insert("other_key".to_string(), json!("value"));
-        let result = parse_greeks_conventions_from_params(&Some(params));
+        let result = parse_greeks_conventions_from_params(Some(&params));
         assert_eq!(result, both());
     }
 
@@ -3138,7 +3398,7 @@ mod tests {
     fn parse_conventions_accepts_single_string(#[case] raw: &str, #[case] expected: OKXGreeksType) {
         let mut params = Params::new();
         params.insert("greeks_convention".to_string(), json!(raw));
-        let result = parse_greeks_conventions_from_params(&Some(params));
+        let result = parse_greeks_conventions_from_params(Some(&params));
         assert_eq!(result, only(expected));
     }
 
@@ -3149,7 +3409,7 @@ mod tests {
             "greeks_convention".to_string(),
             json!(["BLACK_SCHOLES", "PRICE_ADJUSTED"]),
         );
-        let result = parse_greeks_conventions_from_params(&Some(params));
+        let result = parse_greeks_conventions_from_params(Some(&params));
         assert_eq!(result, both());
     }
 
@@ -3157,7 +3417,7 @@ mod tests {
     fn parse_conventions_accepts_single_entry_list() {
         let mut params = Params::new();
         params.insert("greeks_convention".to_string(), json!(["PRICE_ADJUSTED"]));
-        let result = parse_greeks_conventions_from_params(&Some(params));
+        let result = parse_greeks_conventions_from_params(Some(&params));
         assert_eq!(result, only(OKXGreeksType::Pa));
     }
 
@@ -3168,7 +3428,7 @@ mod tests {
             "greeks_convention".to_string(),
             json!(["BLACK_SCHOLES", "black_scholes"]),
         );
-        let result = parse_greeks_conventions_from_params(&Some(params));
+        let result = parse_greeks_conventions_from_params(Some(&params));
         assert_eq!(result, only(OKXGreeksType::Bs));
     }
 
@@ -3179,7 +3439,7 @@ mod tests {
             "greeks_convention".to_string(),
             json!(["BOGUS", "PRICE_ADJUSTED"]),
         );
-        let result = parse_greeks_conventions_from_params(&Some(params));
+        let result = parse_greeks_conventions_from_params(Some(&params));
         assert_eq!(result, only(OKXGreeksType::Pa));
     }
 
@@ -3187,7 +3447,7 @@ mod tests {
     fn parse_conventions_falls_back_to_both_on_all_unknown() {
         let mut params = Params::new();
         params.insert("greeks_convention".to_string(), json!(["BOGUS"]));
-        let result = parse_greeks_conventions_from_params(&Some(params));
+        let result = parse_greeks_conventions_from_params(Some(&params));
         assert_eq!(result, both());
     }
 
@@ -3199,7 +3459,7 @@ mod tests {
     fn parse_conventions_falls_back_on_non_string_value(#[case] value: serde_json::Value) {
         let mut params = Params::new();
         params.insert("greeks_convention".to_string(), value);
-        let result = parse_greeks_conventions_from_params(&Some(params));
+        let result = parse_greeks_conventions_from_params(Some(&params));
         assert_eq!(result, both());
     }
 
@@ -3207,7 +3467,7 @@ mod tests {
     fn parse_conventions_falls_back_on_unknown_single_string() {
         let mut params = Params::new();
         params.insert("greeks_convention".to_string(), json!("BOGUS"));
-        let result = parse_greeks_conventions_from_params(&Some(params));
+        let result = parse_greeks_conventions_from_params(Some(&params));
         assert_eq!(result, both());
     }
 
@@ -3290,7 +3550,7 @@ mod tests {
     }
 
     fn handle_instruments_message(
-        sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        sender: &EventSender<DataEvent>,
         instruments_by_symbol: &Arc<AtomicMap<Ustr, InstrumentAny>>,
         http_client: &OKXHttpClient,
         config: &OKXDataClientConfig,
@@ -3339,7 +3599,7 @@ mod tests {
         let ws_business = offline_ws_client();
 
         handle_instruments_message(
-            &sender,
+            &sender.into(),
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -3396,7 +3656,7 @@ mod tests {
 
         for _ in 0..2 {
             handle_instruments_message(
-                &sender,
+                &sender.clone().into(),
                 &instruments_by_symbol,
                 &http,
                 &OKXDataClientConfig::default(),
@@ -3437,7 +3697,7 @@ mod tests {
         let http = offline_http_client();
 
         handle_instruments_message(
-            &sender,
+            &sender.clone().into(),
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -3446,7 +3706,7 @@ mod tests {
             ws_instruments_message(swap_definition("0.1")),
         );
         handle_instruments_message(
-            &sender,
+            &sender.into(),
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -3498,7 +3758,7 @@ mod tests {
         definition["uly"] = json!("");
 
         handle_instruments_message(
-            &sender,
+            &sender.into(),
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -3541,7 +3801,7 @@ mod tests {
         ]);
 
         handle_instruments_message(
-            &sender,
+            &sender.into(),
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -3590,7 +3850,7 @@ mod tests {
             .build();
 
         handle_instruments_message(
-            &sender,
+            &sender.clone().into(),
             &instruments_by_symbol,
             &http,
             &config,
@@ -3621,7 +3881,7 @@ mod tests {
         assert_eq!(inverse_item["instId"], json!("BTC-USD-SWAP"));
         assert_eq!(inverse_item["ctType"], json!("inverse"));
         handle_instruments_message(
-            &sender,
+            &sender.into(),
             &instruments_by_symbol,
             &http,
             &config,
@@ -3658,7 +3918,7 @@ mod tests {
         eth_definition["uly"] = json!("ETH-USDT");
 
         handle_instruments_message(
-            &sender,
+            &sender.clone().into(),
             &instruments_by_symbol,
             &http,
             &config,
@@ -3683,7 +3943,7 @@ mod tests {
         assert!(instruments_by_symbol.load().is_empty());
 
         handle_instruments_message(
-            &sender,
+            &sender.into(),
             &instruments_by_symbol,
             &http,
             &config,
@@ -3730,7 +3990,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("reconcile");
@@ -3775,7 +4035,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("reconcile");
@@ -3801,7 +4061,7 @@ mod tests {
         let okx_inst = OKXInstrument {
             inst_type: OKXInstrumentType::Events,
             inst_id: Ustr::from("BTC-ABOVE-DAILY-260224-1600-65000"),
-            inst_id_code: Some(1000000001),
+            inst_id_code: Some(1_000_000_001),
             uly: Ustr::from(""),
             inst_family: Ustr::from(""),
             series_id: Some(Ustr::from("BTC-ABOVE-DAILY")),
@@ -3817,8 +4077,8 @@ mod tests {
             ct_val_ccy: String::new(),
             opt_type: crate::common::enums::OKXOptionType::None,
             stk: String::new(),
-            list_time: Some(1769697132335),
-            exp_time: Some(1769700732335),
+            list_time: Some(1_769_697_132_335),
+            exp_time: Some(1_769_700_732_335),
             lever: String::new(),
             tick_sz: "0.001".to_string(),
             lot_sz: "1".to_string(),
@@ -3837,6 +4097,7 @@ mod tests {
             rpi: None,
             rpi_min_level: None,
             rpi_min_px_band: None,
+            trade_quote_ccy_list: Vec::new(),
         };
         let instrument = crate::common::parse::parse_event_contract_instrument(
             &okx_inst,
@@ -3884,7 +4145,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("reconcile");
@@ -3895,7 +4156,7 @@ mod tests {
         let rest_item = test_payload("http_get_instruments_swap.json")["data"][2].clone();
         assert_eq!(rest_item["instId"], json!("BTC-USDT-SWAP"));
         handle_instruments_message(
-            &sender,
+            &sender.clone().into(),
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -4132,7 +4393,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("initial reconcile");
@@ -4149,7 +4410,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("unchanged reconcile");
@@ -4172,7 +4433,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("changed reconcile");
@@ -4200,7 +4461,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("new listing reconcile");
@@ -4225,7 +4486,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("removal reconcile");
@@ -4264,7 +4525,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await;
 
@@ -4301,7 +4562,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("reconcile");
@@ -4358,7 +4619,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("reconcile");
@@ -4400,7 +4661,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("reconcile");
@@ -4442,7 +4703,7 @@ mod tests {
                 &update_lock_task,
                 Some(&ws_task),
                 Some(&ws_business_task),
-                &sender,
+                &sender.clone().into(),
             )
             .await
         });
@@ -4498,7 +4759,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("seed reconcile");
@@ -4519,7 +4780,7 @@ mod tests {
                     &update_lock,
                     None,
                     None,
-                    &sender,
+                    &sender.clone().into(),
                 )
                 .await
             })
@@ -4547,7 +4808,7 @@ mod tests {
                 None,
                 None,
                 &update_lock,
-                &sender,
+                &sender.clone().into(),
             );
         }
 

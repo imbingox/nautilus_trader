@@ -41,6 +41,9 @@ pub(crate) mod tests;
 
 // Re-exports
 pub use data_actor::{DataActor, DataActorConfig, DataActorCore, DataActorNative};
+pub(crate) use dispatch::ChainContext;
+#[cfg(feature = "live")]
+pub(crate) use dispatch::{SendChainContext, collect_command_contexts};
 
 pub use crate::component::Component;
 

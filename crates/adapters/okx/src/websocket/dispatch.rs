@@ -479,7 +479,7 @@ impl WsDispatchState {
 /// Dispatches a WebSocket message with cross-stream deduplication.
 ///
 /// For orders with a tracked identity (submitted through this client), produces
-/// proper order events (OrderAccepted, OrderCanceled, OrderFilled, etc.).
+/// proper order events (`OrderAccepted`, `OrderCanceled`, `OrderFilled`, etc.).
 /// For untracked orders (external or pre-existing), falls back to execution
 /// reports for downstream reconciliation.
 #[expect(clippy::too_many_arguments)]
@@ -836,6 +836,7 @@ fn route_algo_order_message(
     if matches!(
         msg.ord_type,
         OKXAlgoOrderType::Iceberg
+            | OKXAlgoOrderType::SmartIceberg
             | OKXAlgoOrderType::Twap
             | OKXAlgoOrderType::Chase
             | OKXAlgoOrderType::Other
