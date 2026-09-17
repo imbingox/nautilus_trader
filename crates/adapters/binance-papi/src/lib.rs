@@ -13,24 +13,24 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Binance Portfolio Margin account evidence and bounded Rust/Python read-only queries.
+//! Binance Portfolio Margin account evidence, private observation, and bounded recovery.
 //!
 //! The [`read_only`] client uses the pinned Binance SDK for signed account observations,
 //! order/fill/position reports, and explicitly incomplete historical snapshots. It accepts
 //! explicit credentials and preloaded one-way UM instrument scope. Supported observations can
-//! produce a diagnostic totals-only account projection and independent PM risk view. Trading is
-//! unavailable.
+//! produce a totals-only account projection and independent PM risk view.
 //!
-//! Factory-created Rust execution clients support scoped reports after explicit read-only
-//! configuration and instrument preloading. LiveNode startup remains unavailable because the
-//! diagnostic snapshot does not publish a live account or provide PM order admission. Public
-//! market data and instruments use the existing `nautilus-binance` adapter.
+//! The [`websocket`] session receives before collecting its REST baseline, owns listen-key renewal,
+//! and publishes typed recovery evidence. Factory-created execution clients can connect in this
+//! observation mode and publish account and reconciliation state after synchronization. Order
+//! submission, modification, and cancellation remain unavailable. Public market data and
+//! instruments use the existing `nautilus-binance` adapter.
 //!
 //! # Feature Flags
 //!
 //! - `extension-module`: Builds Python bindings into an extension module.
 //! - `high-precision` (default): Uses 128-bit fixed-point domain values.
-//! - `python`: Enables Python read-only query, configuration, and factory bindings.
+//! - `python`: Enables Python query, observation-session, configuration, and factory bindings.
 
 #![deny(unsafe_code)]
 #![deny(missing_debug_implementations)]
@@ -41,6 +41,7 @@ pub mod config;
 pub mod consts;
 pub mod factories;
 pub mod read_only;
+pub mod websocket;
 
 #[cfg(feature = "python")]
 pub mod python;

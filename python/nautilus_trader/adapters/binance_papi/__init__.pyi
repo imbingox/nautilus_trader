@@ -9,6 +9,7 @@ __all__ = [
     "BINANCE_PAPI",
     "BINANCE_PAPI_CLIENT_ID",
     "BINANCE_PAPI_VENUE",
+    "BinancePapiAccountSession",
     "BinancePapiExecutionClientConfig",
     "BinancePapiExecutionClientFactory",
     "BinancePapiReadOnlyClient",
@@ -19,6 +20,19 @@ __all__ = [
 BINANCE_PAPI: str
 BINANCE_PAPI_CLIENT_ID: model.ClientId
 BINANCE_PAPI_VENUE: model.Venue
+
+@typing.final
+class BinancePapiAccountSession:
+    def __init__(
+        self, config: BinancePapiReadOnlyConfig, instruments: typing.Sequence[typing.Any]
+    ) -> None: ...
+    def start(self) -> typing.Awaitable[None]: ...
+    def stop(self) -> typing.Awaitable[None]: ...
+    def evidence_json(self) -> str: ...
+    @property
+    def is_connected(self) -> bool: ...
+    @property
+    def is_synchronized(self) -> bool: ...
 
 @typing.final
 class BinancePapiExecutionClientConfig:
@@ -78,10 +92,19 @@ class BinancePapiReadOnlyConfig:
         api_key: str,
         api_secret: str,
         base_url: str | None = None,
+        websocket_url: str | None = None,
+        proxy_url: str | None = None,
         request_timeout_ms: int | None = None,
         operation_timeout_ms: int | None = None,
         max_requests: int | None = None,
         max_rows: int | None = None,
+        listen_key_keepalive_interval_ms: int | None = None,
+        transport_rotation_interval_ms: int | None = None,
+        recovery_lookback_ms: int | None = None,
+        refresh_debounce_ms: int | None = None,
+        max_websocket_message_bytes: int | None = None,
+        max_websocket_buffer_messages: int | None = None,
+        max_websocket_buffer_bytes: int | None = None,
     ) -> None: ...
     @property
     def account_id(self) -> model.AccountId: ...
@@ -93,6 +116,22 @@ class BinancePapiReadOnlyConfig:
     def max_requests(self) -> int: ...
     @property
     def max_rows(self) -> int: ...
+    @property
+    def listen_key_keepalive_interval_ms(self) -> int: ...
+    @property
+    def transport_rotation_interval_ms(self) -> int: ...
+    @property
+    def recovery_lookback_ms(self) -> int: ...
+    @property
+    def refresh_debounce_ms(self) -> int: ...
+    @property
+    def max_websocket_message_bytes(self) -> int: ...
+    @property
+    def max_websocket_buffer_messages(self) -> int: ...
+    @property
+    def max_websocket_buffer_bytes(self) -> int: ...
+    @property
+    def has_proxy_url(self) -> bool: ...
 
 @typing.final
 class BinancePapiReadOnlySnapshot:

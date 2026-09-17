@@ -13,23 +13,14 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Python factory bindings for scoped read-only PAPI execution reports.
+//! Portfolio Margin private account-stream transport and recovery ownership.
 
-use pyo3::prelude::*;
+mod messages;
+mod state;
 
-use crate::{consts::BINANCE_PAPI, factories::BinancePapiExecutionClientFactory};
+pub mod session;
 
-#[pymethods]
-#[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl BinancePapiExecutionClientFactory {
-    /// Factory for scoped Binance Portfolio Margin observation and execution reports.
-    #[new]
-    fn py_new() -> Self {
-        Self::new()
-    }
-
-    #[pyo3(name = "name")]
-    fn py_name(&self) -> &'static str {
-        BINANCE_PAPI
-    }
-}
+pub(crate) use session::PapiRecoveryBundle;
+pub use session::{
+    BinancePapiAccountSession, BinancePapiRecoveryEvidence, BinancePapiSessionState,
+};

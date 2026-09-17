@@ -17,13 +17,15 @@ Binance Portfolio Margin read-only queries (requires the ``papi`` build feature)
 
 Use ``nautilus_trader.adapters.binance`` for public data and instrument loading.
 ``BinancePapiReadOnlyClient`` returns exact account evidence and execution reports.
-LiveNode startup still requires an accepted economic account projection.
+``BinancePapiAccountSession`` adds private-stream observation and bounded recovery.
+Trading commands remain disabled.
 
 """
 
 from nautilus_trader._libnautilus.binance_papi import BINANCE_PAPI
 from nautilus_trader._libnautilus.binance_papi import BINANCE_PAPI_CLIENT_ID
 from nautilus_trader._libnautilus.binance_papi import BINANCE_PAPI_VENUE
+from nautilus_trader._libnautilus.binance_papi import BinancePapiAccountSession
 from nautilus_trader._libnautilus.binance_papi import BinancePapiExecutionClientConfig
 from nautilus_trader._libnautilus.binance_papi import BinancePapiExecutionClientFactory
 from nautilus_trader._libnautilus.binance_papi import BinancePapiReadOnlyClient
@@ -35,6 +37,7 @@ __all__ = [
     "BINANCE_PAPI",
     "BINANCE_PAPI_CLIENT_ID",
     "BINANCE_PAPI_VENUE",
+    "BinancePapiAccountSession",
     "BinancePapiExecutionClientConfig",
     "BinancePapiExecutionClientFactory",
     "BinancePapiReadOnlyClient",

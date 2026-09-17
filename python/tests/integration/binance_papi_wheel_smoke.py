@@ -23,6 +23,7 @@ This script needs only the installed wheel and the Python standard library.
 import asyncio
 import importlib
 import importlib.metadata
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -114,6 +115,7 @@ def main() -> None:
     assert isinstance(config.account_id, AccountId)
     assert papi.BinancePapiExecutionClientFactory().name() == "BINANCE_PAPI"
     for name in (
+        "BinancePapiAccountSession",
         "BinancePapiReadOnlyClient",
         "BinancePapiReadOnlyConfig",
         "BinancePapiReadOnlySnapshot",
@@ -139,6 +141,16 @@ def main() -> None:
         api_secret="OfflinePapiSecret",
         base_url="http://127.0.0.1:9",
     )
+    session = papi.BinancePapiAccountSession(read_only, [instrument])
+    evidence = json.loads(session.evidence_json())
+    assert evidence["state"] == "stopped"
+    assert evidence["transport_connected"] is False
+    assert evidence["synchronized"] is False
+    assert evidence["trading_authorized"] is False
+    assert not hasattr(session, "submit_order")
+    assert not hasattr(session, "modify_order")
+    assert not hasattr(session, "cancel_order")
+    asyncio.run(session.stop())
     reader = papi.BinancePapiReadOnlyClient(read_only, [instrument])
     reader.cancel()
 
@@ -172,7 +184,7 @@ def main() -> None:
         )
         .build()
     )
-    # The engine logs the client's PAPI error and the node fails its readiness check
+    # The offline endpoint is unreachable, so the node must fail its readiness check cleanly
     check = unittest.TestCase()
     with check.assertRaisesRegex(RuntimeError, "readiness timeout"):  # noqa: PT027 - stdlib-only check
         unsupported.run()

@@ -37,9 +37,7 @@ use crate::{
     execution::BinancePapiExecutionClient,
 };
 
-/// Factory for scoped Binance Portfolio Margin read-only execution reports.
-///
-/// LiveNode startup remains unavailable until economic account projection is accepted.
+/// Factory for scoped Binance Portfolio Margin observation and execution reports.
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(
     feature = "python",

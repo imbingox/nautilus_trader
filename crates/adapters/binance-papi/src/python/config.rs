@@ -28,8 +28,8 @@ impl BinancePapiExecutionClientConfig {
     ///
     /// The default supports node construction without credentials. Supplying `read_only`
     /// and explicit instrument IDs enables the Rust execution client's report methods.
-    /// Instruments must already exist in the node cache. LiveNode startup remains unavailable
-    /// until the native account balance mapping is accepted; trading is unsupported.
+    /// Instruments must already exist in the node cache. The client starts a private observation and
+    /// recovery session; trading remains unsupported.
     #[new]
     #[pyo3(signature = (account_id=None, read_only=None, instrument_ids=None))]
     fn py_new(

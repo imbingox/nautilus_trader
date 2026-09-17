@@ -49,6 +49,7 @@ nautilus-binance = { workspace = true }
 nautilus-common = { workspace = true }
 nautilus-core = { workspace = true }
 nautilus-execution = { workspace = true }
+nautilus-live = { workspace = true }
 nautilus-model = { workspace = true }
 nautilus-network = { workspace = true }
 nautilus-system = { workspace = true, optional = true }
@@ -75,10 +76,13 @@ pyo3-stub-gen = { workspace = true, optional = true }
 [dev-dependencies]
 nautilus-live = { workspace = true }
 nautilus-model = { workspace = true, features = ["test-support"] }
+nautilus-portfolio = { workspace = true }
 
 aws-lc-rs = { workspace = true }
 axum = { workspace = true }
+futures-util = { workspace = true }
 rstest = { workspace = true }
 rust_decimal_macros = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+tokio-tungstenite = { workspace = true }
 toml = { workspace = true }

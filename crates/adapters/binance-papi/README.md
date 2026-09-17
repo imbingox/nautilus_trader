@@ -1,10 +1,11 @@
 # nautilus-binance-papi
 
-Binance Portfolio Margin (PAPI) adapter for NautilusTrader, with Rust and Python read-only queries.
+Binance Portfolio Margin (PAPI) adapter for NautilusTrader, with Rust and Python private account
+observation and read-only queries.
 The client collects exact account observations and
 ordinary/algo order, fill, and one-way UM position reports through signed GET requests.
 The read-only account projection is implemented and has authenticated supported-account acceptance.
-The documented scope limits and trading startup gate remain in place.
+The documented scope limits and trading gate remain in place.
 
 The execution factory supports configuration, factory extraction and `LiveNode` construction.
 Factory-created Rust clients can generate scoped reports after `start()` when configured with
@@ -13,11 +14,12 @@ remain unavailable because their interface cannot express incomplete coverage. T
 mass status defaults to a sixty-minute lookback and preserves the configured client identity.
 Position reports support current observations only; historical position filters fail explicitly.
 
-`LiveNode.run()` still fails its connection readiness check. The diagnostic totals-only snapshot
-does not publish an execution-client account, implement PM admission, or authorize trading.
-Account publication and writes remain unavailable.
-Construction and rejected connection attempts perform no network requests. Cleanup cancels
-outstanding reads and remains idempotent; a later `start()` creates a new read session.
+With explicit credentials and preloaded instrument scope, the execution client starts a private
+account stream before collecting its REST baseline. It publishes the reported totals-only account
+state and uses bounded mass status recovery for later transport gaps. Connection, synchronization,
+and trading authorization remain separate; this stage never authorizes trading, and every
+submit/modify/cancel path rejects the command. Construction performs no network requests. Cleanup
+is idempotent, bounded, and a later start uses a new cancellation domain.
 
 The independent factory name and default client ID are `BINANCE_PAPI`. Instrument venue
 remains `BINANCE`. The default account ID is `BINANCE-PAPI-001`, keeping its issuer
@@ -25,11 +27,28 @@ aligned with the venue used by the core account cache. Use `BinanceDataClientFac
 `load_binance_instruments` from `nautilus_trader.adapters.binance` for existing public
 market data and instrument loading. No Binance code is copied or reconfigured by this adapter.
 
+## Private-stream capability matrix
+
+| Source or event                                                         | Observation behavior                                                                                                                             |
+| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| listen key POST/PUT/DELETE                                              | API-key authenticated lifecycle with empty-response support; no signed query or arbitrary write surface.                                         |
+| `ORDER_TRADE_UPDATE`                                                    | Retains order identity and cumulative state; a fill requires trade ID, quantity, price, signed native commission, currency, liquidity, and time. |
+| `ALGO_UPDATE`                                                           | Accepts the current `ao` UM one-way schema and retains parent/child identity; legacy conditional events are restricted.                          |
+| `ACCOUNT_UPDATE`                                                        | Treats positions as partial rows, never clears an omitted position, and marks wallet/risk/position sources dirty for REST confirmation.          |
+| Balance, liability, risk, and config notices                            | Invalidates the affected source and coalesces a bounded REST refresh; it does not synthesize PM wallet totals from UM deltas.                    |
+| Unknown critical event, unsupported product/mode, conflict, or overflow | Revokes synchronization and latches the session in `restricted` until an explicit new session generation.                                        |
+
+The first supported private scope is declared linear UM instruments in one-way mode. WebSocket
+facts and REST history share bounded identity retention. REST remains authoritative for the PM
+wallet baseline and independent risk evidence. A fixed overlap window recovers activity that
+opened and closed during a gap; missing or contradictory coverage fails synchronization rather
+than being inferred from empty current-order results.
+
 ## Feature flags
 
 - `extension-module`: Builds Python bindings into an extension module.
 - `high-precision` (default): Uses 128-bit fixed-point domain values.
-- `python`: Enables Python read-only query, configuration, and factory bindings.
+- `python`: Enables Python query, observation-session, configuration, and factory bindings.
 
 The encompassing `nautilus-pyo3` crate enables `papi` by default, so regular Cargo builds,
 maturin wheel builds and development installs include PAPI bindings. Pass
@@ -81,7 +100,7 @@ bash "$repo/scripts/strip-adapter-env.bash" \
 
 The smoke test checks the installed package location, distribution metadata, shared core
 types, the existing Binance factory, combined Binance data/PAPI node construction and
-explicit startup failure. It does not connect to Binance. See
+offline startup failure without credential leakage. It does not connect to Binance. See
 `examples/live/binance_papi/build_node.py` for the minimal construction example.
 
 Repeat the build with `--no-default-features`, using a separate output and clean environment,
@@ -95,13 +114,31 @@ Use `read_only::BinancePapiReadOnlyConfig` with an explicit account ID, HMAC key
 then construct `BinancePapiReadOnlyClient` with 1 to 256 preloaded Binance linear UM instruments.
 Public metadata can be loaded through the existing Binance adapter without PAPI credentials.
 No adapter environment variables are read. HTTPS origins and local HTTP loopback origins are
-supported; redirects and implicit environment proxy configuration are disabled.
+supported; redirects and implicit environment proxy configuration are disabled. An explicit
+HTTP or HTTPS `proxy_url` applies to both REST and WebSocket transports.
 
-Python exposes the same `BinancePapiReadOnlyConfig`, `BinancePapiReadOnlyClient`, and
-`BinancePapiReadOnlySnapshot` through `nautilus_trader.adapters.binance_papi`. Query methods are
-awaitable and return the shared Nautilus domain types. Python timestamps and receipt-age bounds
-use integer nanoseconds and milliseconds, respectively. Configuration representations redact
-credentials and URLs, and no plaintext credential getters are exposed.
+Python exposes `BinancePapiReadOnlyConfig`, `BinancePapiReadOnlyClient`,
+`BinancePapiReadOnlySnapshot`, and `BinancePapiAccountSession` through
+`nautilus_trader.adapters.binance_papi`. Query and session lifecycle methods are awaitable.
+Python timestamps and receipt-age bounds use integer nanoseconds and milliseconds, respectively.
+Configuration representations redact credentials and URLs, and no plaintext credential getters
+are exposed.
+
+The standalone no-trading observation session uses the same native state machine as the execution
+client:
+
+```python
+session = BinancePapiAccountSession(config, instruments)
+await session.start()
+evidence = json.loads(session.evidence_json())
+assert evidence["trading_authorized"] is False
+await session.stop()
+```
+
+The session owns one listen key and WebSocket URL at a time. It renews the key separately from
+WebSocket Ping/Pong, rotates the transport before 24 hours, and replaces an expired key without an
+old owner deleting the replacement. Unknown critical events, scope violations, conflicts,
+overflow, and bounded recovery failure move the session to `restricted`.
 
 The client exposes:
 
@@ -258,16 +295,17 @@ validate every field it uses. PM purchasing power is not projected into a native
 
 The read-only client refreshes all nine sources within one generation and operation budget,
 retaining successful sources independently after a partial failure. The SDK decodes into raw
-JSON before the exact observation parser runs, preserving missing/null distinctions. There is
-no account-state publication or native free/locked balance mapping. A successful diagnostic wallet
-contains a formal reported margin `AccountState` with `base_currency=None`, empty complete balances
-and margins, and exact native `total_only_balances`. The
+JSON before the exact observation parser runs, preserving missing/null distinctions. There is no
+native free/locked balance mapping. A successful wallet projection contains a formal reported
+margin `AccountState` with `base_currency=None`, empty complete balances and margins, and exact
+native `total_only_balances`; the private session publishes it only after bounded recovery
+converges. The
 [synthetic account fixtures](test_data/observations/README.md) and
 [official report examples](test_data/reports/README.md) do not establish live compatibility.
 
 The remaining acceptance work must establish authenticated endpoint behavior for the complete
 scope checks and supported wallet projection, plus unobserved historical/algo lifecycle evidence.
-PM admission and successful LiveNode bootstrap remain later trading work.
+PM admission and trading authorization remain later work.
 The rationale and acceptance obligations are recorded in [RESEARCH.md](RESEARCH.md).
 
 ## Local tests

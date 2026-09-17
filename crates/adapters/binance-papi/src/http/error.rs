@@ -27,6 +27,8 @@ pub(crate) enum PapiHttpError {
     },
     #[error("PAPI clock or receive-window failure (-1021)")]
     Clock,
+    #[error("PAPI listen key is expired or invalid (-1125)")]
+    ListenKeyExpired,
     #[error(
         "PAPI throttling closed the shared request gate (status {status:?}, code {code:?}); automatic recovery is unavailable"
     )]
@@ -91,6 +93,8 @@ impl PapiHttpError {
             Self::Authentication { status, code }
         } else if code == Some(-1021) {
             Self::Clock
+        } else if code == Some(-1125) {
+            Self::ListenKeyExpired
         } else if status.is_some() || code.is_some() {
             Self::Rejected { status, code }
         } else {

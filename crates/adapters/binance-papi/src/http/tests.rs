@@ -66,6 +66,78 @@ fn assert_signature(request: &testing::RecordedRequest) {
     assert_eq!(request.params["recvWindow"], "5000");
 }
 
+#[tokio::test]
+async fn listen_key_lifecycle_uses_api_key_without_signed_parameters() {
+    let server = MockServer::new(testing::quiet).await;
+    let client = http(&server, testing::gate());
+    let cancel = CancellationToken::new();
+    let key = client.create_listen_key(&budget(), &cancel).await.unwrap();
+    assert_eq!(key.expose_secret(), "offline-listen-key");
+    client
+        .keepalive_listen_key(&budget(), &cancel)
+        .await
+        .unwrap();
+    client.close_listen_key(&budget(), &cancel).await.unwrap();
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[1].method, "PUT");
+    assert_eq!(requests[2].method, "DELETE");
+
+    for request in requests {
+        assert_eq!(request.path, "/papi/v1/listenKey");
+        assert_eq!(request.api_key.as_deref(), Some(API_KEY));
+        assert!(request.params.is_empty());
+        assert!(!request.query.contains("signature"));
+        assert!(!request.query.contains("timestamp"));
+    }
+}
+
+#[tokio::test]
+async fn listen_key_expiry_is_typed_and_not_retried() {
+    let server = MockServer::new(|request| {
+        if request.path == "/papi/v1/listenKey" && request.method == "PUT" {
+            Reply::raw(
+                400,
+                r#"{"code":-1125,"msg":"This listenKey does not exist."}"#,
+            )
+        } else {
+            testing::quiet(request)
+        }
+    })
+    .await;
+    let client = http(&server, testing::gate());
+    let e = client
+        .keepalive_listen_key(&budget(), &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(e, PapiHttpError::ListenKeyExpired);
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn listen_key_throttle_closes_the_shared_gate() {
+    let server =
+        MockServer::new(|_| Reply::raw(429, r#"{"code":-1003,"msg":"Too many requests"}"#)).await;
+    let gate = testing::gate();
+    let first = http(&server, Arc::clone(&gate));
+    let second = http(&server, gate);
+    let e = first
+        .create_listen_key(&budget(), &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(e, PapiHttpError::Throttled { .. }));
+    assert_eq!(
+        second
+            .keepalive_listen_key(&budget(), &CancellationToken::new())
+            .await
+            .unwrap_err(),
+        PapiHttpError::GateClosed
+    );
+    assert_eq!(server.requests().len(), 1);
+}
+
 #[rstest]
 #[case(ObservationSource::UmOpenOrders, 40)]
 #[case(ObservationSource::UmOpenAlgos, 40)]
@@ -361,7 +433,11 @@ async fn shared_weight_blocks_the_next_client_within_its_total_deadline() {
 #[tokio::test]
 async fn cancel_during_quota_wait_sends_no_request() {
     let server = MockServer::new(|_| Reply::raw(200, "{}")).await;
-    let gate = testing::gate();
+    let gate = Arc::new(RequestGate::new(
+        Quota::with_period(Duration::from_secs(10))
+            .unwrap()
+            .allow_burst(std::num::NonZeroU32::new(40).unwrap()),
+    ));
     gate.limiter.await_keys_ready(Some(&[(); 40])).await;
     let client = http(&server, gate);
     let request = request();

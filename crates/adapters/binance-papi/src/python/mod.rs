@@ -18,6 +18,7 @@
 mod config;
 mod factories;
 mod read_only;
+mod session;
 
 #[cfg(test)]
 mod tests;
@@ -26,6 +27,7 @@ use nautilus_common::factories::{ClientConfig, ExecutionClientFactory};
 use nautilus_core::python::to_pyruntime_err;
 use nautilus_system::get_global_pyo3_registry;
 use pyo3::prelude::*;
+use session::BinancePapiAccountSession;
 
 use crate::{
     config::BinancePapiExecutionClientConfig,
@@ -68,6 +70,7 @@ pub fn binance_papi(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BinancePapiReadOnlyConfig>()?;
     m.add_class::<BinancePapiReadOnlyClient>()?;
     m.add_class::<BinancePapiReadOnlySnapshot>()?;
+    m.add_class::<BinancePapiAccountSession>()?;
 
     let registry = get_global_pyo3_registry();
     registry

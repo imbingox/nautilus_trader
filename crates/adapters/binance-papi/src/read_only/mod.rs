@@ -31,6 +31,7 @@ use std::{fmt::Debug, sync::Arc, time::Duration};
 use nautilus_common::live::dst::time::Instant;
 use nautilus_core::{UnixNanos, time::AtomicTime};
 use nautilus_model::{
+    events::AccountState,
     identifiers::{AccountId, ClientOrderId, InstrumentId, VenueOrderId},
     instruments::InstrumentAny,
     reports::{ExecutionMassStatus, OrderStatusReport, PositionStatusReport},
@@ -78,6 +79,53 @@ pub struct BinancePapiReadOnlySnapshot {
     pub issues: Vec<String>,
     /// Receipt and quota metadata for each successful response.
     pub responses: Vec<BinancePapiResponseMetadata>,
+}
+
+/// Availability of one typed account projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BinancePapiProjectionStatus {
+    /// All required sources are recent and semantically supported.
+    Available,
+    /// A source contains a product or economic state outside the supported scope.
+    Unsupported,
+    /// Sources disagree in generation or collection timing.
+    Inconsistent,
+    /// A required source has not been observed.
+    Missing,
+    /// A required source is older than the caller's freshness bound.
+    Stale,
+    /// A required source failed its most recent refresh.
+    Failed,
+    /// A replacement observation is still being collected.
+    Refreshing,
+    /// The owning client has been canceled.
+    Canceled,
+}
+
+/// Typed account projection retained for the private-session recovery path.
+#[derive(Clone, Debug, Serialize)]
+pub struct BinancePapiAccountProjection {
+    /// Portfolio Margin account identity.
+    pub account_id: AccountId,
+    /// Reported totals-only wallet state, when every required source is valid.
+    pub account_state: Option<AccountState>,
+    /// Wallet projection status.
+    pub wallet_status: BinancePapiProjectionStatus,
+    /// Wallet limitations or validation failures.
+    pub wallet_issues: Vec<String>,
+    /// Independent Portfolio Margin risk-source status.
+    pub risk_status: BinancePapiProjectionStatus,
+    /// Risk-source limitations or validation failures.
+    pub risk_issues: Vec<String>,
+    /// Endpoint and successful observation generation for every contributing source.
+    pub source_generations: Vec<(&'static str, u64)>,
+    /// Wallet collection span in monotonic nanoseconds.
+    pub wallet_collection_span_ns: Option<u128>,
+    /// Risk collection span in monotonic nanoseconds.
+    pub risk_collection_span_ns: Option<u128>,
+    /// Always false in issue #4; trade admission belongs to the subsequent phase.
+    pub trading_authorized: bool,
 }
 
 impl BinancePapiReadOnlySnapshot {
@@ -382,6 +430,101 @@ impl BinancePapiReadOnlyClient {
         Ok(serde_json::to_string(&snapshot)?)
     }
 
+    /// Projects retained observations without serializing and reparsing adapter-owned JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero freshness or collection-span bounds.
+    pub fn account_projection(
+        &self,
+        max_receipt_age: Duration,
+        max_collection_span: Duration,
+    ) -> anyhow::Result<BinancePapiAccountProjection> {
+        anyhow::ensure!(
+            !max_receipt_age.is_zero(),
+            "PAPI maximum receipt age must be positive"
+        );
+        anyhow::ensure!(
+            !max_collection_span.is_zero(),
+            "PAPI maximum collection span must be positive"
+        );
+        let observations = self.inner.observations.lock();
+        let context = projection::AccountProjectionContext {
+            account_id: self.inner.account_id,
+            scope: &self.inner.scope,
+            ts_init: self.inner.clock.get_time_ns(),
+            now: Instant::now(),
+            max_receipt_age,
+            max_collection_span,
+            canceled: self.inner.cancel.is_cancelled(),
+        };
+        let snapshot = projection::project_account_snapshot(&observations.sources, &context);
+        let mut source_generations = Vec::new();
+
+        for source in snapshot
+            .wallet
+            .sources
+            .iter()
+            .chain(&snapshot.portfolio_margin_risk.sources)
+        {
+            if let Some(generation) = source.generation()
+                && !source_generations
+                    .iter()
+                    .any(|(endpoint, _)| *endpoint == source.endpoint())
+            {
+                source_generations.push((source.endpoint(), generation));
+            }
+        }
+
+        Ok(BinancePapiAccountProjection {
+            account_id: snapshot.account_id,
+            account_state: snapshot.wallet.value,
+            wallet_status: snapshot.wallet.status.into(),
+            wallet_issues: snapshot.wallet.issues,
+            risk_status: snapshot.portfolio_margin_risk.status.into(),
+            risk_issues: snapshot.portfolio_margin_risk.issues,
+            source_generations,
+            wallet_collection_span_ns: snapshot.wallet.collection_span_ns,
+            risk_collection_span_ns: snapshot.portfolio_margin_risk.collection_span_ns,
+            trading_authorized: snapshot.trading_authorized,
+        })
+    }
+
+    pub(crate) async fn create_listen_key(&self) -> anyhow::Result<crate::http::ListenKey> {
+        let budget = self.budget()?;
+        Ok(self
+            .inner
+            .http
+            .create_listen_key(&budget, &self.inner.cancel)
+            .await?)
+    }
+
+    pub(crate) async fn keepalive_listen_key(&self) -> anyhow::Result<()> {
+        let budget = self.budget()?;
+        Ok(self
+            .inner
+            .http
+            .keepalive_listen_key(&budget, &self.inner.cancel)
+            .await?)
+    }
+
+    pub(crate) async fn close_listen_key(&self) -> anyhow::Result<()> {
+        let budget = self.budget()?;
+        Ok(self
+            .inner
+            .http
+            .close_listen_key(&budget, &self.inner.cancel)
+            .await?)
+    }
+
+    pub(crate) fn now(&self) -> UnixNanos {
+        self.inner.clock.get_time_ns()
+    }
+
+    pub(crate) fn instrument_ids(&self) -> Vec<InstrumentId> {
+        self.inner.scope.instrument_ids()
+    }
+
     /// Queries the account's order quota as unprojected JSON evidence.
     ///
     /// This GET consumes one IP-weight unit; it does not reserve or consume an order slot.
@@ -490,6 +633,21 @@ impl BinancePapiReadOnlyClient {
             budget: self.budget()?,
             responses: Vec::new(),
         })
+    }
+}
+
+impl From<projection::ProjectionStatus> for BinancePapiProjectionStatus {
+    fn from(value: projection::ProjectionStatus) -> Self {
+        match value {
+            projection::ProjectionStatus::Available => Self::Available,
+            projection::ProjectionStatus::Unsupported => Self::Unsupported,
+            projection::ProjectionStatus::Inconsistent => Self::Inconsistent,
+            projection::ProjectionStatus::Missing => Self::Missing,
+            projection::ProjectionStatus::Stale => Self::Stale,
+            projection::ProjectionStatus::Failed => Self::Failed,
+            projection::ProjectionStatus::Refreshing => Self::Refreshing,
+            projection::ProjectionStatus::Canceled => Self::Canceled,
+        }
     }
 }
 

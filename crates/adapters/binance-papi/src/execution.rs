@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Scoped read-only execution reports, with live account startup gated on economic mapping.
+//! Scoped private observation and execution reports with all trading commands disabled.
 
 use std::cell::RefCell;
 
@@ -21,42 +21,75 @@ use async_trait::async_trait;
 use nautilus_common::{
     clients::ExecutionClient,
     enums::LogLevel,
-    messages::execution::{
-        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-        GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
-        ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+    live::runner::get_exec_event_sender,
+    messages::{
+        ExecutionReport,
+        execution::{
+            BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder,
+            GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
+            GeneratePositionStatusReports, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
+            SubmitOrderList,
+        },
     },
 };
 use nautilus_core::{Params, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_execution::client::core::ExecutionClientCore;
+use nautilus_live::ExecutionEventEmitter;
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{LiquiditySide, OmsType},
+    enums::{AccountType, LiquiditySide, OmsType},
     identifiers::{AccountId, ClientId, InstrumentId, Venue},
     instruments::InstrumentAny,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Money, Price, Quantity},
 };
 
-use crate::{config::BinancePapiExecutionClientConfig, read_only::BinancePapiReadOnlyClient};
+use crate::{
+    config::BinancePapiExecutionClientConfig,
+    read_only::BinancePapiReadOnlyClient,
+    websocket::{BinancePapiAccountSession, PapiRecoveryBundle},
+};
 
 #[derive(Debug)]
 pub(crate) struct BinancePapiExecutionClient {
     core: ExecutionClientCore,
     config: BinancePapiExecutionClientConfig,
+    emitter: ExecutionEventEmitter,
     reader: RefCell<Option<BinancePapiReadOnlyClient>>,
+    session: Option<BinancePapiAccountSession>,
 }
 
 impl BinancePapiExecutionClient {
-    pub(crate) const fn new(
-        core: ExecutionClientCore,
-        config: BinancePapiExecutionClientConfig,
-    ) -> Self {
+    pub(crate) fn new(core: ExecutionClientCore, config: BinancePapiExecutionClientConfig) -> Self {
+        let emitter = ExecutionEventEmitter::new(
+            get_atomic_clock_realtime(),
+            core.trader_id,
+            core.account_id,
+            AccountType::Margin,
+            None,
+        );
+
         Self {
             core,
             config,
+            emitter,
             reader: RefCell::new(None),
+            session: None,
         }
+    }
+
+    fn instruments(&self) -> anyhow::Result<Vec<InstrumentAny>> {
+        let cache = self.core.cache();
+        self.config
+            .instrument_ids
+            .iter()
+            .map(|id| {
+                cache
+                    .instrument(id)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("PAPI instrument is not preloaded: {id}"))
+            })
+            .collect()
     }
 
     fn reader(&self) -> anyhow::Result<BinancePapiReadOnlyClient> {
@@ -74,31 +107,18 @@ impl BinancePapiExecutionClient {
             .read_only
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("PAPI read-only configuration is required"))?;
-        let instruments = {
-            let cache = self.core.cache();
-            self.config
-                .instrument_ids
-                .iter()
-                .map(|id| {
-                    cache
-                        .instrument(id)
-                        .cloned()
-                        .ok_or_else(|| anyhow::anyhow!("PAPI instrument is not preloaded: {id}"))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?
-        };
+        let instruments = self.instruments()?;
         let client = BinancePapiReadOnlyClient::new(config, instruments)?;
         *self.reader.borrow_mut() = Some(client.clone());
         Ok(client)
     }
 
-    fn cancel_reads(&mut self) {
-        if let Some(client) = self.reader.get_mut().take() {
-            client.cancel();
+    fn begin_shutdown(&self) {
+        if let Some(session) = self.session.as_ref() {
+            session.begin_shutdown();
         }
 
         self.core.set_disconnected();
-        self.core.set_stopped();
     }
 
     fn log_report_receipt(count: usize, report_type: &str, level: LogLevel) {
@@ -118,7 +138,11 @@ impl BinancePapiExecutionClient {
 #[async_trait(?Send)]
 impl ExecutionClient for BinancePapiExecutionClient {
     fn is_connected(&self) -> bool {
-        false
+        self.core.is_connected()
+            && self
+                .session
+                .as_ref()
+                .is_some_and(BinancePapiAccountSession::is_connected)
     }
 
     fn client_id(&self) -> ClientId {
@@ -138,7 +162,7 @@ impl ExecutionClient for BinancePapiExecutionClient {
     }
 
     fn get_account(&self) -> Option<AccountAny> {
-        None
+        self.core.cache().account_owned(&self.core.account_id)
     }
 
     fn provides_bulk_position_coverage(&self, instrument_id: InstrumentId) -> bool {
@@ -147,13 +171,14 @@ impl ExecutionClient for BinancePapiExecutionClient {
 
     fn generate_account_state(
         &self,
-        _balances: Vec<AccountBalance>,
-        _margins: Vec<MarginBalance>,
-        _reported: bool,
-        _ts_event: UnixNanos,
-        _info: Option<Params>,
+        balances: Vec<AccountBalance>,
+        margins: Vec<MarginBalance>,
+        reported: bool,
+        ts_event: UnixNanos,
+        info: Option<Params>,
     ) -> anyhow::Result<()> {
-        anyhow::bail!("Binance PAPI account state is not implemented")
+        self.emitter
+            .try_emit_account_state(balances, margins, reported, ts_event, info)
     }
 
     fn calculate_commission(
@@ -167,73 +192,127 @@ impl ExecutionClient for BinancePapiExecutionClient {
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
+        if self.core.is_started() {
+            return Ok(());
+        }
+
         self.config.validate()?;
         anyhow::ensure!(
             self.config.read_only.is_some(),
             "PAPI read-only configuration is required"
         );
+        self.emitter.set_sender(get_exec_event_sender());
         self.core.set_started();
         Ok(())
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
-        self.cancel_reads();
-        anyhow::bail!(
-            "PAPI LiveNode startup requires an accepted economic account balance mapping; \
-             use BinancePapiReadOnlyClient for account evidence and reports"
-        )
+        anyhow::ensure!(
+            self.core.is_started(),
+            "PAPI execution client is not started"
+        );
+
+        if self.core.is_connected() {
+            return Ok(());
+        }
+
+        if let Some(mut session) = self.session.take() {
+            session.stop().await?;
+        }
+
+        let config = self
+            .config
+            .read_only
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PAPI read-only configuration is required"))?;
+        let instruments = self.instruments()?;
+        let emitter = self.emitter.clone();
+        let client_id = self.core.client_id;
+        let handler = std::sync::Arc::new(move |mut bundle: PapiRecoveryBundle| {
+            emitter.try_send_account_state(bundle.account_state)?;
+
+            if !bundle.initial {
+                bundle.snapshot.mass_status.client_id = client_id;
+                emitter.try_send_execution_report(ExecutionReport::MassStatus(Box::new(
+                    bundle.snapshot.mass_status,
+                )))?;
+            }
+            Ok(())
+        });
+        let mut session = BinancePapiAccountSession::with_handler(config, instruments, handler)?;
+        session.start().await?;
+        *self.reader.borrow_mut() = Some(session.read_only_client());
+        self.session = Some(session);
+        self.core.set_connected();
+        Ok(())
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
-        self.cancel_reads();
+        self.core.set_stopped();
+        self.begin_shutdown();
         Ok(())
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        self.cancel_reads();
+        self.core.set_disconnected();
+
+        if let Some(mut session) = self.session.take() {
+            session.stop().await?;
+        }
         Ok(())
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
-        self.cancel_reads();
+        self.begin_shutdown();
         Ok(())
     }
 
     fn dispose(&mut self) -> anyhow::Result<()> {
-        self.cancel_reads();
+        self.core.set_stopped();
+        self.begin_shutdown();
         Ok(())
     }
 
     fn submit_order(&self, _cmd: SubmitOrder) -> anyhow::Result<()> {
-        anyhow::bail!("Binance PAPI submit_order is not implemented")
+        anyhow::bail!("Binance PAPI private-state observation does not authorize order submission")
     }
 
     fn submit_order_list(&self, _cmd: SubmitOrderList) -> anyhow::Result<()> {
-        anyhow::bail!("Binance PAPI submit_order_list is not implemented")
+        anyhow::bail!("Binance PAPI private-state observation does not authorize order submission")
     }
 
     fn modify_order(&self, _cmd: ModifyOrder) -> anyhow::Result<()> {
-        anyhow::bail!("Binance PAPI modify_order is not implemented")
+        anyhow::bail!(
+            "Binance PAPI private-state observation does not authorize order modification"
+        )
     }
 
     fn batch_modify_orders(&self, _cmd: BatchModifyOrders) -> anyhow::Result<()> {
-        anyhow::bail!("Binance PAPI batch_modify_orders is not implemented")
+        anyhow::bail!(
+            "Binance PAPI private-state observation does not authorize order modification"
+        )
     }
 
     fn cancel_order(&self, _cmd: CancelOrder) -> anyhow::Result<()> {
-        anyhow::bail!("Binance PAPI cancel_order is not implemented")
+        anyhow::bail!(
+            "Binance PAPI private-state observation does not authorize order cancellation"
+        )
     }
 
     fn cancel_all_orders(&self, _cmd: CancelAllOrders) -> anyhow::Result<()> {
-        anyhow::bail!("Binance PAPI cancel_all_orders is not implemented")
+        anyhow::bail!(
+            "Binance PAPI private-state observation does not authorize order cancellation"
+        )
     }
 
     fn batch_cancel_orders(&self, _cmd: BatchCancelOrders) -> anyhow::Result<()> {
-        anyhow::bail!("Binance PAPI batch_cancel_orders is not implemented")
+        anyhow::bail!(
+            "Binance PAPI private-state observation does not authorize order cancellation"
+        )
     }
 
     fn query_account(&self, _cmd: QueryAccount) -> anyhow::Result<()> {
-        anyhow::bail!("Binance PAPI query_account is not implemented")
+        anyhow::bail!("Binance PAPI account state is published by the private recovery session")
     }
 
     fn query_order(&self, _cmd: QueryOrder) -> anyhow::Result<()> {
@@ -313,24 +392,31 @@ impl ExecutionClient for BinancePapiExecutionClient {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{cell::RefCell, rc::Rc, time::Duration};
 
+    use futures_util::StreamExt;
     use nautilus_common::{
         cache::Cache,
         clock::TestClock,
         factories::ExecutionClientFactory,
-        messages::execution::{
-            GenerateFillReportsBuilder, GenerateOrderStatusReportBuilder,
-            GenerateOrderStatusReportsBuilder, GeneratePositionStatusReportsBuilder,
+        live::runner::replace_exec_event_sender,
+        messages::{
+            ExecutionEvent,
+            execution::{
+                GenerateFillReportsBuilder, GenerateOrderStatusReportBuilder,
+                GenerateOrderStatusReportsBuilder, GeneratePositionStatusReportsBuilder,
+            },
         },
     };
-    use nautilus_core::UUID4;
+    use nautilus_core::{UUID4, string::secret::SecretString};
+    use nautilus_live::runner::AsyncRunner;
     use nautilus_model::{
         enums::{OrderSide, TimeInForce},
         events::OrderInitialized,
         identifiers::{ClientOrderId, OrderListId, StrategyId, TraderId},
         orders::{MarketOrder, OrderAny, OrderList},
     };
+    use nautilus_portfolio::portfolio::Portfolio;
     use rstest::rstest;
     use serde_json::json;
 
@@ -342,6 +428,7 @@ mod tests {
     };
 
     fn client() -> Box<dyn ExecutionClient> {
+        install_exec_event_sender();
         BinancePapiExecutionClientFactory::new()
             .create(
                 TraderId::from("TRADER-001"),
@@ -358,6 +445,7 @@ mod tests {
         symbols: &[&str],
         preload: bool,
     ) -> Box<dyn ExecutionClient> {
+        install_exec_event_sender();
         let cache = Rc::new(RefCell::new(Cache::default()));
 
         if preload {
@@ -386,6 +474,79 @@ mod tests {
                 Rc::new(RefCell::new(TestClock::new())),
             )
             .unwrap()
+    }
+
+    fn install_exec_event_sender() {
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        replace_exec_event_sender(sender);
+    }
+
+    #[tokio::test]
+    async fn private_recovery_publishes_account_through_runner_and_portfolio() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let websocket_url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let websocket_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+            while let Some(message) = websocket.next().await {
+                if matches!(
+                    message,
+                    Ok(tokio_tungstenite::tungstenite::Message::Close(_))
+                ) {
+                    break;
+                }
+            }
+        });
+        let server = MockServer::new(|request| {
+            if request.path == "/papi/v1/balance" {
+                Reply::json(&testing::supported_balances())
+            } else {
+                testing::quiet(request)
+            }
+        })
+        .await;
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_instrument(testing::instrument("BTCUSDT"))
+            .unwrap();
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let _portfolio = Portfolio::new(clock.clone(), cache.clone(), None);
+        let mut read_only = testing::config(&server.url);
+        read_only.websocket_url = SecretString::from(websocket_url);
+        let config = BinancePapiExecutionClientConfig {
+            read_only: Some(read_only),
+            instrument_ids: vec![InstrumentId::from("BTCUSDT-PERP.BINANCE")],
+            ..Default::default()
+        };
+        let mut client = BinancePapiExecutionClientFactory::new()
+            .create(
+                TraderId::from("TRADER-001"),
+                "PAPI-OBSERVE-001",
+                &config,
+                cache.clone().into(),
+                clock,
+            )
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        replace_exec_event_sender(sender);
+
+        client.start().unwrap();
+        client.connect().await.unwrap();
+        assert!(client.is_connected());
+        let event = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        AsyncRunner::handle_exec_event(event);
+        let account = client.get_account().unwrap();
+        assert!(!account.total_only_balances().is_empty());
+
+        client.stop().unwrap();
+        client.disconnect().await.unwrap();
+        assert!(!client.is_connected());
+        websocket_task.abort();
     }
 
     #[tokio::test]
@@ -560,7 +721,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string()
-                .contains("economic account")
+                .contains("not preloaded")
         );
         assert!(!client.is_connected());
         assert!(client.get_account().is_none());
@@ -590,7 +751,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string()
-                .contains("economic account balance mapping")
+                .contains("not started")
         );
         assert!(!client.is_connected());
         assert!(client.get_account().is_none());

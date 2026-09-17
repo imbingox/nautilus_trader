@@ -287,6 +287,12 @@ pub(crate) fn triggered_algo() -> (Value, Value) {
 /// Default quiet-account GET responses; each test overrides only its relevant scenario.
 pub(crate) fn quiet(request: &RecordedRequest) -> Reply {
     match request.path.as_str() {
+        "/papi/v1/listenKey" if request.method == "POST" => {
+            Reply::json(&json!({"listenKey": "offline-listen-key"}))
+        }
+        "/papi/v1/listenKey" if matches!(request.method.as_str(), "PUT" | "DELETE") => {
+            Reply::raw(200, "")
+        }
         "/papi/v1/um/positionSide/dual" => Reply::json(&json!({"dualSidePosition": false})),
         "/papi/v1/um/positionRisk" => Reply::json(&json!([position(&request.params["symbol"])])),
         "/papi/v1/um/openOrders"

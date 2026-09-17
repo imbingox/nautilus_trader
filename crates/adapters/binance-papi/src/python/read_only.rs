@@ -41,8 +41,13 @@ impl BinancePapiReadOnlyConfig {
     /// Credentials and the base URL are redacted from Rust and Python representations.
     #[new]
     #[pyo3(signature = (
-        account_id, api_key, api_secret, base_url=None, request_timeout_ms=None,
-        operation_timeout_ms=None, max_requests=None, max_rows=None,
+        account_id, api_key, api_secret, base_url=None, websocket_url=None,
+        proxy_url=None,
+        request_timeout_ms=None, operation_timeout_ms=None, max_requests=None, max_rows=None,
+        listen_key_keepalive_interval_ms=None, transport_rotation_interval_ms=None,
+        recovery_lookback_ms=None, refresh_debounce_ms=None,
+        max_websocket_message_bytes=None, max_websocket_buffer_messages=None,
+        max_websocket_buffer_bytes=None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -50,15 +55,32 @@ impl BinancePapiReadOnlyConfig {
         api_key: String,
         api_secret: String,
         base_url: Option<String>,
+        websocket_url: Option<String>,
+        proxy_url: Option<String>,
         request_timeout_ms: Option<u64>,
         operation_timeout_ms: Option<u64>,
         max_requests: Option<u32>,
         max_rows: Option<usize>,
+        listen_key_keepalive_interval_ms: Option<u64>,
+        transport_rotation_interval_ms: Option<u64>,
+        recovery_lookback_ms: Option<u64>,
+        refresh_debounce_ms: Option<u64>,
+        max_websocket_message_bytes: Option<usize>,
+        max_websocket_buffer_messages: Option<usize>,
+        max_websocket_buffer_bytes: Option<usize>,
     ) -> PyResult<Self> {
         let mut config = Self::new(account_id, api_key.into(), api_secret.into());
 
         if let Some(base_url) = base_url {
             config.base_url = SecretString::from(base_url);
+        }
+
+        if let Some(websocket_url) = websocket_url {
+            config.websocket_url = SecretString::from(websocket_url);
+        }
+
+        if let Some(proxy_url) = proxy_url {
+            config.proxy_url = Some(SecretString::from(proxy_url));
         }
 
         if let Some(timeout) = request_timeout_ms {
@@ -75,6 +97,34 @@ impl BinancePapiReadOnlyConfig {
 
         if let Some(max_rows) = max_rows {
             config.max_rows = max_rows;
+        }
+
+        if let Some(interval) = listen_key_keepalive_interval_ms {
+            config.listen_key_keepalive_interval = Duration::from_millis(interval);
+        }
+
+        if let Some(interval) = transport_rotation_interval_ms {
+            config.transport_rotation_interval = Duration::from_millis(interval);
+        }
+
+        if let Some(lookback) = recovery_lookback_ms {
+            config.recovery_lookback = Duration::from_millis(lookback);
+        }
+
+        if let Some(debounce) = refresh_debounce_ms {
+            config.refresh_debounce = Duration::from_millis(debounce);
+        }
+
+        if let Some(maximum) = max_websocket_message_bytes {
+            config.max_websocket_message_bytes = maximum;
+        }
+
+        if let Some(maximum) = max_websocket_buffer_messages {
+            config.max_websocket_buffer_messages = maximum;
+        }
+
+        if let Some(maximum) = max_websocket_buffer_bytes {
+            config.max_websocket_buffer_bytes = maximum;
         }
 
         config.validate().map_err(to_pyvalue_err)?;
@@ -104,6 +154,46 @@ impl BinancePapiReadOnlyConfig {
     #[getter]
     fn max_rows(&self) -> usize {
         self.max_rows
+    }
+
+    #[getter]
+    fn listen_key_keepalive_interval_ms(&self) -> u128 {
+        self.listen_key_keepalive_interval.as_millis()
+    }
+
+    #[getter]
+    fn transport_rotation_interval_ms(&self) -> u128 {
+        self.transport_rotation_interval.as_millis()
+    }
+
+    #[getter]
+    fn recovery_lookback_ms(&self) -> u128 {
+        self.recovery_lookback.as_millis()
+    }
+
+    #[getter]
+    fn refresh_debounce_ms(&self) -> u128 {
+        self.refresh_debounce.as_millis()
+    }
+
+    #[getter]
+    fn max_websocket_message_bytes(&self) -> usize {
+        self.max_websocket_message_bytes
+    }
+
+    #[getter]
+    fn max_websocket_buffer_messages(&self) -> usize {
+        self.max_websocket_buffer_messages
+    }
+
+    #[getter]
+    fn max_websocket_buffer_bytes(&self) -> usize {
+        self.max_websocket_buffer_bytes
+    }
+
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
     }
 
     fn __repr__(&self) -> String {

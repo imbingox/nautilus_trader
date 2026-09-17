@@ -44,6 +44,7 @@ checks reject orders without explicit reduce-only or validated full-position-exi
 carrying totals-only balances. An opposite-side order is not proof of reduction in every OMS mode.
 Quantity increases and price or trigger-price changes are also rejected. This representation does
 not authorize trading or delegate capital checks to an adapter.
+
 ## Example
 
 Account state is normally consumed through the `Portfolio` rather than a dedicated handler:

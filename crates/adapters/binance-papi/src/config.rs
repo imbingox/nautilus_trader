@@ -27,8 +27,8 @@ use crate::read_only::BinancePapiReadOnlyConfig;
 ///
 /// The default supports node construction without credentials. Supplying `read_only`
 /// and explicit instrument IDs enables the Rust execution client's report methods.
-/// Instruments must already exist in the node cache. LiveNode startup remains unavailable
-/// until the native account balance mapping is accepted; trading is unsupported.
+/// Instruments must already exist in the node cache. The client starts a private observation and
+/// recovery session; trading remains unsupported.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(

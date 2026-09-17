@@ -35,12 +35,13 @@ use std::{
 use binance_sdk::{
     common::config::{ConfigurationRestApi, HttpAgent},
     derivatives_trading_portfolio_margin::{
-        DerivativesTradingPortfolioMarginRestApi, rest_api::RestApi,
+        DerivativesTradingPortfolioMarginRestApi,
+        rest_api::{RestApi, StartUserDataStreamResponse},
     },
 };
 use http::Method;
 use nautilus_common::live::dst::time::{Instant, timeout};
-use nautilus_core::{UnixNanos, time::AtomicTime};
+use nautilus_core::{UnixNanos, string::secret::SecretString, time::AtomicTime};
 use nautilus_network::{
     ratelimiter::{RateLimiter, clock::MonotonicClock, quota::Quota},
     retry::{RetryConfig, RetryManager},
@@ -54,6 +55,7 @@ use crate::{observations::MAX_RESPONSE_BYTES, read_only::BinancePapiReadOnlyConf
 
 const WEIGHT_PER_MINUTE: NonZeroU32 = NonZeroU32::new(3_000).expect("Positive request quota");
 const WEIGHT_BURST: NonZeroU32 = NonZeroU32::new(40).expect("Positive request burst");
+const LISTEN_KEY_ENDPOINT: &str = "/papi/v1/listenKey";
 
 // A strong process-wide owner preserves quota and a throttle latch across client reconstruction
 static SHARED_GATE: LazyLock<Arc<RequestGate>> = LazyLock::new(|| {
@@ -100,6 +102,12 @@ impl PapiHttpClient {
     ) -> anyhow::Result<Self> {
         config.validate()?;
         let timeout_ms = u64::try_from(config.request_timeout.as_millis())?;
+        let proxy = config
+            .proxy_url
+            .as_ref()
+            .map(|url| reqwest::Proxy::all(url.expose_secret()))
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("Could not configure PAPI proxy"))?;
 
         // The adapter's timeout expires first, keeping timeout classification out of SDK strings
         let sdk_config = ConfigurationRestApi::builder()
@@ -109,11 +117,16 @@ impl PapiHttpClient {
             .timeout(timeout_ms + 1_000)
             .retries(0)
             .compression(false)
-            .agent(HttpAgent(Arc::new(|builder| {
-                builder
+            .agent(HttpAgent(Arc::new(move |builder| {
+                let builder = builder
                     .use_rustls_tls()
                     .no_proxy()
-                    .redirect(reqwest::redirect::Policy::none())
+                    .redirect(reqwest::redirect::Policy::none());
+
+                match &proxy {
+                    Some(proxy) => builder.proxy(proxy.clone()),
+                    None => builder,
+                }
             })))
             .build()
             .map_err(|_| anyhow::anyhow!("Could not configure PAPI SDK"))?;
@@ -165,6 +178,174 @@ impl PapiHttpClient {
             .await?;
         budget.check()?;
         Ok(response)
+    }
+
+    pub(crate) async fn create_listen_key(
+        &self,
+        budget: &RequestBudget,
+        cancel: &CancellationToken,
+    ) -> Result<ListenKey, PapiHttpError> {
+        let response = self
+            .session_request(ListenKeyOperation::Create, budget, cancel)
+            .await?;
+        let key = response.listen_key.ok_or(PapiHttpError::Decode)?;
+        ListenKey::new(key)
+    }
+
+    pub(crate) async fn keepalive_listen_key(
+        &self,
+        budget: &RequestBudget,
+        cancel: &CancellationToken,
+    ) -> Result<(), PapiHttpError> {
+        self.session_request(ListenKeyOperation::Keepalive, budget, cancel)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn close_listen_key(
+        &self,
+        budget: &RequestBudget,
+        cancel: &CancellationToken,
+    ) -> Result<(), PapiHttpError> {
+        self.session_request(ListenKeyOperation::Close, budget, cancel)
+            .await
+            .map(|_| ())
+    }
+
+    async fn session_request(
+        &self,
+        operation: ListenKeyOperation,
+        budget: &RequestBudget,
+        cancel: &CancellationToken,
+    ) -> Result<SessionResponse, PapiHttpError> {
+        let requested_at = Instant::now();
+        let retry = RetryManager::new(RetryConfig {
+            max_retries: operation.max_retries(),
+            initial_delay_ms: 200,
+            max_delay_ms: 1_000,
+            backoff_factor: 2.0,
+            jitter_ms: 0,
+            operation_timeout_ms: None,
+            immediate_first: false,
+            max_elapsed_ms: Some(budget.remaining_ms()?),
+        });
+
+        let response = retry
+            .invocation(
+                operation.name(),
+                || self.attempt_session(operation, budget, requested_at),
+                PapiHttpError::retryable,
+                |e| PapiHttpError::from_retry(&e),
+            )
+            .cancellation_token(cancel)
+            .execute()
+            .await?;
+        budget.check()?;
+        Ok(response)
+    }
+
+    async fn attempt_session(
+        &self,
+        operation: ListenKeyOperation,
+        budget: &RequestBudget,
+        requested_at: Instant,
+    ) -> Result<SessionResponse, PapiHttpError> {
+        budget.charge_request()?;
+
+        let permit = tokio::select! {
+            biased;
+            () = self.gate.closed.cancelled() => return Err(PapiHttpError::GateClosed),
+            permit = self.gate.concurrent.acquire() => {
+                permit.map_err(|_| PapiHttpError::GateClosed)?
+            }
+        };
+        let keys = [()];
+
+        tokio::select! {
+            biased;
+            () = self.gate.closed.cancelled() => return Err(PapiHttpError::GateClosed),
+            () = self.gate.limiter.await_keys_ready(Some(&keys)) => {}
+        }
+
+        budget.check()?;
+        let result = tokio::select! {
+            biased;
+            () = self.gate.closed.cancelled() => Err(PapiHttpError::GateClosed),
+            result = timeout(
+                self.request_timeout,
+                self.send_session(operation, requested_at),
+            ) => result.unwrap_or(Err(PapiHttpError::Timeout)),
+        };
+
+        if matches!(result, Err(PapiHttpError::Throttled { .. })) {
+            self.gate.closed.cancel();
+        }
+
+        drop(permit);
+        result
+    }
+
+    async fn send_session(
+        &self,
+        operation: ListenKeyOperation,
+        requested_at: Instant,
+    ) -> Result<SessionResponse, PapiHttpError> {
+        let ts_requested = self.clock.get_time_ns();
+        let response = self
+            .sdk
+            .send_request::<StartUserDataStreamResponse>(
+                LISTEN_KEY_ENDPOINT,
+                operation.method(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .await
+            .map_err(|e| PapiHttpError::from_sdk(&e))?;
+
+        if !(200..300).contains(&response.status) {
+            return Err(PapiHttpError::Rejected {
+                status: Some(response.status),
+                code: None,
+            });
+        }
+
+        let metadata = BinancePapiResponseMetadata {
+            endpoint: LISTEN_KEY_ENDPOINT,
+            symbol: None,
+            status: response.status,
+            ts_requested,
+            ts_received: self.clock.get_time_ns(),
+            used_weight_1m: response
+                .headers
+                .get("x-mbx-used-weight-1m")
+                .and_then(|v| v.parse().ok()),
+            order_count_1m: response
+                .headers
+                .get("x-mbx-order-count-1m")
+                .and_then(|v| v.parse().ok()),
+            retry_after_seconds: response
+                .headers
+                .get("retry-after")
+                .and_then(|v| v.parse().ok()),
+        };
+        let received_at = Instant::now();
+        let listen_key = if operation == ListenKeyOperation::Create {
+            response
+                .data()
+                .await
+                .map_err(|_| PapiHttpError::Decode)?
+                .listen_key
+        } else {
+            // Binance permits empty keepalive and close bodies. Do not force JSON decoding.
+            None
+        };
+
+        Ok(SessionResponse {
+            listen_key,
+            metadata,
+            requested_at,
+            received_at,
+        })
     }
 
     async fn attempt(
@@ -269,6 +450,72 @@ impl PapiHttpClient {
             received_at,
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListenKeyOperation {
+    Create,
+    Keepalive,
+    Close,
+}
+
+impl ListenKeyOperation {
+    const fn method(self) -> Method {
+        match self {
+            Self::Create => Method::POST,
+            Self::Keepalive => Method::PUT,
+            Self::Close => Method::DELETE,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Create => "PAPI listen key create",
+            Self::Keepalive => "PAPI listen key keepalive",
+            Self::Close => "PAPI listen key close",
+        }
+    }
+
+    const fn max_retries(self) -> u32 {
+        match self {
+            // POST returns the existing active key and PUT is idempotent by venue contract.
+            Self::Create | Self::Keepalive => 2,
+            // DELETE has account-global effect and must never race a replacement session.
+            Self::Close => 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ListenKey(SecretString);
+
+impl ListenKey {
+    fn new(value: String) -> Result<Self, PapiHttpError> {
+        if value.is_empty()
+            || value.len() > 1_024
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(PapiHttpError::Decode);
+        }
+
+        Ok(Self(value.into()))
+    }
+
+    pub(crate) fn expose_secret(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
+
+struct SessionResponse {
+    listen_key: Option<String>,
+    #[allow(dead_code, reason = "retained for typed session evidence")]
+    metadata: BinancePapiResponseMetadata,
+    #[allow(dead_code, reason = "retained for typed session evidence")]
+    requested_at: Instant,
+    #[allow(dead_code, reason = "retained for typed session evidence")]
+    received_at: Instant,
 }
 
 impl Debug for PapiHttpClient {

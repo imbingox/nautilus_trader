@@ -16,8 +16,8 @@
 Construct a node with Binance public USD-M data and the PAPI execution factory.
 
 Requires a wheel built with the ``papi`` feature. This example does not run the
-node or contact Binance. PAPI LiveNode startup awaits an accepted account balance mapping.
-Use read_only_acceptance.py to collect scoped account evidence and execution reports.
+node or contact Binance. Starting a PAPI execution client requires explicit credentials,
+preloaded instruments, and matching instrument IDs. It observes private state but rejects trades.
 
 """
 
@@ -57,4 +57,4 @@ def build_node() -> LiveNode:
 
 if __name__ == "__main__":
     node = build_node()
-    print(f"Constructed node for {node.trader_id}; PAPI account bootstrap remains unavailable")
+    print(f"Constructed node for {node.trader_id}; configure PAPI observation before startup")

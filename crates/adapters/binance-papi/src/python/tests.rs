@@ -38,10 +38,21 @@ fn test_python_read_only_constructors_registry_and_secret_boundaries() {
         let module = PyModule::new(py, "binance_papi").unwrap();
         super::binance_papi(py, &module).unwrap();
         let account_id = AccountId::from("BINANCE-PAPI-009");
+        let read_only_kwargs = PyDict::new(py);
+        read_only_kwargs.set_item("account_id", account_id).unwrap();
+        read_only_kwargs
+            .set_item("api_key", testing::API_KEY)
+            .unwrap();
+        read_only_kwargs
+            .set_item("api_secret", testing::API_SECRET)
+            .unwrap();
+        read_only_kwargs
+            .set_item("proxy_url", "http://proxy-user:proxy-secret@localhost:7897")
+            .unwrap();
         let read_only = module
             .getattr("BinancePapiReadOnlyConfig")
             .unwrap()
-            .call1((account_id, testing::API_KEY, testing::API_SECRET))
+            .call((), Some(&read_only_kwargs))
             .unwrap();
         let instruments = PyList::empty(py);
         instruments
@@ -49,6 +60,33 @@ fn test_python_read_only_constructors_registry_and_secret_boundaries() {
             .unwrap();
         let client_type = module.getattr("BinancePapiReadOnlyClient").unwrap();
         let client = client_type.call1((&read_only, &instruments)).unwrap();
+        let session = module
+            .getattr("BinancePapiAccountSession")
+            .unwrap()
+            .call1((&read_only, &instruments))
+            .unwrap();
+        let evidence: String = session
+            .call_method0("evidence_json")
+            .unwrap()
+            .extract()
+            .unwrap();
+        let evidence: Value = serde_json::from_str(&evidence).unwrap();
+        assert_eq!(evidence["state"], "stopped");
+        assert_eq!(evidence["trading_authorized"], false);
+        assert!(
+            !session
+                .getattr("is_connected")
+                .unwrap()
+                .extract::<bool>()
+                .unwrap()
+        );
+        assert!(
+            !session
+                .getattr("is_synchronized")
+                .unwrap()
+                .extract::<bool>()
+                .unwrap()
+        );
         let raw: String = client
             .call_method1("account_observations_json", (1_000,))
             .unwrap()
@@ -85,9 +123,18 @@ fn test_python_read_only_constructors_registry_and_secret_boundaries() {
         assert!(read_only.getattr("api_key").is_err());
         assert!(read_only.getattr("api_secret").is_err());
         assert!(read_only.getattr("base_url").is_err());
+        assert!(read_only.getattr("proxy_url").is_err());
+        assert!(
+            read_only
+                .getattr("has_proxy_url")
+                .unwrap()
+                .extract::<bool>()
+                .unwrap()
+        );
         let rendered = read_only.repr().unwrap().to_string();
         assert!(!rendered.contains(testing::API_KEY));
         assert!(!rendered.contains(testing::API_SECRET));
+        assert!(!rendered.contains("proxy-secret"));
 
         let kwargs = PyDict::new(py);
         kwargs.set_item("read_only", read_only).unwrap();

@@ -47,6 +47,10 @@ pub struct BinancePapiReadOnlyConfig {
     pub api_secret: SecretString,
     /// HTTPS origin, or an HTTP loopback origin for a local REST server.
     pub base_url: SecretString,
+    /// Secure PAPI WebSocket path, or a loopback path for local tests.
+    pub websocket_url: SecretString,
+    /// Optional HTTP or HTTPS forward proxy shared by REST and WebSocket transports.
+    pub proxy_url: Option<SecretString>,
     /// Timeout for each network attempt, excluding quota acquisition.
     pub request_timeout: Duration,
     /// Total budget for one operation, including all pages, quota waits and retries.
@@ -55,6 +59,20 @@ pub struct BinancePapiReadOnlyConfig {
     pub max_requests: u32,
     /// Maximum rows decoded per operation, including overlapping history pages.
     pub max_rows: usize,
+    /// REST listen-key keepalive cadence, strictly below the venue's 60-minute expiry.
+    pub listen_key_keepalive_interval: Duration,
+    /// Planned transport replacement cadence, strictly below the venue's 24-hour limit.
+    pub transport_rotation_interval: Duration,
+    /// Historical overlap collected on initial synchronization and after a transport gap.
+    pub recovery_lookback: Duration,
+    /// Debounce applied while coalescing account-stream dirty sources.
+    pub refresh_debounce: Duration,
+    /// Maximum accepted WebSocket text or binary frame size.
+    pub max_websocket_message_bytes: usize,
+    /// Maximum number of account-stream events waiting for the serial recovery driver.
+    pub max_websocket_buffer_messages: usize,
+    /// Maximum aggregate bytes waiting for the serial recovery driver.
+    pub max_websocket_buffer_bytes: usize,
 }
 
 impl BinancePapiReadOnlyConfig {
@@ -66,10 +84,19 @@ impl BinancePapiReadOnlyConfig {
             api_key,
             api_secret,
             base_url: SecretString::from("https://papi.binance.com"),
+            websocket_url: SecretString::from("wss://fstream.binance.com/pm/ws"),
+            proxy_url: None,
             request_timeout: Duration::from_secs(5),
             operation_timeout: Duration::from_secs(60),
             max_requests: 256,
             max_rows: 100_000,
+            listen_key_keepalive_interval: Duration::from_mins(30),
+            transport_rotation_interval: Duration::from_hours(23),
+            recovery_lookback: Duration::from_hours(24),
+            refresh_debounce: Duration::from_millis(250),
+            max_websocket_message_bytes: 1_048_576,
+            max_websocket_buffer_messages: 4_096,
+            max_websocket_buffer_bytes: 8_388_608,
         }
     }
 
@@ -107,6 +134,38 @@ impl BinancePapiReadOnlyConfig {
                 && url.path() == "/",
             "PAPI base URL must be an HTTPS origin or HTTP loopback origin"
         );
+
+        let websocket_url = Url::parse(self.websocket_url.expose_secret())
+            .map_err(|_| anyhow::anyhow!("Invalid PAPI WebSocket URL"))?;
+        let websocket_loopback = match websocket_url.host() {
+            Some(Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(Host::Ipv6(ip)) => ip.is_loopback(),
+            _ => false,
+        };
+        anyhow::ensure!(
+            (websocket_url.scheme() == "wss"
+                || (websocket_url.scheme() == "ws" && websocket_loopback))
+                && websocket_url.host().is_some()
+                && websocket_url.username().is_empty()
+                && websocket_url.password().is_none()
+                && websocket_url.query().is_none()
+                && websocket_url.fragment().is_none(),
+            "PAPI WebSocket URL must be a WSS path or WS loopback path"
+        );
+
+        if let Some(proxy_url) = &self.proxy_url {
+            let proxy_url = Url::parse(proxy_url.expose_secret())
+                .map_err(|_| anyhow::anyhow!("Invalid PAPI proxy URL"))?;
+            anyhow::ensure!(
+                matches!(proxy_url.scheme(), "http" | "https")
+                    && proxy_url.host().is_some()
+                    && proxy_url.query().is_none()
+                    && proxy_url.fragment().is_none()
+                    && proxy_url.path() == "/",
+                "PAPI proxy URL must be an HTTP or HTTPS origin"
+            );
+        }
+
         anyhow::ensure!(
             (Duration::from_millis(1)..=Duration::from_secs(60)).contains(&self.request_timeout)
                 && self.operation_timeout >= self.request_timeout
@@ -117,6 +176,70 @@ impl BinancePapiReadOnlyConfig {
             (1..=10_000).contains(&self.max_requests) && (1..=1_000_000).contains(&self.max_rows),
             "Invalid PAPI request or row budget"
         );
+        anyhow::ensure!(
+            (Duration::from_secs(1)..Duration::from_hours(1))
+                .contains(&self.listen_key_keepalive_interval)
+                && (Duration::from_secs(1)..Duration::from_hours(24))
+                    .contains(&self.transport_rotation_interval)
+                && (Duration::from_secs(1)..=Duration::from_hours(24 * 7))
+                    .contains(&self.recovery_lookback)
+                && (Duration::from_millis(1)..=Duration::from_secs(30))
+                    .contains(&self.refresh_debounce),
+            "Invalid PAPI session timing"
+        );
+        anyhow::ensure!(
+            (1_024..=8_388_608).contains(&self.max_websocket_message_bytes)
+                && (1..=100_000).contains(&self.max_websocket_buffer_messages)
+                && self.max_websocket_buffer_bytes >= self.max_websocket_message_bytes
+                && self.max_websocket_buffer_bytes <= 134_217_728,
+            "Invalid PAPI WebSocket resource bounds"
+        );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_core::string::secret::SecretString;
+    use nautilus_model::identifiers::AccountId;
+    use rstest::rstest;
+
+    use super::BinancePapiReadOnlyConfig;
+
+    fn config() -> BinancePapiReadOnlyConfig {
+        BinancePapiReadOnlyConfig::new(
+            AccountId::from("BINANCE-PAPI-001"),
+            SecretString::from("OfflinePapiKey"),
+            SecretString::from("OfflinePapiSecret"),
+        )
+    }
+
+    #[rstest]
+    fn proxy_credentials_are_redacted() {
+        let mut config = config();
+        config.proxy_url = Some(SecretString::from(
+            "http://proxy-user:proxy-secret@localhost:7897",
+        ));
+
+        config.validate().unwrap();
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("proxy-user"));
+        assert!(!rendered.contains("proxy-secret"));
+    }
+
+    #[rstest]
+    #[case("socks5://127.0.0.1:1080")]
+    #[case("http://127.0.0.1:7897/path")]
+    #[case("http://127.0.0.1:7897?token=secret")]
+    fn unsupported_proxy_url_is_rejected(#[case] proxy_url: &str) {
+        let mut config = config();
+        config.proxy_url = Some(SecretString::from(proxy_url));
+
+        let e = config.validate().unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "PAPI proxy URL must be an HTTP or HTTPS origin"
+        );
+        assert!(!e.to_string().contains(proxy_url));
     }
 }

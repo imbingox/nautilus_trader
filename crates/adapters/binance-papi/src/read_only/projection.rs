@@ -37,24 +37,24 @@ use crate::{
 
 #[derive(Serialize)]
 pub(super) struct AccountSnapshot<'a> {
-    account_id: AccountId,
-    trading_authorized: bool,
-    wallet: ProjectionResult<'a, AccountState>,
-    portfolio_margin_risk: ProjectionResult<'a, PortfolioMarginRiskView<'a>>,
+    pub(super) account_id: AccountId,
+    pub(super) trading_authorized: bool,
+    pub(super) wallet: ProjectionResult<'a, AccountState>,
+    pub(super) portfolio_margin_risk: ProjectionResult<'a, PortfolioMarginRiskView<'a>>,
 }
 
 #[derive(Serialize)]
-struct ProjectionResult<'a, T> {
-    status: ProjectionStatus,
-    value: Option<T>,
-    issues: Vec<String>,
-    sources: Vec<ProjectionSource<'a>>,
-    collection_span_ns: Option<u128>,
+pub(super) struct ProjectionResult<'a, T> {
+    pub(super) status: ProjectionStatus,
+    pub(super) value: Option<T>,
+    pub(super) issues: Vec<String>,
+    pub(super) sources: Vec<ProjectionSource<'a>>,
+    pub(super) collection_span_ns: Option<u128>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum ProjectionStatus {
+pub(super) enum ProjectionStatus {
     Available,
     Unsupported,
     Inconsistent,
@@ -66,7 +66,7 @@ enum ProjectionStatus {
 }
 
 #[derive(Serialize)]
-struct ProjectionSource<'a> {
+pub(super) struct ProjectionSource<'a> {
     endpoint: &'static str,
     source_scope: &'a ObservationSource,
     receipt_status: ReceiptStatus,
@@ -76,8 +76,18 @@ struct ProjectionSource<'a> {
     response_metadata: Option<&'a BinancePapiResponseMetadata>,
 }
 
+impl ProjectionSource<'_> {
+    pub(super) fn generation(&self) -> Option<u64> {
+        self.generation
+    }
+
+    pub(super) fn endpoint(&self) -> &'static str {
+        self.endpoint
+    }
+}
+
 #[derive(Serialize)]
-struct PortfolioMarginRiskView<'a> {
+pub(super) struct PortfolioMarginRiskView<'a> {
     endpoint: &'static str,
     generation: u64,
     account_summary: &'a AccountSummary,
