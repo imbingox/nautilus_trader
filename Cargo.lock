@@ -5847,6 +5847,7 @@ dependencies = [
  "aws-lc-rs",
  "axum",
  "binance-sdk",
+ "blake3",
  "futures-util",
  "http",
  "log",
@@ -5869,6 +5870,7 @@ dependencies = [
  "rust_decimal_macros",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tokio-tungstenite 0.30.0",
@@ -7077,6 +7079,7 @@ name = "nautilus-risk"
 version = "0.65.0"
 dependencies = [
  "ahash",
+ "anyhow",
  "bon",
  "indexmap 2.14.2",
  "log",

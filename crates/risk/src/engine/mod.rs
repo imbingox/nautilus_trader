@@ -15,11 +15,13 @@
 
 //! Risk management engine implementation.
 
+pub mod capital;
 pub mod config;
 
 use std::{cell::RefCell, fmt::Debug, rc::Rc};
 
 use ahash::AHashMap;
+use capital::{NativeCapitalCheck, NativeCapitalCheckDecision, NativeCapitalCheckRequest};
 use config::RiskEngineConfig;
 use indexmap::IndexMap;
 use nautilus_common::{
@@ -52,7 +54,7 @@ use nautilus_model::{
         OrderDenied, OrderDeniedReason, OrderEventAny, OrderModifyRejected, OrderPriceField,
         PositionEvent,
     },
-    identifiers::{AccountId, InstrumentId},
+    identifiers::{AccountId, ClientId, InstrumentId},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
     types::{Currency, Money, Price, Quantity, quantity::QuantityRaw},
@@ -107,6 +109,7 @@ pub struct RiskEngine {
     max_notional_per_order: AHashMap<InstrumentId, Decimal>,
     trading_state: TradingState,
     config: RiskEngineConfig,
+    native_capital_checks: AHashMap<(AccountId, ClientId), NativeCapitalCheck>,
     command_count: u64,
     event_count: u64,
 }
@@ -139,6 +142,7 @@ impl RiskEngine {
             max_notional_per_order: config.max_notional_per_order.clone(),
             trading_state: TradingState::Active,
             config,
+            native_capital_checks: AHashMap::new(),
             command_count: 0,
             event_count: 0,
         }
@@ -217,6 +221,46 @@ impl RiskEngine {
             }),
             Some(10),
         );
+    }
+
+    /// Registers an account- and route-bound replacement for unavailable native capital checks.
+    ///
+    /// The delegate is considered only for a totals-only margin account when every cached order
+    /// route resolves to `client_id` and any explicit command route agrees. All other risk checks
+    /// remain in the normal engine path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a delegate is already registered for the same account and client.
+    pub fn register_native_capital_check(
+        &mut self,
+        account_id: AccountId,
+        client_id: ClientId,
+        check: NativeCapitalCheck,
+    ) -> anyhow::Result<()> {
+        if self
+            .native_capital_checks
+            .contains_key(&(account_id, client_id))
+        {
+            anyhow::bail!(
+                "Native capital check already registered for account {account_id} and client {client_id}"
+            );
+        }
+        self.native_capital_checks
+            .insert((account_id, client_id), check);
+        Ok(())
+    }
+
+    /// Removes an account- and route-bound native capital check.
+    #[must_use]
+    pub fn deregister_native_capital_check(
+        &mut self,
+        account_id: AccountId,
+        client_id: ClientId,
+    ) -> bool {
+        self.native_capital_checks
+            .remove(&(account_id, client_id))
+            .is_some()
     }
 
     fn create_submit_throttler(
@@ -661,7 +705,7 @@ impl RiskEngine {
             return; // Denied
         }
 
-        if !self.check_orders_risk(&instrument, &[order], full_position_exit) {
+        if !self.check_orders_risk(&instrument, &[order], command.client_id, full_position_exit) {
             return; // Denied
         }
 
@@ -844,7 +888,7 @@ impl RiskEngine {
             return; // Denied
         };
 
-        if !self.check_orders_risk(&representative, &orders, false) {
+        if !self.check_orders_risk(&representative, &orders, command.client_id, false) {
             self.deny_order_list(
                 &orders,
                 &OrderDeniedReason::OrderListDenied {
@@ -1176,6 +1220,7 @@ impl RiskEngine {
         &self,
         instrument: &InstrumentAny,
         orders: &[OrderAny],
+        client_id: Option<ClientId>,
         full_position_exit: bool,
     ) -> bool {
         let mut orders_by_account: AHashMap<Option<AccountId>, Vec<&OrderAny>> = AHashMap::new();
@@ -1191,6 +1236,7 @@ impl RiskEngine {
                 instrument,
                 account_orders,
                 *account_id,
+                client_id,
                 full_position_exit,
             ) {
                 return false;
@@ -1209,6 +1255,7 @@ impl RiskEngine {
         instrument: &InstrumentAny,
         orders: &[&OrderAny],
         account_id: Option<AccountId>,
+        client_id: Option<ClientId>,
         full_position_exit: bool,
     ) -> bool {
         let mut max_notional: Option<Money> = None;
@@ -1303,7 +1350,54 @@ impl RiskEngine {
         }
 
         // Quantity-based netting cannot prove reduction for every execution/OMS route
+        let mut native_capital_delegated = false;
+
         if let AccountAny::Margin(margin) = &account
+            && !margin.total_only_balances.is_empty()
+            && orders
+                .iter()
+                .any(|order| !order.is_reduce_only() && !full_position_exit)
+        {
+            let routed_client_id = self.native_capital_client_id(orders, client_id);
+            let decision = routed_client_id
+                .and_then(|client_id| {
+                    self.native_capital_checks
+                        .get(&(margin.id, client_id))
+                        .map(|check| {
+                            check(&NativeCapitalCheckRequest {
+                                account_id: margin.id,
+                                client_id,
+                                instrument,
+                                orders,
+                                full_position_exit,
+                            })
+                        })
+                })
+                .unwrap_or_else(|| {
+                    NativeCapitalCheckDecision::Denied(
+                        OrderDeniedReason::NativeCapitalCheckUnavailable {
+                            account_id: margin.id,
+                        }
+                        .to_string(),
+                    )
+                });
+
+            match decision {
+                NativeCapitalCheckDecision::Approved => native_capital_delegated = true,
+                NativeCapitalCheckDecision::Denied(reason) => {
+                    let reason = if reason.is_empty() {
+                        OrderDeniedReason::NativeCapitalCheckUnavailable {
+                            account_id: margin.id,
+                        }
+                        .to_string()
+                    } else {
+                        reason
+                    };
+                    self.deny_order(orders[0], &reason);
+                    return false;
+                }
+            }
+        } else if let AccountAny::Margin(margin) = &account
             && !margin.total_only_balances.is_empty()
         {
             for order in orders {
@@ -1709,6 +1803,10 @@ impl RiskEngine {
                 return false; // Denied
             }
 
+            if is_margin && native_capital_delegated {
+                continue;
+            }
+
             if is_margin {
                 // Margin account: check initial margin requirement
                 let margin_req = match &mut account {
@@ -2036,6 +2134,27 @@ impl RiskEngine {
 
         // Finally
         true // Passed
+    }
+
+    fn native_capital_client_id(
+        &self,
+        orders: &[&OrderAny],
+        command_client_id: Option<ClientId>,
+    ) -> Option<ClientId> {
+        let cache = self.cache.borrow();
+        let cached_client_id = cache
+            .client_id(&orders.first()?.client_order_id())
+            .copied()?;
+
+        if command_client_id.is_some_and(|client_id| client_id != cached_client_id)
+            || orders.iter().any(|order| {
+                cache.client_id(&order.client_order_id()).copied() != Some(cached_client_id)
+            })
+        {
+            None
+        } else {
+            Some(cached_client_id)
+        }
     }
 
     fn market_order_price(

@@ -16,6 +16,9 @@
 Test the PAPI boundary in the shared Python extension.
 """
 
+from decimal import Decimal
+from pathlib import Path
+
 import pytest
 
 from nautilus_trader import _libnautilus
@@ -28,6 +31,8 @@ from nautilus_trader.adapters.binance import BinanceProductType
 from nautilus_trader.common import Environment
 from nautilus_trader.live import LiveNode
 from nautilus_trader.model import AccountId
+from nautilus_trader.model import Currency
+from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import TraderId
 
 
@@ -57,7 +62,65 @@ def test_default_account_issuer_matches_instrument_venue() -> None:
     """
     config = papi.BinancePapiExecutionClientConfig()
     assert config.account_id == AccountId("BINANCE-PAPI-001")
+    assert config.trading is None
     assert str(config.account_id).split("-", 1)[0] == str(papi.BINANCE_PAPI_VENUE)
+
+
+def test_trading_config_preserves_exact_finite_limits(tmp_path: Path) -> None:
+    """
+    Require explicit Decimal limits, report scope, credentials, and recovery bounds.
+    """
+    account_id = AccountId("BINANCE-PAPI-002")
+    instrument_id = InstrumentId.from_str("BTCUSDT-PERP.BINANCE")
+    instrument_limits = papi.BinancePapiInstrumentTradingConfig(
+        instrument_id=instrument_id,
+        max_order_quantity=Decimal("1.25"),
+        max_order_notional=Decimal("5000.00"),
+        max_position_quantity=Decimal("2.50"),
+        max_instrument_exposure=Decimal("10000.00"),
+    )
+    trading = papi.BinancePapiTradingConfig(
+        command_journal_path=tmp_path / "papi-commands.journal",
+        risk_currency=Currency.from_str("USDT"),
+        instrument_limits=[instrument_limits],
+        max_account_exposure=Decimal("15000.00"),
+        max_in_flight_operations=4,
+        max_risk_age_ms=2_000,
+        max_risk_collection_span_ms=1_000,
+        max_recovery_requests=32,
+        max_recovery_rounds=3,
+        recovery_recheck_interval_ms=250,
+        market_order_price_buffer_bps=100,
+        fee_buffer_bps=10,
+    )
+    read_only = papi.BinancePapiReadOnlyConfig(
+        account_id=account_id,
+        api_key="OfflinePapiKey",
+        api_secret="OfflinePapiSecret",
+    )
+    config = papi.BinancePapiExecutionClientConfig(
+        account_id=account_id,
+        read_only=read_only,
+        instrument_ids=[instrument_id],
+        trading=trading,
+    )
+
+    assert config.trading.max_account_exposure == Decimal("15000.00")
+    assert config.trading.instrument_limits[0].max_order_quantity == Decimal("1.25")
+
+
+def test_trading_config_rejects_nonpositive_limits() -> None:
+    """
+    Reject a trading limit that would disable a required hard ceiling.
+    """
+    with pytest.raises(ValueError, match="greater than zero"):
+        papi.BinancePapiInstrumentTradingConfig(
+            instrument_id=InstrumentId.from_str("BTCUSDT-PERP.BINANCE"),
+            max_order_quantity=Decimal(0),
+            max_order_notional=Decimal(5000),
+            max_position_quantity=Decimal("2.5"),
+            max_instrument_exposure=Decimal(10000),
+        )
 
 
 def test_builder_accepts_public_data_and_papi_execution() -> None:

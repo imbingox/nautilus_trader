@@ -22,9 +22,13 @@
 //!
 //! The [`websocket`] session receives before collecting its REST baseline, owns listen-key renewal,
 //! and publishes typed recovery evidence. Factory-created execution clients can connect in this
-//! observation mode and publish account and reconciliation state after synchronization. Order
-//! submission, modification, and cancellation remain unavailable. Public market data and
-//! instruments use the existing `nautilus-binance` adapter.
+//! observation mode and publish account and reconciliation state after synchronization. Ordinary
+//! UM submission, targeted cancellation, bounded batch cancellation, and cancel-all orchestration
+//! are connected through a durable account-bound coordinator and typed write transport.
+//! Modification and linked-order submission remain unsupported. Trading is explicit and
+//! default-off; increase-risk admission remains fail-closed until current authenticated PM risk
+//! evidence is available. An optional trading configuration defines finite admission limits.
+//! Public market data and instruments use the existing `nautilus-binance` adapter.
 //!
 //! # Feature Flags
 //!
@@ -50,6 +54,11 @@ mod execution;
 mod http;
 mod observations;
 mod reports;
+#[allow(
+    dead_code,
+    reason = "durable trading paths remain disconnected until verified PAPI risk evidence is available"
+)]
+mod trading;
 
 #[cfg(test)]
 mod testing;

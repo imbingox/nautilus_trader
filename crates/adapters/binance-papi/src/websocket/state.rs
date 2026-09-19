@@ -17,6 +17,20 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::messages::{AlgoFact, DirtySource, OrderFact, PapiWsEvent};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct OrderDelta {
+    pub(super) order: OrderFact,
+    pub(super) fill: Option<super::messages::FillFact>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FactApplication {
+    pub(super) changed: bool,
+    pub(super) version: u64,
+    pub(super) order: Option<OrderDelta>,
+    pub(super) requires_recovery: bool,
+}
+
 #[derive(Debug)]
 pub(super) struct FactState {
     max_facts: usize,
@@ -43,7 +57,7 @@ impl FactState {
         }
     }
 
-    pub(super) fn apply(&mut self, event: PapiWsEvent) -> Result<(), String> {
+    pub(super) fn apply(&mut self, event: PapiWsEvent) -> Result<FactApplication, String> {
         match event {
             PapiWsEvent::Order(order) => self.apply_order(order),
             PapiWsEvent::Algo(algo) => self.apply_algo(algo),
@@ -56,11 +70,11 @@ impl FactState {
                     self.dirty
                         .insert(DirtySourceKey::Instrument(position.symbol));
                 }
-                self.advance_version()
+                self.changed(true, None)
             }
             PapiWsEvent::Dirty(dirty) => {
                 self.dirty.insert(dirty.source.into());
-                self.advance_version()
+                self.changed(true, None)
             }
             PapiWsEvent::ListenKeyExpired { .. } => Err("PAPI listen key expired".to_string()),
         }
@@ -74,11 +88,17 @@ impl FactState {
         self.dirty.clear();
     }
 
+    pub(super) fn clear_order_sources(&mut self, symbol: &str) {
+        self.dirty.remove(&DirtySourceKey::Orders);
+        self.dirty
+            .remove(&DirtySourceKey::Instrument(symbol.to_owned()));
+    }
+
     pub(super) fn fact_count(&self) -> usize {
         self.orders.len() + self.algos.len() + self.trades.len()
     }
 
-    fn apply_order(&mut self, order: OrderFact) -> Result<(), String> {
+    fn apply_order(&mut self, mut order: OrderFact) -> Result<FactApplication, String> {
         let key = (order.symbol.clone(), order.order_id);
         let trade = order
             .fill
@@ -95,15 +115,23 @@ impl FactState {
             },
             None => false,
         };
-        let insert_order = match self.orders.get(&key) {
-            Some(existing) if existing.client_order_id != order.client_order_id => {
+        let existing_order = self.orders.get(&key).cloned();
+        let insert_order = match existing_order.as_ref() {
+            Some(existing) if !same_order_terms(existing, &order) => {
                 self.conflict_count = self.conflict_count.saturating_add(1);
-                return Err("Conflicting PAPI order identity".to_string());
+                return Err("Conflicting PAPI order identity or terms".to_string());
             }
             Some(existing) => {
-                existing != &order
-                    && order.accumulated_qty >= existing.accumulated_qty
-                    && (!existing.is_terminal() || order.is_terminal())
+                order.accepted_time_ms = order.accepted_time_ms.min(existing.accepted_time_ms);
+
+                if existing == &order {
+                    false
+                } else {
+                    order.transaction_time_ms >= existing.transaction_time_ms
+                        && order.event_time_ms >= existing.event_time_ms
+                        && order.accumulated_qty >= existing.accumulated_qty
+                        && !existing.is_terminal()
+                }
             }
             None => true,
         };
@@ -114,9 +142,12 @@ impl FactState {
             return Err("PAPI fact retention bound exhausted".to_string());
         }
 
-        if insert_trade && let Some((trade_key, fill)) = trade {
+        let inserted_fill = if insert_trade && let Some((trade_key, fill)) = trade {
             self.trades.insert(trade_key, fill.clone());
-        }
+            Some(fill.clone())
+        } else {
+            None
+        };
 
         if insert_order {
             self.orders.insert(key, order.clone());
@@ -124,21 +155,33 @@ impl FactState {
 
         if insert_trade || insert_order {
             self.dirty.insert(DirtySourceKey::Orders);
-            self.dirty.insert(DirtySourceKey::Instrument(order.symbol));
-            self.advance_version()
+            self.dirty
+                .insert(DirtySourceKey::Instrument(order.symbol.clone()));
+            let retained = if insert_order {
+                order
+            } else {
+                existing_order.expect("existing order is present when an order update is retained")
+            };
+            self.changed(
+                false,
+                Some(OrderDelta {
+                    order: retained,
+                    fill: inserted_fill,
+                }),
+            )
         } else {
             self.duplicate_count = self.duplicate_count.saturating_add(1);
-            Ok(())
+            Ok(self.unchanged())
         }
     }
 
-    fn apply_algo(&mut self, algo: AlgoFact) -> Result<(), String> {
+    fn apply_algo(&mut self, algo: AlgoFact) -> Result<FactApplication, String> {
         let key = (algo.symbol.clone(), algo.algo_id);
 
         match self.algos.get(&key) {
             Some(existing) if existing == &algo => {
                 self.duplicate_count = self.duplicate_count.saturating_add(1);
-                return Ok(());
+                return Ok(self.unchanged());
             }
             Some(existing)
                 if existing.client_algo_id != algo.client_algo_id
@@ -157,7 +200,7 @@ impl FactState {
         self.dirty
             .insert(DirtySourceKey::Instrument(algo.symbol.clone()));
         self.algos.insert(key, algo);
-        self.advance_version()
+        self.changed(true, None)
     }
 
     fn ensure_capacity(&self) -> Result<(), String> {
@@ -175,6 +218,43 @@ impl FactState {
             .ok_or_else(|| "PAPI fact version overflow".to_string())?;
         Ok(())
     }
+
+    fn changed(
+        &mut self,
+        requires_recovery: bool,
+        order: Option<OrderDelta>,
+    ) -> Result<FactApplication, String> {
+        self.advance_version()?;
+        Ok(FactApplication {
+            changed: true,
+            version: self.fact_version,
+            order,
+            requires_recovery,
+        })
+    }
+
+    fn unchanged(&self) -> FactApplication {
+        FactApplication {
+            changed: false,
+            version: self.fact_version,
+            order: None,
+            requires_recovery: false,
+        }
+    }
+}
+
+fn same_order_terms(left: &OrderFact, right: &OrderFact) -> bool {
+    left.symbol == right.symbol
+        && left.client_order_id == right.client_order_id
+        && left.order_id == right.order_id
+        && left.side == right.side
+        && left.order_type == right.order_type
+        && left.time_in_force == right.time_in_force
+        && left.post_only == right.post_only
+        && left.quantity == right.quantity
+        && left.price == right.price
+        && left.reduce_only == right.reduce_only
+        && left.position_side == right.position_side
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -202,6 +282,7 @@ impl From<DirtySource> for DirtySourceKey {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_model::enums::{OrderSide, OrderType, TimeInForce};
     use rstest::rstest;
     use rust_decimal_macros::dec;
 
@@ -213,9 +294,19 @@ mod tests {
             symbol: "BTCUSDT".to_string(),
             client_order_id: "client-1".to_string(),
             order_id: 42,
+            side: OrderSide::Buy,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::Gtc,
+            post_only: false,
+            quantity: dec!(0.010),
+            price: Some(dec!(42000)),
+            average_price: Some(dec!(42000)),
+            reduce_only: false,
+            position_side: "BOTH".to_string(),
             execution_type: "TRADE".to_string(),
             status: "PARTIALLY_FILLED".to_string(),
             accumulated_qty,
+            accepted_time_ms: 1_700_000_000_000,
             event_time_ms: 1_700_000_000_000,
             transaction_time_ms: 1_700_000_000_000,
             fill: Some(FillFact {
@@ -247,8 +338,15 @@ mod tests {
     fn duplicate_trade_is_idempotent_and_conflict_restricts() {
         let mut state = FactState::new(8);
         let fact = order(7, dec!(0.001));
-        state.apply(PapiWsEvent::Order(fact.clone())).unwrap();
-        state.apply(PapiWsEvent::Order(fact.clone())).unwrap();
+        let first = state.apply(PapiWsEvent::Order(fact.clone())).unwrap();
+        let duplicate = state.apply(PapiWsEvent::Order(fact.clone())).unwrap();
+        assert!(first.changed);
+        assert_eq!(first.version, 1);
+        assert!(first.order.is_some());
+        assert!(!first.requires_recovery);
+        assert!(!duplicate.changed);
+        assert_eq!(duplicate.version, first.version);
+        assert!(duplicate.order.is_none());
         assert!(state.duplicate_count > 0);
 
         let mut conflict = fact;

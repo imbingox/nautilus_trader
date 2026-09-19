@@ -19,6 +19,7 @@ use nautilus_common::{cache::Cache, clock::TestClock};
 use nautilus_model::{
     identifiers::{AccountId, ClientId, InstrumentId, TraderId},
     python::instruments::instrument_any_to_pyobject,
+    types::Currency,
 };
 use nautilus_system::get_global_pyo3_registry;
 use pyo3::{
@@ -26,6 +27,8 @@ use pyo3::{
     types::{PyDict, PyList, PyModule},
 };
 use rstest::rstest;
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use serde_json::Value;
 
 use crate::{config::BinancePapiExecutionClientConfig, testing};
@@ -136,14 +139,82 @@ fn test_python_read_only_constructors_registry_and_secret_boundaries() {
         assert!(!rendered.contains(testing::API_SECRET));
         assert!(!rendered.contains("proxy-secret"));
 
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let limit_kwargs = PyDict::new(py);
+        limit_kwargs
+            .set_item("instrument_id", instrument_id)
+            .unwrap();
+        limit_kwargs
+            .set_item("max_order_quantity", dec!(1.25))
+            .unwrap();
+        limit_kwargs
+            .set_item("max_order_notional", dec!(5000.00))
+            .unwrap();
+        limit_kwargs
+            .set_item("max_position_quantity", dec!(2.50))
+            .unwrap();
+        limit_kwargs
+            .set_item("max_instrument_exposure", dec!(10000.00))
+            .unwrap();
+        let limits = module
+            .getattr("BinancePapiInstrumentTradingConfig")
+            .unwrap()
+            .call((), Some(&limit_kwargs))
+            .unwrap();
+        let trading_kwargs = PyDict::new(py);
+        trading_kwargs
+            .set_item(
+                "command_journal_path",
+                std::env::temp_dir().join("papi-python-config-test.journal"),
+            )
+            .unwrap();
+        trading_kwargs
+            .set_item("risk_currency", Currency::USDT())
+            .unwrap();
+        trading_kwargs
+            .set_item("instrument_limits", PyList::new(py, [&limits]).unwrap())
+            .unwrap();
+        trading_kwargs
+            .set_item("max_account_exposure", dec!(15000.00))
+            .unwrap();
+        trading_kwargs
+            .set_item("max_in_flight_operations", 4)
+            .unwrap();
+        trading_kwargs.set_item("max_risk_age_ms", 2_000).unwrap();
+        trading_kwargs
+            .set_item("max_risk_collection_span_ms", 1_000)
+            .unwrap();
+        trading_kwargs
+            .set_item("max_recovery_requests", 32)
+            .unwrap();
+        trading_kwargs.set_item("max_recovery_rounds", 3).unwrap();
+        trading_kwargs
+            .set_item("recovery_recheck_interval_ms", 250)
+            .unwrap();
+        trading_kwargs
+            .set_item("market_order_price_buffer_bps", 100)
+            .unwrap();
+        trading_kwargs.set_item("fee_buffer_bps", 10).unwrap();
+        let trading = module
+            .getattr("BinancePapiTradingConfig")
+            .unwrap()
+            .call((), Some(&trading_kwargs))
+            .unwrap();
+        assert_eq!(
+            trading
+                .getattr("max_account_exposure")
+                .unwrap()
+                .extract::<Decimal>()
+                .unwrap(),
+            dec!(15000.00)
+        );
+
         let kwargs = PyDict::new(py);
         kwargs.set_item("read_only", read_only).unwrap();
         kwargs
-            .set_item(
-                "instrument_ids",
-                vec![InstrumentId::from("BTCUSDT-PERP.BINANCE")],
-            )
+            .set_item("instrument_ids", vec![instrument_id])
             .unwrap();
+        kwargs.set_item("trading", trading).unwrap();
         let config = module
             .getattr("BinancePapiExecutionClientConfig")
             .unwrap()

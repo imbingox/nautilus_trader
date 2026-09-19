@@ -30,13 +30,16 @@ use nautilus_model::{
 };
 use rust_decimal::Decimal;
 
-use super::log_not_implemented;
-use crate::messages::execution::{
-    BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-    GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
-    GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
-    GeneratePositionStatusReportsBuilder, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
-    SubmitOrderList,
+use super::{capital::NativeCapitalCheck, log_not_implemented};
+use crate::messages::{
+    ExecutionReport,
+    execution::{
+        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
+        GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
+        GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
+        GeneratePositionStatusReportsBuilder, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
+        SubmitOrderList,
+    },
 };
 
 /// Default maximum absolute position difference tolerated during reconciliation.
@@ -57,6 +60,20 @@ pub trait ExecutionClient {
     fn venue(&self) -> Venue;
     fn oms_type(&self) -> OmsType;
     fn get_account(&self) -> Option<AccountAny>;
+
+    /// Returns an account- and route-bound replacement for unavailable native capital checks.
+    ///
+    /// The risk engine invokes this only for a totals-only margin account after all ordinary
+    /// instrument, order, routing, and trading-state checks. Clients return `None` by default.
+    fn native_capital_check(&self) -> Option<NativeCapitalCheck> {
+        None
+    }
+
+    /// Observes a reconciliation report after the execution engine has applied it.
+    ///
+    /// Implementations must verify any adapter-specific application expectations against their
+    /// shared cache before advancing durable or trading-sensitive checkpoints.
+    fn on_execution_report_applied(&self, _report: &ExecutionReport) {}
 
     /// Returns the maximum absolute position difference tolerated during reconciliation.
     fn position_reconciliation_tolerance(&self) -> Decimal {

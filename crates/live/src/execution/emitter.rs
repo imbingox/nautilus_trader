@@ -183,6 +183,16 @@ impl ExecutionEventEmitter {
         self.send_order_event(event);
     }
 
+    /// Generates and emits an order submitted event, returning any channel error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sender is uninitialized or its receiver is closed.
+    pub fn try_emit_order_submitted(&self, order: &OrderAny) -> anyhow::Result<()> {
+        let event = self.factory.generate_order_submitted(order, self.ts_init());
+        self.try_send_order_event(event)
+    }
+
     /// Generates and emits an order rejected event.
     pub fn emit_order_rejected(
         &self,

@@ -28,9 +28,11 @@ from nautilus_trader._libnautilus.binance_papi import BINANCE_PAPI_VENUE
 from nautilus_trader._libnautilus.binance_papi import BinancePapiAccountSession
 from nautilus_trader._libnautilus.binance_papi import BinancePapiExecutionClientConfig
 from nautilus_trader._libnautilus.binance_papi import BinancePapiExecutionClientFactory
+from nautilus_trader._libnautilus.binance_papi import BinancePapiInstrumentTradingConfig
 from nautilus_trader._libnautilus.binance_papi import BinancePapiReadOnlyClient
 from nautilus_trader._libnautilus.binance_papi import BinancePapiReadOnlyConfig
 from nautilus_trader._libnautilus.binance_papi import BinancePapiReadOnlySnapshot
+from nautilus_trader._libnautilus.binance_papi import BinancePapiTradingConfig
 
 
 __all__ = [
@@ -40,7 +42,9 @@ __all__ = [
     "BinancePapiAccountSession",
     "BinancePapiExecutionClientConfig",
     "BinancePapiExecutionClientFactory",
+    "BinancePapiInstrumentTradingConfig",
     "BinancePapiReadOnlyClient",
     "BinancePapiReadOnlyConfig",
     "BinancePapiReadOnlySnapshot",
+    "BinancePapiTradingConfig",
 ]

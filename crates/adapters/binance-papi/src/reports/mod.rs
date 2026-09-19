@@ -276,7 +276,7 @@ impl ReportCollector<'_> {
     }
 
     pub(crate) async fn single_order(
-        mut self,
+        &mut self,
         instrument_id: InstrumentId,
         venue_id: Option<VenueOrderId>,
         client_id: Option<ClientOrderId>,

@@ -1025,6 +1025,23 @@ impl ExecutionEngine {
                 self.reconcile_execution_mass_status(mass_status);
             }
         }
+
+        let client_id = match report {
+            ExecutionReport::MassStatus(mass_status) => Some(mass_status.client_id),
+            ExecutionReport::Order(report) | ExecutionReport::OrderWithFills(report, _) => {
+                self.source_client_id_for_account(report.account_id, &report.instrument_id)
+            }
+            ExecutionReport::Fill(report) => {
+                self.source_client_id_for_account(report.account_id, &report.instrument_id)
+            }
+            ExecutionReport::Position(report) => {
+                self.source_client_id_for_account(report.account_id, &report.instrument_id)
+            }
+        };
+
+        if let Some(client) = client_id.and_then(|client_id| self.get_client(&client_id)) {
+            client.on_execution_report_applied(report);
+        }
     }
 
     /// Reconciles an order status report received at runtime.
@@ -4667,18 +4684,141 @@ enum SubmissionValidationResult {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_common::clock::TestClock;
+    use nautilus_common::{clients::ExecutionClient, clock::TestClock, messages::ExecutionReport};
+    use nautilus_core::Params;
     use nautilus_model::{
+        accounts::AccountAny,
         enums::{LiquiditySide, OrderSide, OrderType, PositionSide},
         events::order::spec::OrderFilledSpec,
-        identifiers::{AccountId, ClientOrderId, TradeId, VenueOrderId},
+        identifiers::{AccountId, ClientId, ClientOrderId, TradeId, Venue, VenueOrderId},
         instruments::{InstrumentAny, stubs::audusd_sim},
         orders::builder::OrderTestBuilder,
-        types::Price,
+        types::{AccountBalance, MarginBalance, Price},
     };
     use rstest::*;
 
     use super::*;
+
+    #[derive(Debug)]
+    struct ApplicationRecordingClient {
+        client_id: ClientId,
+        account_id: AccountId,
+        venue: Venue,
+        cache: Rc<RefCell<Cache>>,
+        application_states: Rc<RefCell<Vec<bool>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl ExecutionClient for ApplicationRecordingClient {
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn client_id(&self) -> ClientId {
+            self.client_id
+        }
+
+        fn account_id(&self) -> AccountId {
+            self.account_id
+        }
+
+        fn venue(&self) -> Venue {
+            self.venue
+        }
+
+        fn oms_type(&self) -> OmsType {
+            OmsType::Netting
+        }
+
+        fn get_account(&self) -> Option<AccountAny> {
+            None
+        }
+
+        fn on_execution_report_applied(&self, report: &ExecutionReport) {
+            let applied = match report {
+                ExecutionReport::Order(report) | ExecutionReport::OrderWithFills(report, _) => self
+                    .cache
+                    .borrow()
+                    .client_order_id(&report.venue_order_id)
+                    .is_some(),
+                _ => false,
+            };
+            self.application_states.borrow_mut().push(applied);
+        }
+
+        fn generate_account_state(
+            &self,
+            _balances: Vec<AccountBalance>,
+            _margins: Vec<MarginBalance>,
+            _reported: bool,
+            _ts_event: UnixNanos,
+            _info: Option<Params>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn start(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[rstest]
+    fn execution_report_application_callback_follows_cache_update_and_exact_route() {
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let instrument_id = instrument.id();
+        cache.borrow_mut().add_instrument(instrument).unwrap();
+        let mut engine = ExecutionEngine::new(clock, Rc::clone(&cache), None);
+        let matched_states = Rc::new(RefCell::new(Vec::new()));
+        let unmatched_states = Rc::new(RefCell::new(Vec::new()));
+        engine
+            .register_client(Box::new(ApplicationRecordingClient {
+                client_id: ClientId::from("MATCHED"),
+                account_id: AccountId::from("SIM-001"),
+                venue: instrument_id.venue,
+                cache: Rc::clone(&cache),
+                application_states: Rc::clone(&matched_states),
+            }))
+            .unwrap();
+        engine
+            .register_client(Box::new(ApplicationRecordingClient {
+                client_id: ClientId::from("UNMATCHED"),
+                account_id: AccountId::from("OTHER-001"),
+                venue: Venue::from("OTHER"),
+                cache: Rc::clone(&cache),
+                application_states: Rc::clone(&unmatched_states),
+            }))
+            .unwrap();
+        let venue_order_id = VenueOrderId::from("V-APPLICATION-1");
+        let report = OrderStatusReport::new(
+            AccountId::from("SIM-001"),
+            instrument_id,
+            None,
+            venue_order_id,
+            Some(OrderSide::Buy),
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Accepted,
+            Quantity::from(10_000),
+            Quantity::zero(0),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            None,
+        )
+        .with_price(Price::from("1.00000"));
+
+        engine.reconcile_execution_report(&ExecutionReport::Order(Box::new(report)));
+
+        assert_eq!(&*matched_states.borrow(), &[true]);
+        assert!(unmatched_states.borrow().is_empty());
+        assert!(cache.borrow().client_order_id(&venue_order_id).is_some());
+    }
 
     #[rstest]
     fn netting_positions_open_for_report_scopes_positions_by_account() {

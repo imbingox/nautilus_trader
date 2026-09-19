@@ -43,12 +43,19 @@ use tokio_util::sync::CancellationToken;
 pub use self::config::BinancePapiReadOnlyConfig;
 pub use crate::http::BinancePapiResponseMetadata;
 use crate::{
-    http::{PapiHttpClient, RequestBudget, RequestGate, error::PapiHttpError, query::PapiRequest},
+    http::{
+        PapiCommandResponse, PapiHttpClient, RequestBudget, RequestGate, error::PapiHttpError,
+        query::PapiRequest,
+    },
     observations::{
         AccountObservation, ObservationFailure, ObservationSlot, ObservationSource,
         ObservationTiming, ReceiptStatus,
     },
     reports::{InstrumentScope, ReportCollector, history::HistoryWindow},
+    trading::coordinator::{
+        CoordinatorDispatchError, PapiCommandCoordinator, dispatch_cancel_shared,
+        dispatch_submit_shared,
+    },
 };
 
 /// A bounded set of current and historical observations, with explicit incompleteness.
@@ -525,6 +532,106 @@ impl BinancePapiReadOnlyClient {
         self.inner.scope.instrument_ids()
     }
 
+    pub(crate) async fn dispatch_submit<F>(
+        &self,
+        coordinator: &Arc<Mutex<Option<PapiCommandCoordinator>>>,
+        operation_id: nautilus_core::UUID4,
+        after_barrier: F,
+    ) -> Result<PapiCommandResponse, CoordinatorDispatchError>
+    where
+        F: FnOnce() -> anyhow::Result<()> + Send,
+    {
+        let budget = self.budget().map_err(|e| {
+            CoordinatorDispatchError::Command(
+                crate::http::command::PapiCommandFailure::before_dispatch(
+                    e.downcast::<PapiHttpError>()
+                        .unwrap_or(PapiHttpError::Configuration),
+                ),
+            )
+        })?;
+        dispatch_submit_shared(
+            coordinator,
+            operation_id,
+            &self.inner.http,
+            &budget,
+            &self.inner.cancel,
+            after_barrier,
+        )
+        .await
+    }
+
+    pub(crate) async fn dispatch_cancel<F>(
+        &self,
+        coordinator: &Arc<Mutex<Option<PapiCommandCoordinator>>>,
+        operation_id: nautilus_core::UUID4,
+        after_barrier: F,
+    ) -> Result<PapiCommandResponse, CoordinatorDispatchError>
+    where
+        F: FnOnce() -> anyhow::Result<()> + Send,
+    {
+        let budget = self.budget().map_err(|e| {
+            CoordinatorDispatchError::Command(
+                crate::http::command::PapiCommandFailure::before_dispatch(
+                    e.downcast::<PapiHttpError>()
+                        .unwrap_or(PapiHttpError::Configuration),
+                ),
+            )
+        })?;
+        dispatch_cancel_shared(
+            coordinator,
+            operation_id,
+            &self.inner.http,
+            &budget,
+            &self.inner.cancel,
+            after_barrier,
+        )
+        .await
+    }
+
+    pub(crate) async fn dispatch_cancel_batch(
+        &self,
+        coordinator: &Arc<Mutex<Option<PapiCommandCoordinator>>>,
+        operation_ids: &[nautilus_core::UUID4],
+    ) -> Vec<(
+        nautilus_core::UUID4,
+        Result<PapiCommandResponse, CoordinatorDispatchError>,
+    )> {
+        let budget = match self.budget() {
+            Ok(budget) => budget,
+            Err(e) => {
+                let message = e.to_string();
+                log::warn!("Could not initialize PAPI cancel budget: {message}");
+                return operation_ids
+                    .iter()
+                    .map(|operation_id| {
+                        (
+                            *operation_id,
+                            Err(CoordinatorDispatchError::Command(
+                                crate::http::command::PapiCommandFailure::before_dispatch(
+                                    PapiHttpError::Configuration,
+                                ),
+                            )),
+                        )
+                    })
+                    .collect();
+            }
+        };
+        let mut outcomes = Vec::with_capacity(operation_ids.len());
+        for operation_id in operation_ids {
+            let result = dispatch_cancel_shared(
+                coordinator,
+                *operation_id,
+                &self.inner.http,
+                &budget,
+                &self.inner.cancel,
+                || Ok(()),
+            )
+            .await;
+            outcomes.push((*operation_id, result));
+        }
+        outcomes
+    }
+
     /// Queries the account's order quota as unprojected JSON evidence.
     ///
     /// This GET consumes one IP-weight unit; it does not reserve or consume an order slot.
@@ -610,9 +717,29 @@ impl BinancePapiReadOnlyClient {
         venue_order_id: Option<VenueOrderId>,
         client_order_id: Option<ClientOrderId>,
     ) -> anyhow::Result<OrderStatusReport> {
-        self.collector()?
+        let mut collector = self.collector()?;
+        collector
             .single_order(instrument_id, venue_order_id, client_order_id)
             .await
+    }
+
+    pub(crate) fn recovery_collector(
+        &self,
+        max_requests: u32,
+    ) -> anyhow::Result<ReportCollector<'_>> {
+        Ok(ReportCollector {
+            http: &self.inner.http,
+            scope: &self.inner.scope,
+            account_id: self.inner.account_id,
+            clock: &self.inner.clock,
+            cancel: &self.inner.cancel,
+            budget: RequestBudget::new(
+                self.inner.operation_timeout,
+                max_requests,
+                self.inner.max_rows,
+            )?,
+            responses: Vec::new(),
+        })
     }
 
     fn budget(&self) -> anyhow::Result<RequestBudget> {

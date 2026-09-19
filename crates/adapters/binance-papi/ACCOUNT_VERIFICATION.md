@@ -152,6 +152,14 @@ no free or locked amount was synthesized. The mass status contained the one acti
 orders or fills in its one-hour window, and retained `reports_complete=false` with its historical
 coverage issue.
 
+On 2026-09-19, the current build reproduced this acceptance through the explicitly configured
+local proxy. Public UM metadata and private PAPI requests used the same proxy, but the public
+metadata request received no PAPI credentials. All nine account sources, the order quota, and
+bounded mass status succeeded again. The wallet and PM risk views were available without issues;
+mass status reported one position and no orders or fills in the one-hour window, while retaining
+`reports_complete=false`. The evidence reported `trading_authorized=false`, every authenticated
+operation was a GET, and no account setting or trading command was invoked.
+
 The first current-build run exposed an additional asset code, `U`, which correctly made the wallet
 unsupported while the currency was unknown. Binance's read-only asset configuration identifies it
 as United Stables, and public `UUSDT` and `BTCU` metadata assign eight-digit asset and commission
@@ -348,6 +356,41 @@ the project's `python/.venv` interpreter.
 
 These counts record the 2026-09-13 evidence checkout, not the subsequent implementation's final
 validation. They do not validate PM admission capability or live recovery design.
+
+## Issue #5 offline command validation
+
+On 2026-09-19, the ordinary UM command lifecycle was validated entirely against loopback mock
+venues. No production trading request was sent. The engine-wired tests exercise the real
+RiskEngine and ExecutionEngine path through the PAPI client: current provenance-tagged synthetic
+risk evidence permits exactly one signed POST and applies the resulting native acceptance, while
+missing evidence and unsupported terms produce a denial with zero write requests. Explicit venue
+rejection becomes a native rejection; a response timeout after the durable dispatch barrier leaves
+the order submitted and the journal operation unknown without retrying or inventing a rejection.
+
+The completed local selections were:
+
+- `nautilus-binance-papi --lib`: 404 passed, covering command transport, coordinator, journal,
+  recovery, private-stream application, and the engine-wired order lifecycle.
+- `nautilus-binance-papi --features python --lib`: 405 passed, covering the same behavior with
+  Python bindings enabled.
+- `nautilus-execution --lib`: 923 passed, covering core reconciliation, post-application callback
+  ordering, and exact client routing.
+- `nautilus-risk --tests`: 1,132 passed and 2 ignored, covering native-capital delegation,
+  totals-only fail-closed behavior, ordinary risk checks, and existing risk regressions.
+- Python PAPI unit tests: 21 passed, covering Python configuration, factory wiring, Decimal limits,
+  and default-off behavior.
+
+Relevant Rust clippy selections passed with warnings denied, generated Python stubs were refreshed,
+and repository formatting completed. On macOS, the Python-feature Rust test required the installed
+Python 3.14 library path and allowing the linker's compact-unwind size warning; all 405 tests then
+ran and passed.
+
+Production increase-risk admission remains fail-closed because authenticated observations do not
+yet construct a `PapiVerifiedRiskSnapshot`. Separately authorized live acceptance still needs to
+verify the PM field units and conservative incremental-margin inputs, then exercise bounded real
+MARKET, LIMIT GTC/IOC/FOK, GTX post-only, reduce-only, targeted cancellation, actual fills, and
+risk rebaseline behavior. The account, instrument, maximum order and position exposure, permitted
+actions, and credentials must be confirmed explicitly before that work.
 
 [account-api]: https://developers.binance.com/en/docs/catalog/advanced-trading-derivatives-trading-portfolio-margin/api/rest-api/account
 [income-api]: https://developers.binance.com/en/docs/catalog/advanced-trading-derivatives-trading-portfolio-margin/api/rest-api/account#get-um-income-history

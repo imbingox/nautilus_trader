@@ -51,11 +51,11 @@ pub(crate) enum PapiHttpError {
     Decode,
     #[error("PAPI response exceeds the 8 MiB parsing limit")]
     ResponseTooLarge,
-    #[error("PAPI read attempt timed out")]
+    #[error("PAPI request attempt timed out")]
     Timeout,
-    #[error("PAPI read was canceled")]
+    #[error("PAPI request was canceled")]
     Canceled,
-    #[error("PAPI read exhausted its operation budget")]
+    #[error("PAPI request exhausted its operation budget")]
     Budget,
     #[error("Invalid PAPI retry configuration")]
     Configuration,

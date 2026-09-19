@@ -57,6 +57,7 @@ nautilus-system = { workspace = true, optional = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 binance-sdk = { workspace = true }
+blake3 = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
 parking_lot = { workspace = true }
@@ -74,7 +75,7 @@ pyo3-async-runtimes = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
-nautilus-live = { workspace = true }
+nautilus-live = { workspace = true, features = ["test-support"] }
 nautilus-model = { workspace = true, features = ["test-support"] }
 nautilus-portfolio = { workspace = true }
 
@@ -83,6 +84,7 @@ axum = { workspace = true }
 futures-util = { workspace = true }
 rstest = { workspace = true }
 rust_decimal_macros = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = { workspace = true }
 toml = { workspace = true }

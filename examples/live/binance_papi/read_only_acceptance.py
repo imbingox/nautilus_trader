@@ -52,18 +52,22 @@ def _read_json(path: Path, max_bytes: int) -> Any:
     return json.loads(payload)
 
 
-def _load_credentials(path: Path) -> BinancePapiReadOnlyConfig:
+def _load_credentials(path: Path) -> tuple[BinancePapiReadOnlyConfig, str | None]:
     try:
         values = _read_json(path, 16_384)
         account_id = AccountId(values.pop("account_id"))
-        return BinancePapiReadOnlyConfig(account_id=account_id, **values)
+        proxy_url = values.get("proxy_url")
+        config = BinancePapiReadOnlyConfig(account_id=account_id, **values)
     except (KeyError, TypeError, ValueError, AttributeError):
         raise ValueError("Invalid PAPI credential configuration") from None
+    else:
+        return config, proxy_url
 
 
 async def _load_scope(
     instrument_ids: list[InstrumentId],
     instruments_file: Path | None,
+    proxy_url: str | None,
 ) -> list[CryptoFuture | CryptoPerpetual]:
     if instruments_file is None:
         loaded = await load_binance_instruments(
@@ -75,6 +79,7 @@ async def _load_scope(
                     load_ids=[str(instrument_id) for instrument_id in instrument_ids],
                     query_commission_rates=False,
                 ),
+                proxy_url=proxy_url,
             ),
         )
         instruments = [
@@ -103,7 +108,9 @@ async def _load_scope(
     if len(instruments) != len(instrument_ids) or {i.id for i in instruments} != set(
         instrument_ids,
     ):
-        raise ValueError("Loaded metadata does not exactly match the requested instrument scope")
+        raise ValueError(
+            "Loaded metadata does not exactly match the requested instrument scope",
+        )
     return instruments
 
 
@@ -131,7 +138,9 @@ async def collect_evidence(
     if not 0 <= start <= end <= time_ns():
         raise ValueError("Invalid inclusive history window")
     if not 1 <= max_receipt_age_ms <= 2**64 - 1:
-        raise ValueError("Receipt age must be a positive unsigned 64-bit millisecond value")
+        raise ValueError(
+            "Receipt age must be a positive unsigned 64-bit millisecond value",
+        )
 
     client = BinancePapiReadOnlyClient(config, instruments)
     operations = dict.fromkeys(
@@ -142,7 +151,10 @@ async def collect_evidence(
         "schema_version": 2,
         "account_id": str(config.account_id),
         "instrument_ids": [str(instrument.id) for instrument in instruments],
-        "instruments_json": json.dumps([i.to_dict() for i in instruments], default=_decimal_json),
+        "instruments_json": json.dumps(
+            [i.to_dict() for i in instruments],
+            default=_decimal_json,
+        ),
         "window_start_ns": start,
         "window_end_ns": end,
         "collection_started_ns": time_ns(),
@@ -189,11 +201,17 @@ async def collect_evidence(
     return evidence
 
 
-async def _collect(args: argparse.Namespace, config: BinancePapiReadOnlyConfig) -> dict[str, Any]:
+async def _collect(
+    args: argparse.Namespace,
+    config: BinancePapiReadOnlyConfig,
+    proxy_url: str | None,
+) -> dict[str, Any]:
     instrument_ids = [InstrumentId.from_str(value) for value in args.instrument_id]
-    if not 1 <= len(instrument_ids) <= 256 or len(set(instrument_ids)) != len(instrument_ids):
+    if not 1 <= len(instrument_ids) <= 256 or len(set(instrument_ids)) != len(
+        instrument_ids,
+    ):
         raise ValueError("Specify 1 to 256 unique instrument IDs")
-    instruments = await _load_scope(instrument_ids, args.instruments_file)
+    instruments = await _load_scope(instrument_ids, args.instruments_file, proxy_url)
     end = time_ns()
     start = end - args.lookback_minutes * 60_000_000_000
     return await collect_evidence(config, instruments, start, end)
@@ -214,11 +232,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("lookback-minutes must be between 1 and 10080")
 
     try:
-        config = _load_credentials(args.credentials)
+        config, proxy_url = _load_credentials(args.credentials)
         descriptor = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                evidence = asyncio.run(_collect(args, config))
+                evidence = asyncio.run(_collect(args, config, proxy_url))
                 json.dump(evidence, stream, indent=2)
                 stream.write("\n")
         except BaseException:
@@ -228,7 +246,9 @@ def main(argv: list[str] | None = None) -> int:
         print("Output already exists; choose a new evidence file")
         return 1
     except (OSError, ValueError, TypeError, RuntimeError):
-        print("Collection setup failed; check credentials, instrument metadata, and output path")
+        print(
+            "Collection setup failed; check credentials, instrument metadata, and output path",
+        )
         return 1
     except KeyboardInterrupt:
         print("Collection canceled")

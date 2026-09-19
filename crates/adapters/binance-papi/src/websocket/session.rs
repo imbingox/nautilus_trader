@@ -16,7 +16,7 @@
 //! One-owner listen-key, transport, event-buffer, and bounded recovery lifecycle.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     sync::{
         Arc,
@@ -31,6 +31,7 @@ use nautilus_model::{
     events::AccountState,
     identifiers::{AccountId, InstrumentId},
     instruments::{Instrument, InstrumentAny},
+    reports::{FillReport, OrderStatusReport},
 };
 use nautilus_network::{
     RECONNECTED, SocketState, SocketStateSink,
@@ -43,7 +44,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     messages::{PapiWsEvent, parse_event},
-    state::FactState,
+    reports::incremental_reports,
+    state::{FactState, OrderDelta},
 };
 use crate::{
     http::{BinancePapiResponseMetadata, ListenKey, error::PapiHttpError},
@@ -91,7 +93,7 @@ pub struct BinancePapiRecoveryEvidence {
     pub state: BinancePapiSessionState,
     /// Whether the current account-stream transport is active.
     pub transport_connected: bool,
-    /// Whether declared state has converged and the recovery callback acknowledged application.
+    /// Whether declared state has converged and the recovery callback accepted delivery.
     pub synchronized: bool,
     /// Always false in issue #4; issue #5 owns trade admission.
     pub trading_authorized: bool,
@@ -103,8 +105,14 @@ pub struct BinancePapiRecoveryEvidence {
     pub recovery_generation: u64,
     /// Epoch within the current `nautilus-network` WebSocket client.
     pub transport_epoch: u64,
-    /// Highest received fact version acknowledged by the application callback.
+    /// Highest fact version retained by the serial account-stream state.
+    pub received_fact_version: u64,
+    /// Highest fact version successfully delivered to the application callback.
+    pub delivered_fact_version: u64,
+    /// Highest fact version explicitly confirmed as applied by the execution engine.
     pub applied_fact_version: u64,
+    /// Delivered fact version still awaiting explicit execution-engine application confirmation.
+    pub pending_application_fact_version: Option<u64>,
     /// Inclusive lower bound for the most recent recovery query.
     pub window_start: Option<nautilus_core::UnixNanos>,
     /// Inclusive fixed upper bound for the most recent recovery query.
@@ -155,7 +163,10 @@ impl BinancePapiRecoveryEvidence {
             listen_key_generation: 0,
             recovery_generation: 0,
             transport_epoch: 0,
+            received_fact_version: 0,
+            delivered_fact_version: 0,
             applied_fact_version: 0,
+            pending_application_fact_version: None,
             window_start: None,
             window_end: None,
             responses: Vec::new(),
@@ -181,21 +192,74 @@ pub(crate) struct PapiRecoveryBundle {
     pub(crate) account_state: AccountState,
     pub(crate) snapshot: BinancePapiReadOnlySnapshot,
     pub(crate) initial: bool,
+    pub(crate) checkpoint: PapiApplicationCheckpoint,
+}
+
+pub(crate) struct PapiIncrementalBundle {
+    pub(crate) order: OrderStatusReport,
+    pub(crate) fills: Vec<FillReport>,
+    pub(crate) checkpoint: PapiApplicationCheckpoint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PapiApplicationCheckpoint {
+    session_generation: u64,
+    recovery_generation: u64,
+    fact_version: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct PapiApplicationAcknowledger {
+    shared: Arc<SessionShared>,
+}
+
+impl Debug for PapiApplicationAcknowledger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(PapiApplicationAcknowledger))
+            .finish_non_exhaustive()
+    }
+}
+
+impl PapiApplicationAcknowledger {
+    pub(crate) fn acknowledge(&self, checkpoint: PapiApplicationCheckpoint) -> anyhow::Result<()> {
+        acknowledge_application(&self.shared, checkpoint)
+    }
 }
 
 pub(crate) type PapiRecoveryHandler =
     Arc<dyn Fn(PapiRecoveryBundle) -> anyhow::Result<()> + Send + Sync>;
+pub(crate) type PapiIncrementalHandler =
+    Arc<dyn Fn(PapiIncrementalBundle) -> anyhow::Result<()> + Send + Sync>;
+
+fn acknowledge_application(
+    shared: &SessionShared,
+    checkpoint: PapiApplicationCheckpoint,
+) -> anyhow::Result<()> {
+    let mut evidence = shared.evidence.lock();
+    anyhow::ensure!(
+        evidence.session_generation == checkpoint.session_generation
+            && evidence.recovery_generation == checkpoint.recovery_generation
+            && evidence.delivered_fact_version == checkpoint.fact_version
+            && evidence.pending_application_fact_version == Some(checkpoint.fact_version),
+        "Stale PAPI application acknowledgement"
+    );
+    evidence.applied_fact_version = checkpoint.fact_version;
+    evidence.pending_application_fact_version = None;
+    Ok(())
+}
 
 /// A no-trading Portfolio Margin private account observation session.
 pub struct BinancePapiAccountSession {
     config: BinancePapiReadOnlyConfig,
     reader: BinancePapiReadOnlyClient,
     symbols: Arc<BTreeSet<String>>,
+    instruments: Arc<BTreeMap<String, InstrumentAny>>,
     shared: Arc<SessionShared>,
     websocket: Arc<tokio::sync::Mutex<Option<WebSocketClient>>>,
     listen_key: Arc<Mutex<Option<OwnedListenKey>>>,
     tasks: TaskGroup,
     handler: PapiRecoveryHandler,
+    incremental_handler: PapiIncrementalHandler,
 }
 
 impl BinancePapiAccountSession {
@@ -216,11 +280,25 @@ impl BinancePapiAccountSession {
         instruments: Vec<InstrumentAny>,
         handler: PapiRecoveryHandler,
     ) -> anyhow::Result<Self> {
+        Self::with_handlers(config, instruments, handler, Arc::new(|_| Ok(())))
+    }
+
+    pub(crate) fn with_handlers(
+        config: &BinancePapiReadOnlyConfig,
+        instruments: Vec<InstrumentAny>,
+        handler: PapiRecoveryHandler,
+        incremental_handler: PapiIncrementalHandler,
+    ) -> anyhow::Result<Self> {
         config.validate()?;
-        let symbols = instruments
+        let instrument_map: BTreeMap<_, _> = instruments
             .iter()
-            .map(|instrument| instrument.raw_symbol().to_string())
+            .map(|instrument| (instrument.raw_symbol().to_string(), instrument.clone()))
             .collect();
+        anyhow::ensure!(
+            instrument_map.len() == instruments.len(),
+            "PAPI private-session instrument symbols must be unique"
+        );
+        let symbols = instrument_map.keys().cloned().collect();
         let reader = BinancePapiReadOnlyClient::new(config, instruments)?;
         let evidence =
             BinancePapiRecoveryEvidence::stopped(config.account_id, reader.instrument_ids());
@@ -229,6 +307,7 @@ impl BinancePapiAccountSession {
             config: config.clone(),
             reader,
             symbols: Arc::new(symbols),
+            instruments: Arc::new(instrument_map),
             shared: Arc::new(SessionShared {
                 evidence: Mutex::new(evidence),
                 facts: Mutex::new(FactState::new(config.max_rows)),
@@ -243,6 +322,7 @@ impl BinancePapiAccountSession {
             listen_key: Arc::new(Mutex::new(None)),
             tasks: TaskGroup::new(),
             handler,
+            incremental_handler,
         })
     }
 
@@ -250,6 +330,12 @@ impl BinancePapiAccountSession {
     #[must_use]
     pub fn read_only_client(&self) -> BinancePapiReadOnlyClient {
         self.reader.clone()
+    }
+
+    pub(crate) fn application_acknowledger(&self) -> PapiApplicationAcknowledger {
+        PapiApplicationAcknowledger {
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     /// Returns current typed recovery evidence with live queue counters.
@@ -268,6 +354,18 @@ impl BinancePapiAccountSession {
     #[must_use]
     pub fn is_synchronized(&self) -> bool {
         self.shared.evidence.lock().synchronized
+    }
+
+    /// Confirms that the execution engine applied the exact delivered recovery generation.
+    ///
+    /// Queue admission or callback success is not application confirmation. A stale, skipped, or
+    /// already superseded checkpoint is rejected and cannot advance the trading checkpoint.
+    #[cfg(test)]
+    pub(crate) fn acknowledge_application(
+        &self,
+        checkpoint: PapiApplicationCheckpoint,
+    ) -> anyhow::Result<()> {
+        acknowledge_application(&self.shared, checkpoint)
     }
 
     /// Starts a new listen-key owner, begins receiving, and performs bounded baseline recovery.
@@ -317,6 +415,10 @@ impl BinancePapiAccountSession {
             evidence.risk_collection_span_ns = None;
             evidence.recovery_elapsed_ms = None;
             evidence.issues.clear();
+            evidence.received_fact_version = 0;
+            evidence.delivered_fact_version = 0;
+            evidence.applied_fact_version = 0;
+            evidence.pending_application_fact_version = None;
         }
         let owner = self.next_owner()?;
         let listen_key = match self.reader.create_listen_key().await {
@@ -348,10 +450,12 @@ impl BinancePapiAccountSession {
             config: self.config.clone(),
             reader: self.reader.clone(),
             symbols: Arc::clone(&self.symbols),
+            instruments: Arc::clone(&self.instruments),
             shared: Arc::clone(&self.shared),
             websocket: Arc::clone(&self.websocket),
             listen_key: Arc::clone(&self.listen_key),
             handler: Arc::clone(&self.handler),
+            incremental_handler: Arc::clone(&self.incremental_handler),
             tx,
         };
         let initial = async {
@@ -492,10 +596,12 @@ struct DriverContext {
     config: BinancePapiReadOnlyConfig,
     reader: BinancePapiReadOnlyClient,
     symbols: Arc<BTreeSet<String>>,
+    instruments: Arc<BTreeMap<String, InstrumentAny>>,
     shared: Arc<SessionShared>,
     websocket: Arc<tokio::sync::Mutex<Option<WebSocketClient>>>,
     listen_key: Arc<Mutex<Option<OwnedListenKey>>>,
     handler: PapiRecoveryHandler,
+    incremental_handler: PapiIncrementalHandler,
     tx: tokio::sync::mpsc::Sender<Inbound>,
 }
 
@@ -523,6 +629,7 @@ impl SessionShared {
         evidence.retained_facts = facts.fact_count();
         evidence.duplicate_count = facts.duplicate_count;
         evidence.conflict_count = facts.conflict_count;
+        evidence.received_fact_version = facts.fact_version;
         evidence
     }
 
@@ -713,7 +820,18 @@ async fn run_driver(
                     continue;
                 }
             }
-            Ok(InboundAction::Recover) => {}
+            Ok(InboundAction::DeliverOrder {
+                delta,
+                fact_version,
+            }) if context.shared.evidence.lock().synchronized => {
+                let owner = context.shared.current_owner.load(Ordering::Acquire);
+
+                if let Err(e) = deliver_incremental(&context, &delta, fact_version, owner) {
+                    context.shared.restrict(e.to_string());
+                }
+                continue;
+            }
+            Ok(InboundAction::DeliverOrder { .. } | InboundAction::Recover) => {}
             Err(e) => {
                 context.shared.restrict(e);
                 continue;
@@ -870,6 +988,79 @@ fn allocate_owner(shared: &SessionShared) -> anyhow::Result<u64> {
     Ok(owner)
 }
 
+fn deliver_incremental(
+    context: &DriverContext,
+    delta: &OrderDelta,
+    fact_version: u64,
+    owner: u64,
+) -> anyhow::Result<()> {
+    let instrument = context
+        .instruments
+        .get(&delta.order.symbol)
+        .ok_or_else(|| anyhow::anyhow!("PAPI stream order instrument is outside session scope"))?;
+    let (order, fills) = incremental_reports(
+        delta,
+        context.config.account_id,
+        instrument,
+        context.reader.now(),
+    )?;
+    let (session_generation, recovery_generation) = {
+        let evidence = context.shared.evidence.lock();
+        anyhow::ensure!(
+            evidence.synchronized
+                && evidence.session_generation != 0
+                && context.shared.current_owner.load(Ordering::Acquire) == owner,
+            "Stale PAPI incremental delivery"
+        );
+        (evidence.session_generation, evidence.recovery_generation)
+    };
+    let checkpoint = PapiApplicationCheckpoint {
+        session_generation,
+        recovery_generation,
+        fact_version,
+    };
+    let previous_application = {
+        let mut evidence = context.shared.evidence.lock();
+        let previous = (
+            evidence.delivered_fact_version,
+            evidence.pending_application_fact_version,
+        );
+        evidence.delivered_fact_version = fact_version;
+        evidence.pending_application_fact_version = Some(fact_version);
+        previous
+    };
+
+    if let Err(e) = (context.incremental_handler)(PapiIncrementalBundle {
+        order,
+        fills,
+        checkpoint,
+    }) {
+        let mut evidence = context.shared.evidence.lock();
+        if evidence.pending_application_fact_version == Some(fact_version) {
+            evidence.delivered_fact_version = previous_application.0;
+            evidence.pending_application_fact_version = previous_application.1;
+        }
+        return Err(e);
+    }
+
+    let mut facts = context.shared.facts.lock();
+    let mut evidence = context.shared.evidence.lock();
+    anyhow::ensure!(
+        evidence.synchronized
+            && evidence.session_generation == session_generation
+            && evidence.recovery_generation == recovery_generation
+            && context.shared.current_owner.load(Ordering::Acquire) == owner
+            && facts.fact_version >= fact_version,
+        "Stale PAPI incremental delivery"
+    );
+    facts.clear_order_sources(&delta.order.symbol);
+    evidence.received_fact_version = facts.fact_version;
+    evidence.retained_facts = facts.fact_count();
+    evidence.duplicate_count = facts.duplicate_count;
+    evidence.conflict_count = facts.conflict_count;
+    Ok(())
+}
+
 async fn recover(
     context: &DriverContext,
     rx: &mut tokio::sync::mpsc::Receiver<Inbound>,
@@ -921,7 +1112,9 @@ async fn recover(
                 InboundAction::ReplaceListenKey => {
                     return Ok(RecoveryOutcome::ReplaceListenKey);
                 }
-                InboundAction::Recover | InboundAction::Ignore => {}
+                InboundAction::DeliverOrder { .. }
+                | InboundAction::Recover
+                | InboundAction::Ignore => {}
             }
         }
 
@@ -970,11 +1163,37 @@ async fn recover(
         );
     }
 
-    (context.handler)(PapiRecoveryBundle {
+    let checkpoint = PapiApplicationCheckpoint {
+        session_generation: shared.evidence.lock().session_generation,
+        recovery_generation,
+        fact_version,
+    };
+    let previous_application = {
+        let mut evidence = shared.evidence.lock();
+        let previous = (
+            evidence.delivered_fact_version,
+            evidence.pending_application_fact_version,
+        );
+        evidence.delivered_fact_version = fact_version;
+        evidence.pending_application_fact_version = Some(fact_version);
+        previous
+    };
+
+    if let Err(e) = (context.handler)(PapiRecoveryBundle {
         account_state,
         snapshot: snapshot.clone(),
         initial,
-    })?;
+        checkpoint,
+    }) {
+        let mut evidence = shared.evidence.lock();
+        if evidence.recovery_generation == recovery_generation
+            && evidence.pending_application_fact_version == Some(fact_version)
+        {
+            evidence.delivered_fact_version = previous_application.0;
+            evidence.pending_application_fact_version = previous_application.1;
+        }
+        return Err(e);
+    }
 
     let transport_epoch = if shared.current_owner.load(Ordering::Acquire) == owner {
         shared.evidence.lock().transport_epoch
@@ -995,7 +1214,7 @@ async fn recover(
     evidence.state = BinancePapiSessionState::Synchronized;
     evidence.synchronized = true;
     evidence.trading_authorized = false;
-    evidence.applied_fact_version = fact_version;
+    evidence.received_fact_version = fact_version;
     evidence.transport_epoch = transport_epoch;
     evidence.responses = snapshot.responses;
     evidence.wallet_status = Some(projection.wallet_status);
@@ -1036,8 +1255,16 @@ fn validate_projection(projection: &BinancePapiAccountProjection) -> anyhow::Res
     Ok(())
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Inbound actions are ephemeral and immediately consumed"
+)]
 enum InboundAction {
     Ignore,
+    DeliverOrder {
+        delta: OrderDelta,
+        fact_version: u64,
+    },
     Recover,
     ReplaceListenKey,
 }
@@ -1068,8 +1295,20 @@ fn process_inbound(
             if matches!(event, PapiWsEvent::ListenKeyExpired { .. }) {
                 return Ok(InboundAction::ReplaceListenKey);
             }
-            shared.facts.lock().apply(event)?;
-            Ok(InboundAction::Recover)
+            let application = shared.facts.lock().apply(event)?;
+
+            if !application.changed {
+                Ok(InboundAction::Ignore)
+            } else if let Some(delta) = application.order {
+                Ok(InboundAction::DeliverOrder {
+                    delta,
+                    fact_version: application.version,
+                })
+            } else if application.requires_recovery {
+                Ok(InboundAction::Recover)
+            } else {
+                Err("PAPI fact application produced no delivery or recovery action".to_string())
+            }
         }
         Inbound::Transport { owner, state } => {
             if owner != shared.current_owner.load(Ordering::Acquire) {
@@ -1111,6 +1350,7 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use nautilus_core::string::secret::SecretString;
     use rstest::rstest;
+    use rust_decimal_macros::dec;
     use serde_json::json;
     use tokio_tungstenite::{accept_async, tungstenite::Message as WsMessage};
 
@@ -1168,6 +1408,40 @@ mod tests {
             "a": {
                 "m": "ORDER",
                 "P": [{"s": "BTCUSDT", "pa": "-2.00000000", "ps": "BOTH"}]
+            }
+        })
+        .to_string()
+    }
+
+    fn order_trade_event() -> String {
+        json!({
+            "e": "ORDER_TRADE_UPDATE",
+            "E": 1_700_000_000_003_i64,
+            "T": 1_700_000_000_002_i64,
+            "fs": "UM",
+            "o": {
+                "s": "BTCUSDT",
+                "c": "client-1",
+                "i": 42,
+                "S": "BUY",
+                "o": "LIMIT",
+                "ot": "LIMIT",
+                "f": "GTC",
+                "q": "0.010",
+                "p": "42000.10",
+                "ap": "42000.10",
+                "R": false,
+                "ps": "BOTH",
+                "x": "TRADE",
+                "X": "PARTIALLY_FILLED",
+                "z": "0.001",
+                "l": "0.001",
+                "L": "42000.10",
+                "N": "BNB",
+                "n": "-0.00000123",
+                "m": false,
+                "T": 1_700_000_000_002_i64,
+                "t": 7
             }
         })
         .to_string()
@@ -1234,10 +1508,13 @@ mod tests {
         config.refresh_debounce = Duration::from_millis(10);
         let callback_count = Arc::new(AtomicUsize::new(0));
         let callback_observed = Arc::clone(&callback_count);
+        let delivered_checkpoint = Arc::new(Mutex::new(None));
+        let callback_checkpoint = Arc::clone(&delivered_checkpoint);
         let handler: PapiRecoveryHandler = Arc::new(move |bundle| {
             assert!(bundle.initial);
             assert!(!bundle.snapshot.mass_status.reports_complete());
             assert!(!bundle.account_state.total_only_balances.is_empty());
+            *callback_checkpoint.lock() = Some(bundle.checkpoint);
             callback_observed.fetch_add(1, Ordering::AcqRel);
             Ok(())
         });
@@ -1254,9 +1531,18 @@ mod tests {
         assert!(evidence.transport_connected);
         assert!(evidence.synchronized);
         assert!(!evidence.trading_authorized);
-        assert_eq!(evidence.applied_fact_version, 1);
+        assert_eq!(evidence.received_fact_version, 1);
+        assert_eq!(evidence.delivered_fact_version, 1);
+        assert_eq!(evidence.applied_fact_version, 0);
+        assert_eq!(evidence.pending_application_fact_version, Some(1));
         assert_eq!(callback_count.load(Ordering::Acquire), 1);
         assert!(!baseline_before_websocket.load(Ordering::Acquire));
+
+        let checkpoint = delivered_checkpoint.lock().unwrap();
+        session.acknowledge_application(checkpoint).unwrap();
+        assert_eq!(session.evidence().applied_fact_version, 1);
+        assert_eq!(session.evidence().pending_application_fact_version, None);
+        assert!(session.acknowledge_application(checkpoint).is_err());
 
         websocket_tx
             .send(json!({"e": "UNKNOWN_CRITICAL", "E": 1_700_000_000_002_i64}).to_string())
@@ -1287,6 +1573,81 @@ mod tests {
                 request.path == "/papi/v1/listenKey" && request.method == "DELETE"
             })
         );
+        websocket_task.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn order_delta_delivers_once_without_full_rest_recovery_and_requires_acknowledgement() {
+        let (websocket_url, websocket_tx, websocket_task, _) =
+            websocket_server(partial_account_event()).await;
+        let server = MockServer::new(|request| {
+            if request.path == "/papi/v1/balance" {
+                Reply::json(&testing::supported_balances())
+            } else {
+                testing::quiet(request)
+            }
+        })
+        .await;
+        let mut config = testing::config(&server.url);
+        config.websocket_url = SecretString::from(websocket_url);
+        config.listen_key_keepalive_interval = Duration::from_secs(60);
+        config.transport_rotation_interval = Duration::from_secs(60);
+        config.refresh_debounce = Duration::from_millis(10);
+        let deliveries = Arc::new(Mutex::new(Vec::new()));
+        let observed_deliveries = Arc::clone(&deliveries);
+        let handler: PapiRecoveryHandler = Arc::new(|_| Ok(()));
+        let incremental_handler: PapiIncrementalHandler = Arc::new(move |bundle| {
+            observed_deliveries.lock().push(bundle);
+            Ok(())
+        });
+        let mut session = BinancePapiAccountSession::with_handlers(
+            &config,
+            vec![testing::instrument("BTCUSDT")],
+            handler,
+            incremental_handler,
+        )
+        .unwrap();
+
+        session.start().await.unwrap();
+        let baseline_requests = server.requests().len();
+        let event = order_trade_event();
+        websocket_tx.send(event.clone()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if deliveries.lock().len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let checkpoint = {
+            let deliveries = deliveries.lock();
+            let bundle = &deliveries[0];
+            assert_eq!(bundle.order.client_order_id.unwrap().as_str(), "client-1");
+            assert_eq!(bundle.fills.len(), 1);
+            assert_eq!(bundle.fills[0].commission.as_decimal(), dec!(-0.00000123));
+            bundle.checkpoint
+        };
+        let evidence = session.evidence();
+        assert_eq!(evidence.received_fact_version, 2);
+        assert_eq!(evidence.delivered_fact_version, 2);
+        assert_eq!(evidence.applied_fact_version, 0);
+        assert_eq!(evidence.pending_application_fact_version, Some(2));
+        assert_eq!(server.requests().len(), baseline_requests);
+
+        session.acknowledge_application(checkpoint).unwrap();
+        assert_eq!(session.evidence().applied_fact_version, 2);
+        websocket_tx.send(event).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(deliveries.lock().len(), 1);
+        assert_eq!(session.evidence().received_fact_version, 2);
+        assert_eq!(server.requests().len(), baseline_requests);
+
+        session.stop().await.unwrap();
         websocket_task.abort();
     }
 

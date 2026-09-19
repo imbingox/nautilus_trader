@@ -722,6 +722,13 @@ impl LiveNodeBuilder {
                     }
                 }
 
+                if let Some(check) = client.native_capital_check() {
+                    kernel
+                        .risk_engine
+                        .borrow_mut()
+                        .register_native_capital_check(client.account_id(), client_id, check)?;
+                }
+
                 ExecutionEngine::subscribe_venue_instruments(&kernel.exec_engine, venue);
                 exec_clients.push(client);
 

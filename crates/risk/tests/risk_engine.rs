@@ -18,7 +18,12 @@
     reason = "rstest fixtures define broad test setup signatures"
 )]
 
-use std::{cell::RefCell, rc::Rc, str::FromStr, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    str::FromStr,
+    sync::Arc,
+};
 
 use ahash::{AHashMap, AHashSet};
 use nautilus_common::{
@@ -246,7 +251,11 @@ fn test_deny_order_exceeding_max_notional(
     matches!(saved_events[0], OrderEventAny::Denied(_));
 }
 
-use nautilus_risk::engine::{RiskEngine, config::RiskEngineConfig};
+use nautilus_risk::engine::{
+    RiskEngine,
+    capital::{NativeCapitalCheck, NativeCapitalCheckDecision},
+    config::RiskEngineConfig,
+};
 
 #[fixture]
 fn process_order_event_handler() -> TypedIntoMessageSavingHandler<OrderEventAny> {
@@ -8551,6 +8560,308 @@ fn test_submit_order_totals_only_margin_capital_guard(
             )
         );
     }
+}
+
+#[rstest]
+#[case::matching_route("BINANCE-001", "BINANCE", "BINANCE", Some("BINANCE"), None, true, true)]
+#[case::cached_route("BINANCE-001", "BINANCE", "BINANCE", None, None, true, true)]
+#[case::wrong_account(
+    "BINANCE-OTHER",
+    "BINANCE",
+    "BINANCE",
+    Some("BINANCE"),
+    None,
+    false,
+    false
+)]
+#[case::wrong_registered_client(
+    "BINANCE-001",
+    "BINANCE_PAPI",
+    "BINANCE",
+    Some("BINANCE"),
+    None,
+    false,
+    false
+)]
+#[case::explicit_cached_route_mismatch(
+    "BINANCE-001",
+    "BINANCE",
+    "BINANCE",
+    Some("BINANCE_PAPI"),
+    None,
+    false,
+    false
+)]
+#[case::delegate_denial(
+    "BINANCE-001",
+    "BINANCE",
+    "BINANCE",
+    Some("BINANCE"),
+    Some("PAPI_RISK_EVIDENCE_STALE"),
+    true,
+    false
+)]
+fn test_totals_only_native_capital_delegate_requires_exact_account_and_route(
+    #[case] registered_account: &str,
+    #[case] registered_client: &str,
+    #[case] cached_client: &str,
+    #[case] command_client: Option<&str>,
+    #[case] delegate_denial: Option<&str>,
+    #[case] expected_call: bool,
+    #[case] forwarded: bool,
+    strategy_id_ema_cross: StrategyId,
+    client_id_binance: ClientId,
+    trader_id: TraderId,
+    instrument_eth_usdt: InstrumentAny,
+    quote_ethusdt_binance: QuoteTick,
+    process_order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    execute_order_event_handler: TypedIntoMessageSavingHandler<TradingCommand>,
+    mut simple_cache: Cache,
+) {
+    let account_id = AccountId::from("BINANCE-001");
+    simple_cache
+        .add_instrument(instrument_eth_usdt.clone())
+        .unwrap();
+    simple_cache.add_quote(quote_ethusdt_binance).unwrap();
+    let state = AccountState::new(
+        account_id,
+        AccountType::Margin,
+        vec![],
+        vec![],
+        true,
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        None,
+    )
+    .with_total_only_balances(vec![Money::from("100000 USDT")])
+    .unwrap();
+    simple_cache
+        .add_account(AccountAny::Margin(MarginAccount::new(state, false)))
+        .unwrap();
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.000"))
+        .build();
+    simple_cache
+        .add_order(
+            order.clone(),
+            None,
+            Some(ClientId::from(cached_client)),
+            false,
+        )
+        .unwrap();
+
+    let mut risk_engine =
+        get_risk_engine(Some(Rc::new(RefCell::new(simple_cache))), None, None, false);
+    let instrument_id = instrument_eth_usdt.id();
+    let calls = Rc::new(Cell::new(0));
+    let delegate_calls = Rc::clone(&calls);
+    let expected_delegate_denial = delegate_denial.map(str::to_owned);
+    let delegate_denial = expected_delegate_denial.clone();
+    let check: NativeCapitalCheck = Rc::new(move |request| {
+        assert_eq!(request.account_id, account_id);
+        assert_eq!(request.client_id, client_id_binance);
+        assert_eq!(request.instrument.id(), instrument_id);
+        assert_eq!(request.orders.len(), 1);
+        assert!(!request.full_position_exit);
+        delegate_calls.set(delegate_calls.get() + 1);
+        delegate_denial
+            .as_ref()
+            .map_or(NativeCapitalCheckDecision::Approved, |reason| {
+                NativeCapitalCheckDecision::Denied(reason.clone())
+            })
+    });
+    risk_engine
+        .register_native_capital_check(
+            AccountId::from(registered_account),
+            ClientId::from(registered_client),
+            check,
+        )
+        .unwrap();
+    let command = SubmitOrder::new(
+        trader_id,
+        command_client.map(ClientId::from),
+        strategy_id_ema_cross,
+        instrument_id,
+        order.client_order_id(),
+        order.init_event().clone(),
+        None,
+        None,
+        None,
+        UUID4::new(),
+        risk_engine.clock().borrow().timestamp_ns(),
+        None,
+    );
+
+    risk_engine.execute(TradingCommand::SubmitOrder(command));
+
+    let denied = get_process_order_event_handler_messages(&process_order_event_handler);
+    let sent = get_execute_order_event_handler_messages(&execute_order_event_handler);
+    assert_eq!(calls.get(), usize::from(expected_call));
+    assert_eq!(denied.len(), usize::from(!forwarded));
+    assert_eq!(sent.len(), usize::from(forwarded));
+    if !forwarded {
+        let expected_reason = expected_delegate_denial.unwrap_or_else(|| {
+            OrderDeniedReason::NativeCapitalCheckUnavailable { account_id }.to_string()
+        });
+        assert_eq!(
+            denied[0].message(),
+            Some(Ustr::from(expected_reason.as_str()))
+        );
+    }
+}
+
+#[rstest]
+fn test_native_capital_delegate_registration_is_not_replaced_and_can_be_removed(
+    simple_cache: Cache,
+) {
+    let mut risk_engine =
+        get_risk_engine(Some(Rc::new(RefCell::new(simple_cache))), None, None, false);
+    let account_id = AccountId::from("BINANCE-001");
+    let client_id = ClientId::from("BINANCE");
+    let check: NativeCapitalCheck = Rc::new(|_| NativeCapitalCheckDecision::Approved);
+
+    risk_engine
+        .register_native_capital_check(account_id, client_id, Rc::clone(&check))
+        .unwrap();
+    assert!(
+        risk_engine
+            .register_native_capital_check(account_id, client_id, check)
+            .is_err()
+    );
+    assert!(risk_engine.deregister_native_capital_check(account_id, client_id));
+    assert!(!risk_engine.deregister_native_capital_check(account_id, client_id));
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NativeCapitalOtherRiskCheck {
+    Price,
+    Quantity,
+    Notional,
+    TradingState,
+}
+
+#[rstest]
+#[case::price(
+    NativeCapitalOtherRiskCheck::Price,
+    "PRICE_PRECISION_EXCEEDS_MAXIMUM",
+    false
+)]
+#[case::quantity(
+    NativeCapitalOtherRiskCheck::Quantity,
+    "QUANTITY_PRECISION_EXCEEDS_MAXIMUM",
+    false
+)]
+#[case::notional(
+    NativeCapitalOtherRiskCheck::Notional,
+    "NOTIONAL_EXCEEDS_MAX_PER_ORDER",
+    true
+)]
+#[case::trading_state(NativeCapitalOtherRiskCheck::TradingState, "TRADING_HALTED", true)]
+fn test_native_capital_approval_does_not_bypass_other_risk_checks(
+    #[case] other_check: NativeCapitalOtherRiskCheck,
+    #[case] expected_denial: &str,
+    #[case] expected_delegate_call: bool,
+    strategy_id_ema_cross: StrategyId,
+    client_id_binance: ClientId,
+    trader_id: TraderId,
+    instrument_eth_usdt: InstrumentAny,
+    quote_ethusdt_binance: QuoteTick,
+    process_order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    execute_order_event_handler: TypedIntoMessageSavingHandler<TradingCommand>,
+    mut simple_cache: Cache,
+) {
+    let account_id = AccountId::from("BINANCE-001");
+    simple_cache
+        .add_instrument(instrument_eth_usdt.clone())
+        .unwrap();
+    simple_cache.add_quote(quote_ethusdt_binance).unwrap();
+    let state = AccountState::new(
+        account_id,
+        AccountType::Margin,
+        vec![],
+        vec![],
+        true,
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        None,
+    )
+    .with_total_only_balances(vec![Money::from("100000 USDT")])
+    .unwrap();
+    simple_cache
+        .add_account(AccountAny::Margin(MarginAccount::new(state, false)))
+        .unwrap();
+
+    let mut builder = match other_check {
+        NativeCapitalOtherRiskCheck::Price => OrderTestBuilder::new(OrderType::Limit),
+        NativeCapitalOtherRiskCheck::Quantity
+        | NativeCapitalOtherRiskCheck::Notional
+        | NativeCapitalOtherRiskCheck::TradingState => OrderTestBuilder::new(OrderType::Market),
+    };
+    builder
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Buy)
+        .quantity(match other_check {
+            NativeCapitalOtherRiskCheck::Quantity => Quantity::from("1.0001"),
+            _ => Quantity::from("1.000"),
+        });
+
+    if matches!(other_check, NativeCapitalOtherRiskCheck::Price) {
+        builder.price(Price::from("3000.001"));
+    }
+    let order = builder.build();
+    simple_cache
+        .add_order(order.clone(), None, Some(client_id_binance), false)
+        .unwrap();
+
+    let mut risk_engine =
+        get_risk_engine(Some(Rc::new(RefCell::new(simple_cache))), None, None, false);
+
+    if matches!(other_check, NativeCapitalOtherRiskCheck::Notional) {
+        risk_engine.set_max_notional_per_order(instrument_eth_usdt.id(), dec!(1));
+    }
+
+    if matches!(other_check, NativeCapitalOtherRiskCheck::TradingState) {
+        risk_engine.set_trading_state(TradingState::Halted);
+    }
+    let calls = Rc::new(Cell::new(0));
+    let delegate_calls = Rc::clone(&calls);
+    risk_engine
+        .register_native_capital_check(
+            account_id,
+            client_id_binance,
+            Rc::new(move |_| {
+                delegate_calls.set(delegate_calls.get() + 1);
+                NativeCapitalCheckDecision::Approved
+            }),
+        )
+        .unwrap();
+    let command = SubmitOrder::new(
+        trader_id,
+        Some(client_id_binance),
+        strategy_id_ema_cross,
+        instrument_eth_usdt.id(),
+        order.client_order_id(),
+        order.init_event().clone(),
+        None,
+        None,
+        None,
+        UUID4::new(),
+        risk_engine.clock().borrow().timestamp_ns(),
+        None,
+    );
+
+    risk_engine.execute(TradingCommand::SubmitOrder(command));
+
+    let denied = get_process_order_event_handler_messages(&process_order_event_handler);
+    let sent = get_execute_order_event_handler_messages(&execute_order_event_handler);
+    assert_eq!(calls.get(), usize::from(expected_delegate_call));
+    assert_eq!(denied.len(), 1);
+    assert!(denied[0].message().unwrap().starts_with(expected_denial));
+    assert!(sent.is_empty());
 }
 
 #[rstest]

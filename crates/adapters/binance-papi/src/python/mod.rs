@@ -30,7 +30,10 @@ use pyo3::prelude::*;
 use session::BinancePapiAccountSession;
 
 use crate::{
-    config::BinancePapiExecutionClientConfig,
+    config::{
+        BinancePapiExecutionClientConfig, BinancePapiInstrumentTradingConfig,
+        BinancePapiTradingConfig,
+    },
     consts::{BINANCE_PAPI, BINANCE_PAPI_CLIENT_ID, BINANCE_PAPI_VENUE},
     factories::BinancePapiExecutionClientFactory,
     read_only::{
@@ -66,6 +69,8 @@ pub fn binance_papi(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(stringify!(BINANCE_PAPI_CLIENT_ID), *BINANCE_PAPI_CLIENT_ID)?;
     m.add(stringify!(BINANCE_PAPI_VENUE), *BINANCE_PAPI_VENUE)?;
     m.add_class::<BinancePapiExecutionClientConfig>()?;
+    m.add_class::<BinancePapiInstrumentTradingConfig>()?;
+    m.add_class::<BinancePapiTradingConfig>()?;
     m.add_class::<BinancePapiExecutionClientFactory>()?;
     m.add_class::<BinancePapiReadOnlyConfig>()?;
     m.add_class::<BinancePapiReadOnlyClient>()?;

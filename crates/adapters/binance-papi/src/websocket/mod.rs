@@ -16,11 +16,15 @@
 //! Portfolio Margin private account-stream transport and recovery ownership.
 
 mod messages;
+mod reports;
 mod state;
 
 pub mod session;
 
-pub(crate) use session::PapiRecoveryBundle;
 pub use session::{
     BinancePapiAccountSession, BinancePapiRecoveryEvidence, BinancePapiSessionState,
+};
+pub(crate) use session::{
+    PapiApplicationAcknowledger, PapiApplicationCheckpoint, PapiIncrementalBundle,
+    PapiRecoveryBundle,
 };

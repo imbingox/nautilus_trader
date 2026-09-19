@@ -24,12 +24,20 @@ use std::{
 use aws_lc_rs::hmac;
 use binance_sdk::common::errors::ConnectorError;
 use nautilus_core::time::AtomicTime;
+use nautilus_live::execution::failure::CommandFailure;
+use nautilus_model::identifiers::ClientOrderId;
 use nautilus_network::ratelimiter::quota::Quota;
 use rstest::rstest;
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
 use crate::{
+    http::command::{
+        CancelUmOrderRequest, PapiCommandBuildError, PapiUmOrderSide, PapiUmTimeInForce,
+        SubmitUmOrderRequest,
+    },
     observations::ObservationSource,
     testing::{self, API_KEY, API_SECRET, MockServer, Reply},
 };
@@ -52,6 +60,10 @@ fn request() -> PapiRequest {
 }
 
 fn assert_signature(request: &testing::RecordedRequest) {
+    assert_command_signature(request, "GET");
+}
+
+fn assert_command_signature(request: &testing::RecordedRequest, method: &str) {
     let (canonical, signature) = request.query.rsplit_once("&signature=").unwrap();
     let key = hmac::Key::new(hmac::HMAC_SHA256, API_SECRET.as_bytes());
     let tag = hmac::sign(&key, canonical.as_bytes());
@@ -61,9 +73,604 @@ fn assert_signature(request: &testing::RecordedRequest) {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     assert_eq!(signature, expected);
-    assert_eq!(request.method, "GET");
+    assert_eq!(request.method, method);
     assert_eq!(request.api_key.as_deref(), Some(API_KEY));
     assert_eq!(request.params["recvWindow"], "5000");
+}
+
+fn market_request() -> SubmitUmOrderRequest {
+    SubmitUmOrderRequest::market(
+        "BTCUSDT",
+        PapiUmOrderSide::Buy,
+        dec!(0.0100),
+        ClientOrderId::new("strategy/A:1"),
+        false,
+    )
+    .unwrap()
+}
+
+fn limit_request() -> SubmitUmOrderRequest {
+    SubmitUmOrderRequest::limit(
+        "BTCUSDT",
+        PapiUmOrderSide::Sell,
+        dec!(0.0100),
+        dec!(28511.2300),
+        PapiUmTimeInForce::Gtx,
+        ClientOrderId::new("strategy/A:2"),
+        true,
+    )
+    .unwrap()
+}
+
+fn command_reply(request: &testing::RecordedRequest) -> Reply {
+    let order_id = request
+        .params
+        .get("orderId")
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(270_093_109);
+    let client_order_id = request
+        .params
+        .get("newClientOrderId")
+        .or_else(|| request.params.get("origClientOrderId"))
+        .cloned()
+        .unwrap_or_else(|| "venue-client-id".to_owned());
+    Reply::json(&serde_json::json!({
+        "symbol": request.params["symbol"],
+        "orderId": order_id,
+        "clientOrderId": client_order_id,
+    }))
+}
+
+#[rstest]
+#[case::symbol(
+    SubmitUmOrderRequest::market(
+        "BTC-USDT",
+        PapiUmOrderSide::Buy,
+        dec!(1),
+        ClientOrderId::new("valid"),
+        false,
+    ),
+    PapiCommandBuildError::Symbol
+)]
+#[case::client_order_id(
+    SubmitUmOrderRequest::market(
+        "BTCUSDT",
+        PapiUmOrderSide::Buy,
+        dec!(1),
+        ClientOrderId::new("invalid#id"),
+        false,
+    ),
+    PapiCommandBuildError::ClientOrderId
+)]
+#[case::quantity(
+    SubmitUmOrderRequest::market(
+        "BTCUSDT",
+        PapiUmOrderSide::Buy,
+        Decimal::ZERO,
+        ClientOrderId::new("valid"),
+        false,
+    ),
+    PapiCommandBuildError::Quantity
+)]
+#[case::price(
+    SubmitUmOrderRequest::limit(
+        "BTCUSDT",
+        PapiUmOrderSide::Buy,
+        dec!(1),
+        Decimal::ZERO,
+        PapiUmTimeInForce::Gtc,
+        ClientOrderId::new("valid"),
+        false,
+    ),
+    PapiCommandBuildError::Price
+)]
+fn command_construction_rejects_unsupported_wire_values(
+    #[case] result: Result<SubmitUmOrderRequest, PapiCommandBuildError>,
+    #[case] expected: PapiCommandBuildError,
+) {
+    assert_eq!(result.unwrap_err(), expected);
+}
+
+#[rstest]
+fn cancel_construction_requires_a_valid_identity() {
+    assert_eq!(
+        CancelUmOrderRequest::by_order_id("BTCUSDT", 0).unwrap_err(),
+        PapiCommandBuildError::OrderId
+    );
+    assert_eq!(
+        CancelUmOrderRequest::by_client_order_id("BTCUSDT", ClientOrderId::new("invalid#id"))
+            .unwrap_err(),
+        PapiCommandBuildError::ClientOrderId
+    );
+}
+
+#[tokio::test]
+async fn signed_limit_submit_preserves_exact_decimals_and_fixed_capabilities() {
+    let server = MockServer::new(command_reply).await;
+    let client = http(&server, testing::gate());
+    let response = client
+        .submit_um_order(&limit_request(), &budget(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(response.raw.metadata.endpoint, "/papi/v1/um/order");
+    assert_eq!(response.raw.metadata.symbol.as_deref(), Some("BTCUSDT"));
+    assert_eq!(response.raw.metadata.status, 200);
+    assert_eq!(response.acknowledgement.venue_order_id, 270_093_109);
+    assert_eq!(response.acknowledgement.client_order_id, "strategy/A:2");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_command_signature(request, "POST");
+    assert_eq!(request.path, "/papi/v1/um/order");
+    assert_eq!(request.params["symbol"], "BTCUSDT");
+    assert_eq!(request.params["side"], "SELL");
+    assert_eq!(request.params["positionSide"], "BOTH");
+    assert_eq!(request.params["type"], "LIMIT");
+    assert_eq!(request.params["timeInForce"], "GTX");
+    assert_eq!(request.params["quantity"], "0.0100");
+    assert_eq!(request.params["price"], "28511.2300");
+    assert_eq!(request.params["newClientOrderId"], "strategy/A:2");
+    assert_eq!(request.params["newOrderRespType"], "ACK");
+    assert_eq!(request.params["reduceOnly"], "true");
+    assert!(!request.params.contains_key("priceMatch"));
+    assert!(!request.params.contains_key("selfTradePreventionMode"));
+    assert!(!request.params.contains_key("goodTillDate"));
+}
+
+#[tokio::test]
+async fn signed_market_submit_omits_limit_only_parameters() {
+    let server = MockServer::new(command_reply).await;
+    let client = http(&server, testing::gate());
+    client
+        .submit_um_order(&market_request(), &budget(), &CancellationToken::new())
+        .await
+        .unwrap();
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_command_signature(request, "POST");
+    assert_eq!(request.params["type"], "MARKET");
+    assert_eq!(request.params["quantity"], "0.0100");
+    assert_eq!(request.params["reduceOnly"], "false");
+    assert!(!request.params.contains_key("price"));
+    assert!(!request.params.contains_key("timeInForce"));
+}
+
+#[tokio::test]
+async fn signed_cancel_encodes_exactly_one_order_identity() {
+    let server = MockServer::new(command_reply).await;
+    let client = http(&server, testing::gate());
+    let cancel = CancellationToken::new();
+    client
+        .cancel_um_order(
+            &CancelUmOrderRequest::by_order_id("BTCUSDT", 9_007_199_254_740_993).unwrap(),
+            &budget(),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    client
+        .cancel_um_order(
+            &CancelUmOrderRequest::by_client_order_id(
+                "BTCUSDT",
+                ClientOrderId::new("strategy/A:2"),
+            )
+            .unwrap(),
+            &budget(),
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_command_signature(&requests[0], "DELETE");
+    assert_eq!(requests[0].params["orderId"], "9007199254740993");
+    assert!(!requests[0].params.contains_key("origClientOrderId"));
+    assert_command_signature(&requests[1], "DELETE");
+    assert_eq!(requests[1].params["origClientOrderId"], "strategy/A:2");
+    assert!(!requests[1].params.contains_key("orderId"));
+}
+
+#[rstest]
+#[case(-1000)]
+#[case(-1001)]
+#[case(-1006)]
+#[case(-1007)]
+#[tokio::test]
+async fn uncertain_venue_codes_are_ambiguous_and_not_retried(#[case] code: i64) {
+    let server =
+        MockServer::new(move |_| Reply::raw(400, format!(r#"{{"code":{code},"msg":"unknown"}}"#)))
+            .await;
+    let failure = http(&server, testing::gate())
+        .submit_um_order(&market_request(), &budget(), &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        failure.classification,
+        CommandFailure::Ambiguous(_)
+    ));
+    assert!(matches!(
+        failure.error,
+        PapiHttpError::Rejected {
+            status: Some(400),
+            code: Some(actual),
+        } if actual == code
+    ));
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[rstest]
+#[case(-2011)]
+#[case(-2013)]
+#[tokio::test]
+async fn cancel_not_found_codes_are_ambiguous_and_not_retried(#[case] code: i64) {
+    let server = MockServer::new(move |_| {
+        Reply::raw(400, format!(r#"{{"code":{code},"msg":"cancel rejected"}}"#))
+    })
+    .await;
+    let failure = http(&server, testing::gate())
+        .cancel_um_order(
+            &CancelUmOrderRequest::by_order_id("BTCUSDT", 270_093_109).unwrap(),
+            &budget(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        failure.classification,
+        CommandFailure::Ambiguous(_)
+    ));
+    assert!(matches!(
+        failure.error,
+        PapiHttpError::Rejected {
+            status: Some(400),
+            code: Some(actual),
+        } if actual == code
+    ));
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn explicit_submit_rejection_is_classified_from_typed_venue_evidence() {
+    let server =
+        MockServer::new(|_| Reply::raw(400, r#"{"code":-2010,"msg":"NEW_ORDER_REJECTED"}"#)).await;
+    let failure = http(&server, testing::gate())
+        .submit_um_order(&market_request(), &budget(), &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        failure.classification,
+        CommandFailure::VenueRejected(_)
+    ));
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[rstest]
+#[case(r#"{"msg":"Unknown error, please check your request or try again later."}"#)]
+#[case(r#"{"msg":"Service Unavailable."}"#)]
+#[case(r#"{"msg":"Internal error; unable to process your request."}"#)]
+#[tokio::test]
+async fn sdk_erases_503_variants_so_every_command_outcome_is_ambiguous(#[case] body: &str) {
+    let body = body.to_string();
+    let server = MockServer::new(move |_| Reply::raw(503, body.clone())).await;
+    let failure = http(&server, testing::gate())
+        .submit_um_order(&market_request(), &budget(), &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        failure.classification,
+        CommandFailure::Ambiguous(_)
+    ));
+    assert_eq!(failure.error, PapiHttpError::Server(503));
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn command_decode_failure_after_2xx_is_ambiguous_and_not_retried() {
+    let server = MockServer::new(|_| Reply::raw(200, "{")).await;
+    let failure = http(&server, testing::gate())
+        .submit_um_order(&market_request(), &budget(), &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        failure.classification,
+        CommandFailure::Ambiguous(_)
+    ));
+    assert_eq!(failure.error, PapiHttpError::Decode);
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn command_response_loss_after_dispatch_is_ambiguous_and_not_retried() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = testing::config(&format!("http://{}", listener.local_addr().unwrap()));
+    let serve = async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut data = [0; 4_096];
+        let received = stream.read(&mut data).await.unwrap();
+        assert!(received > 0);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 200\r\nConnection: close\r\n\r\n{}")
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+    };
+
+    let task = tokio::spawn(serve); // tokio-import-ok
+    let client =
+        PapiHttpClient::new(&config, testing::gate(), Arc::new(AtomicTime::default())).unwrap();
+    let failure = client
+        .submit_um_order(&market_request(), &budget(), &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        failure.classification,
+        CommandFailure::Ambiguous(_)
+    ));
+    assert_eq!(failure.error, PapiHttpError::Sdk);
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn command_timeout_after_dispatch_is_ambiguous_and_not_retried() {
+    let server = MockServer::new(|_| {
+        let mut reply = Reply::raw(200, "{}");
+        reply.delay = Duration::from_secs(2);
+        reply
+    })
+    .await;
+    let mut config = testing::config(&server.url);
+    config.request_timeout = Duration::from_millis(50);
+    let client =
+        PapiHttpClient::new(&config, testing::gate(), Arc::new(AtomicTime::default())).unwrap();
+    let failure = client
+        .submit_um_order(&market_request(), &budget(), &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        failure.classification,
+        CommandFailure::Ambiguous(_)
+    ));
+    assert_eq!(failure.error, PapiHttpError::Timeout);
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn command_cancellation_before_dispatch_is_not_sent() {
+    let server = MockServer::new(|_| Reply::raw(200, "{}")).await;
+    let token = CancellationToken::new();
+    token.cancel();
+    let failure = http(&server, testing::gate())
+        .submit_um_order(&market_request(), &budget(), &token)
+        .await
+        .unwrap_err();
+    assert!(matches!(failure.classification, CommandFailure::NotSent(_)));
+    assert_eq!(failure.error, PapiHttpError::Canceled);
+    assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn failed_durable_barrier_sends_nothing() {
+    let server = MockServer::new(|_| Reply::raw(200, "{}")).await;
+    let invoked = Arc::new(AtomicUsize::new(0));
+    let barrier_invoked = Arc::clone(&invoked);
+    let error = http(&server, testing::gate())
+        .submit_um_order_with_barrier(
+            &market_request(),
+            &budget(),
+            &CancellationToken::new(),
+            move || {
+                barrier_invoked.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("offline durability fault")
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, PapiCommandDispatchError::Barrier(_)));
+    assert_eq!(invoked.load(Ordering::SeqCst), 1);
+    assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn durable_barrier_runs_only_after_all_quota_waits() {
+    let server = MockServer::new(|_| Reply::raw(200, "{}")).await;
+    let gate = Arc::new(RequestGate::with_order_quota(
+        Quota::per_minute(std::num::NonZeroU32::new(100).unwrap())
+            .allow_burst(std::num::NonZeroU32::new(10).unwrap()),
+        Quota::with_period(Duration::from_secs(10))
+            .unwrap()
+            .allow_burst(std::num::NonZeroU32::new(1).unwrap()),
+    ));
+    gate.order_limiter.await_keys_ready(Some(&[()])).await;
+    let client = http(&server, gate);
+    let token = CancellationToken::new();
+    let cancel = token.clone();
+    let invoked = Arc::new(AtomicUsize::new(0));
+    let barrier_invoked = Arc::clone(&invoked);
+    let request = market_request();
+    let budget = budget();
+    let future = client.submit_um_order_with_barrier(&request, &budget, &token, move || {
+        barrier_invoked.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    tokio::pin!(future);
+
+    tokio::select! {
+        biased;
+        result = &mut future => panic!("Unexpected command completion: {result:?}"),
+        () = tokio::time::sleep(Duration::from_millis(5)) => {}
+    }
+
+    assert_eq!(invoked.load(Ordering::SeqCst), 0);
+    cancel.cancel();
+    let error = future.await.unwrap_err();
+    assert!(matches!(
+        error,
+        PapiCommandDispatchError::Command(PapiCommandFailure {
+            classification: CommandFailure::NotSent(_),
+            ..
+        })
+    ));
+    assert_eq!(invoked.load(Ordering::SeqCst), 0);
+    assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn command_cancellation_after_dispatch_is_ambiguous_and_not_retried() {
+    let server = MockServer::new(|_| {
+        let mut reply = Reply::raw(200, "{}");
+        reply.delay = Duration::from_secs(2);
+        reply
+    })
+    .await;
+    let client = http(&server, testing::gate());
+    let token = CancellationToken::new();
+    let cancel = token.clone();
+
+    let operation = async move {
+        client
+            .submit_um_order(&market_request(), &budget(), &token)
+            .await
+    };
+
+    let task = tokio::spawn(operation); // tokio-import-ok
+    server.wait_for_requests(1).await;
+    cancel.cancel();
+    let failure = task.await.unwrap().unwrap_err();
+    assert!(matches!(
+        failure.classification,
+        CommandFailure::Ambiguous(_)
+    ));
+    assert_eq!(failure.error, PapiHttpError::Canceled);
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn submit_waiting_for_account_order_quota_can_be_canceled_without_dispatch() {
+    let server = MockServer::new(|_| Reply::raw(200, "{}")).await;
+    let gate = Arc::new(RequestGate::with_order_quota(
+        Quota::per_minute(std::num::NonZeroU32::new(100).unwrap())
+            .allow_burst(std::num::NonZeroU32::new(10).unwrap()),
+        Quota::with_period(Duration::from_secs(10))
+            .unwrap()
+            .allow_burst(std::num::NonZeroU32::new(1).unwrap()),
+    ));
+    gate.order_limiter.await_keys_ready(Some(&[()])).await;
+    let client = http(&server, gate);
+    let token = CancellationToken::new();
+    let cancel = token.clone();
+    let request = market_request();
+    let budget = budget();
+    let future = client.submit_um_order(&request, &budget, &token);
+    tokio::pin!(future);
+
+    tokio::select! {
+        biased;
+        result = &mut future => panic!("Unexpected command completion: {result:?}"),
+        () = tokio::time::sleep(Duration::from_millis(5)) => {}
+    }
+
+    cancel.cancel();
+    let failure = future.await.unwrap_err();
+    assert!(matches!(failure.classification, CommandFailure::NotSent(_)));
+    assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn cancel_does_not_consume_the_new_order_quota() {
+    let server = MockServer::new(|_| Reply::json(&testing::order())).await;
+    let gate = Arc::new(RequestGate::with_order_quota(
+        Quota::per_minute(std::num::NonZeroU32::new(100).unwrap())
+            .allow_burst(std::num::NonZeroU32::new(10).unwrap()),
+        Quota::with_period(Duration::from_secs(10))
+            .unwrap()
+            .allow_burst(std::num::NonZeroU32::new(1).unwrap()),
+    ));
+    gate.order_limiter.await_keys_ready(Some(&[()])).await;
+    let client = http(&server, gate);
+    client
+        .cancel_um_order(
+            &CancelUmOrderRequest::by_order_id("BTCUSDT", 270_093_109).unwrap(),
+            &budget(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn rejected_submit_conservatively_consumes_the_account_order_quota() {
+    let server =
+        MockServer::new(|_| Reply::raw(400, r#"{"code":-2010,"msg":"NEW_ORDER_REJECTED"}"#)).await;
+    let gate = Arc::new(RequestGate::with_order_quota(
+        Quota::per_minute(std::num::NonZeroU32::new(100).unwrap())
+            .allow_burst(std::num::NonZeroU32::new(10).unwrap()),
+        Quota::with_period(Duration::from_secs(10))
+            .unwrap()
+            .allow_burst(std::num::NonZeroU32::new(1).unwrap()),
+    ));
+    let client = http(&server, gate);
+    let first = client
+        .submit_um_order(&market_request(), &budget(), &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        first.classification,
+        CommandFailure::VenueRejected(_)
+    ));
+
+    let token = CancellationToken::new();
+    let cancel = token.clone();
+    let request = market_request();
+    let budget = budget();
+    let future = client.submit_um_order(&request, &budget, &token);
+    tokio::pin!(future);
+
+    tokio::select! {
+        biased;
+        result = &mut future => panic!("Unexpected command completion: {result:?}"),
+        () = tokio::time::sleep(Duration::from_millis(5)) => {}
+    }
+
+    cancel.cancel();
+    let second = future.await.unwrap_err();
+    assert!(matches!(second.classification, CommandFailure::NotSent(_)));
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[rstest]
+#[case(418)]
+#[case(429)]
+#[tokio::test]
+async fn command_throttle_is_ambiguous_and_latches_the_shared_gate(#[case] status: u16) {
+    let server =
+        MockServer::new(move |_| Reply::raw(status, r#"{"code":-1003,"msg":"Too many requests"}"#))
+            .await;
+    let gate = testing::gate();
+    let client = http(&server, Arc::clone(&gate));
+    let first = client
+        .submit_um_order(&market_request(), &budget(), &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(first.classification, CommandFailure::Ambiguous(_)));
+    assert!(matches!(first.error, PapiHttpError::Throttled { .. }));
+
+    let second = http(&server, gate)
+        .cancel_um_order(
+            &CancelUmOrderRequest::by_order_id("BTCUSDT", 270_093_109).unwrap(),
+            &budget(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(second.classification, CommandFailure::NotSent(_)));
+    assert_eq!(second.error, PapiHttpError::GateClosed);
+    assert_eq!(server.requests().len(), 1);
 }
 
 #[tokio::test]

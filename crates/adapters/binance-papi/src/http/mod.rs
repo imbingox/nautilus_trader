@@ -13,8 +13,9 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Signed GET transport using the pinned SDK and Nautilus request policy.
+//! Signed PAPI transport using the pinned SDK and Nautilus request policy.
 
+pub(crate) mod command;
 pub(crate) mod error;
 pub(crate) mod query;
 
@@ -48,13 +49,23 @@ use nautilus_network::{
 };
 use serde::Serialize;
 use serde_json::value::RawValue;
+use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use self::{error::PapiHttpError, query::PapiRequest};
+use self::{
+    command::{
+        CancelUmOrderRequest, PapiCommandAcknowledgement, PapiCommandFailure, PapiCommandRequest,
+        SubmitUmOrderRequest, UM_ORDER_ENDPOINT,
+    },
+    error::PapiHttpError,
+    query::PapiRequest,
+};
 use crate::{observations::MAX_RESPONSE_BYTES, read_only::BinancePapiReadOnlyConfig};
 
 const WEIGHT_PER_MINUTE: NonZeroU32 = NonZeroU32::new(3_000).expect("Positive request quota");
 const WEIGHT_BURST: NonZeroU32 = NonZeroU32::new(40).expect("Positive request burst");
+const ORDERS_PER_MINUTE: NonZeroU32 = NonZeroU32::new(1_000).expect("Positive order quota");
+const ORDER_BURST: NonZeroU32 = NonZeroU32::new(20).expect("Positive order burst");
 const LISTEN_KEY_ENDPOINT: &str = "/papi/v1/listenKey";
 
 // A strong process-wide owner preserves quota and a throttle latch across client reconstruction
@@ -69,7 +80,7 @@ static SHARED_GATE: LazyLock<Arc<RequestGate>> = LazyLock::new(|| {
 /// Only numeric quota headers are exposed. Error headers are unavailable in SDK 69.2.1.
 #[derive(Clone, Debug, Serialize)]
 pub struct BinancePapiResponseMetadata {
-    /// The exact GET endpoint version.
+    /// The exact endpoint version.
     pub endpoint: &'static str,
     /// The requested symbol, when the endpoint is symbol-scoped.
     pub symbol: Option<String>,
@@ -147,6 +158,10 @@ impl PapiHttpClient {
         self.gate.closed.is_cancelled()
     }
 
+    pub(crate) fn now(&self) -> UnixNanos {
+        self.clock.get_time_ns()
+    }
+
     pub(crate) async fn get(
         &self,
         request: &PapiRequest,
@@ -178,6 +193,214 @@ impl PapiHttpClient {
             .await?;
         budget.check()?;
         Ok(response)
+    }
+
+    pub(crate) async fn submit_um_order_with_barrier<F>(
+        &self,
+        request: &SubmitUmOrderRequest,
+        budget: &RequestBudget,
+        cancel: &CancellationToken,
+        barrier: F,
+    ) -> Result<PapiCommandResponse, PapiCommandDispatchError>
+    where
+        F: FnOnce() -> anyhow::Result<()>,
+    {
+        self.command_with_barrier(PapiCommandRequest::Submit(request), budget, cancel, barrier)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn submit_um_order(
+        &self,
+        request: &SubmitUmOrderRequest,
+        budget: &RequestBudget,
+        cancel: &CancellationToken,
+    ) -> Result<PapiCommandResponse, PapiCommandFailure> {
+        self.submit_um_order_with_barrier(request, budget, cancel, || Ok(()))
+            .await
+            .map_err(PapiCommandDispatchError::into_command_failure)
+    }
+
+    pub(crate) async fn cancel_um_order_with_barrier<F>(
+        &self,
+        request: &CancelUmOrderRequest,
+        budget: &RequestBudget,
+        cancel: &CancellationToken,
+        barrier: F,
+    ) -> Result<PapiCommandResponse, PapiCommandDispatchError>
+    where
+        F: FnOnce() -> anyhow::Result<()>,
+    {
+        self.command_with_barrier(PapiCommandRequest::Cancel(request), budget, cancel, barrier)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn cancel_um_order(
+        &self,
+        request: &CancelUmOrderRequest,
+        budget: &RequestBudget,
+        cancel: &CancellationToken,
+    ) -> Result<PapiCommandResponse, PapiCommandFailure> {
+        self.cancel_um_order_with_barrier(request, budget, cancel, || Ok(()))
+            .await
+            .map_err(PapiCommandDispatchError::into_command_failure)
+    }
+
+    async fn command_with_barrier<F>(
+        &self,
+        request: PapiCommandRequest<'_>,
+        budget: &RequestBudget,
+        cancel: &CancellationToken,
+        barrier: F,
+    ) -> Result<PapiCommandResponse, PapiCommandDispatchError>
+    where
+        F: FnOnce() -> anyhow::Result<()>,
+    {
+        let requested_at = Instant::now();
+        budget
+            .charge_request()
+            .map_err(PapiCommandFailure::before_dispatch)
+            .map_err(PapiCommandDispatchError::Command)?;
+
+        let permit = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                return Err(PapiCommandFailure::before_dispatch(PapiHttpError::Canceled).into());
+            }
+            () = self.gate.closed.cancelled() => {
+                return Err(PapiCommandFailure::before_dispatch(PapiHttpError::GateClosed).into());
+            }
+            permit = self.gate.concurrent.acquire() => {
+                permit
+                    .map_err(|_| PapiCommandFailure::before_dispatch(PapiHttpError::GateClosed))
+                    .map_err(PapiCommandDispatchError::Command)?
+            }
+        };
+        let weight_keys = [()];
+
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                return Err(PapiCommandFailure::before_dispatch(PapiHttpError::Canceled).into());
+            }
+            () = self.gate.closed.cancelled() => {
+                return Err(PapiCommandFailure::before_dispatch(PapiHttpError::GateClosed).into());
+            }
+            () = self.gate.limiter.await_keys_ready(Some(&weight_keys)) => {}
+        }
+
+        if request.uses_order_quota() {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    return Err(PapiCommandFailure::before_dispatch(PapiHttpError::Canceled).into());
+                }
+                () = self.gate.closed.cancelled() => {
+                    return Err(PapiCommandFailure::before_dispatch(PapiHttpError::GateClosed).into());
+                }
+                () = self.gate.order_limiter.await_keys_ready(Some(&weight_keys)) => {}
+            }
+        }
+
+        budget
+            .check()
+            .map_err(PapiCommandFailure::before_dispatch)
+            .map_err(PapiCommandDispatchError::Command)?;
+
+        if cancel.is_cancelled() {
+            return Err(PapiCommandFailure::before_dispatch(PapiHttpError::Canceled).into());
+        }
+
+        if self.gate.closed.is_cancelled() {
+            return Err(PapiCommandFailure::before_dispatch(PapiHttpError::GateClosed).into());
+        }
+
+        // This synchronous durability barrier is the final fallible step before socket dispatch.
+        barrier().map_err(PapiCommandDispatchError::Barrier)?;
+
+        let result = tokio::select! {
+            biased;
+            result = timeout(
+                self.request_timeout,
+                self.send_command(&request, requested_at),
+            ) => result.unwrap_or(Err(PapiHttpError::Timeout)),
+            () = cancel.cancelled() => Err(PapiHttpError::Canceled),
+        };
+
+        if matches!(result, Err(PapiHttpError::Throttled { .. })) {
+            self.gate.closed.cancel();
+        }
+
+        drop(permit);
+        let raw = result
+            .map_err(|e| PapiCommandFailure::after_dispatch(&request, e))
+            .map_err(PapiCommandDispatchError::Command)?;
+        let acknowledgement = PapiCommandAcknowledgement::decode(&request, raw.body.get())
+            .map_err(|e| PapiCommandFailure::after_dispatch(&request, e))
+            .map_err(PapiCommandDispatchError::Command)?;
+        Ok(PapiCommandResponse {
+            raw,
+            acknowledgement,
+        })
+    }
+
+    async fn send_command(
+        &self,
+        request: &PapiCommandRequest<'_>,
+        requested_at: Instant,
+    ) -> Result<RawResponse, PapiHttpError> {
+        let ts_requested = self.clock.get_time_ns();
+        let response = self
+            .sdk
+            .send_signed_request::<Box<RawValue>>(
+                UM_ORDER_ENDPOINT,
+                request.method(),
+                request.params(),
+                BTreeMap::new(),
+            )
+            .await
+            .map_err(|e| PapiHttpError::from_sdk(&e))?;
+
+        if !(200..300).contains(&response.status) {
+            return Err(PapiHttpError::Rejected {
+                status: Some(response.status),
+                code: None,
+            });
+        }
+
+        let received_at = Instant::now();
+        let metadata = BinancePapiResponseMetadata {
+            endpoint: UM_ORDER_ENDPOINT,
+            symbol: Some(request.symbol().to_owned()),
+            status: response.status,
+            ts_requested,
+            ts_received: self.clock.get_time_ns(),
+            used_weight_1m: response
+                .headers
+                .get("x-mbx-used-weight-1m")
+                .and_then(|v| v.parse().ok()),
+            order_count_1m: response
+                .headers
+                .get("x-mbx-order-count-1m")
+                .and_then(|v| v.parse().ok()),
+            retry_after_seconds: response
+                .headers
+                .get("retry-after")
+                .and_then(|v| v.parse().ok()),
+        };
+        let body = response.data().await.map_err(|_| PapiHttpError::Decode)?;
+
+        if body.get().len() > MAX_RESPONSE_BYTES {
+            return Err(PapiHttpError::ResponseTooLarge);
+        }
+
+        Ok(RawResponse {
+            body,
+            metadata,
+            requested_at,
+            received_at,
+        })
     }
 
     pub(crate) async fn create_listen_key(
@@ -452,6 +675,38 @@ impl PapiHttpClient {
     }
 }
 
+/// Failure from the quota-to-dispatch boundary.
+#[derive(Debug, Error)]
+pub(crate) enum PapiCommandDispatchError {
+    #[error("{0:?}")]
+    Command(PapiCommandFailure),
+    #[error("PAPI durable dispatch barrier failed")]
+    Barrier(#[source] anyhow::Error),
+}
+
+/// A validated write acknowledgement and its transport metadata.
+#[derive(Debug)]
+pub(crate) struct PapiCommandResponse {
+    pub(crate) raw: RawResponse,
+    pub(crate) acknowledgement: PapiCommandAcknowledgement,
+}
+
+impl From<PapiCommandFailure> for PapiCommandDispatchError {
+    fn from(value: PapiCommandFailure) -> Self {
+        Self::Command(value)
+    }
+}
+
+#[cfg(test)]
+impl PapiCommandDispatchError {
+    fn into_command_failure(self) -> PapiCommandFailure {
+        match self {
+            Self::Command(failure) => failure,
+            Self::Barrier(error) => panic!("test command barrier unexpectedly failed: {error}"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ListenKeyOperation {
     Create,
@@ -547,14 +802,23 @@ impl Debug for RawResponse {
 #[derive(Debug)]
 pub(crate) struct RequestGate {
     limiter: RateLimiter<(), MonotonicClock>,
+    order_limiter: RateLimiter<(), MonotonicClock>,
     concurrent: tokio::sync::Semaphore,
     closed: CancellationToken,
 }
 
 impl RequestGate {
     pub(crate) fn new(quota: Quota) -> Self {
+        Self::with_order_quota(
+            quota,
+            Quota::per_minute(ORDERS_PER_MINUTE).allow_burst(ORDER_BURST),
+        )
+    }
+
+    fn with_order_quota(quota: Quota, order_quota: Quota) -> Self {
         Self {
             limiter: RateLimiter::new_with_quota(Some(quota), vec![]),
+            order_limiter: RateLimiter::new_with_quota(Some(order_quota), vec![]),
             concurrent: tokio::sync::Semaphore::new(4),
             closed: CancellationToken::new(),
         }

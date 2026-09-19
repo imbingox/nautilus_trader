@@ -226,6 +226,11 @@ impl ExecutionHarness {
     ///
     /// Returns an error when the engine already contains the client ID or venue route.
     pub fn register_client(&self, client: Box<dyn ExecutionClient>) -> anyhow::Result<()> {
+        if let Some(check) = client.native_capital_check() {
+            self.risk_engine
+                .borrow_mut()
+                .register_native_capital_check(client.account_id(), client.client_id(), check)?;
+        }
         self.exec_engine.borrow_mut().register_client(client)
     }
 

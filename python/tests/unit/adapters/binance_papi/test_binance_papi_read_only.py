@@ -41,10 +41,12 @@ from urllib.parse import urlsplit
 import pytest
 from unit.adapters.example_modules import load_example_module
 
+from nautilus_trader.adapters.binance import BinanceDataClientConfig
 from nautilus_trader.common import Environment
 from nautilus_trader.live import LiveNode
 from nautilus_trader.model import AccountId
 from nautilus_trader.model import ClientOrderId
+from nautilus_trader.model import CryptoPerpetual
 from nautilus_trader.model import ExecutionMassStatus
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import OrderStatusReport
@@ -367,6 +369,34 @@ def test_acceptance_receipt_age_is_validated_before_queries(max_receipt_age_ms: 
                 ),
             )
         assert requests == []
+
+
+def test_acceptance_scope_uses_the_private_config_proxy_for_public_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Route public instrument metadata through the explicitly configured proxy.
+    """
+    example = load_example_module("binance_papi", "read_only_acceptance")
+    instrument = TestInstrumentProvider.btcusdt_perp_binance()
+    observed_configs: list[BinanceDataClientConfig] = []
+
+    async def load_instruments(config: BinanceDataClientConfig) -> list[CryptoPerpetual]:
+        observed_configs.append(config)
+        return [instrument]
+
+    monkeypatch.setattr(example, "load_binance_instruments", load_instruments)
+    loaded = asyncio.run(
+        example._load_scope(
+            [instrument.id],
+            None,
+            "http://127.0.0.1:7897",
+        ),
+    )
+
+    assert loaded == [instrument]
+    assert len(observed_configs) == 1
+    assert observed_configs[0].has_proxy_url is True
 
 
 def test_python_failed_single_order_query_never_becomes_none() -> None:

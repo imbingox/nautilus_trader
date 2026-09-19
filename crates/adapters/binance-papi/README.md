@@ -1,7 +1,7 @@
 # nautilus-binance-papi
 
 Binance Portfolio Margin (PAPI) adapter for NautilusTrader, with Rust and Python private account
-observation and read-only queries.
+observation, read-only queries, and an explicit ordinary UM command lifecycle.
 The client collects exact account observations and
 ordinary/algo order, fill, and one-way UM position reports through signed GET requests.
 The read-only account projection is implemented and has authenticated supported-account acceptance.
@@ -13,13 +13,18 @@ Factory-created Rust clients can generate scoped reports after `start()` when co
 remain unavailable because their interface cannot express incomplete coverage. The factory's
 mass status defaults to a sixty-minute lookback and preserves the configured client identity.
 Position reports support current observations only; historical position filters fail explicitly.
+`QueryOrder` runs as a managed GET-only task and emits one authoritative `OrderStatusReport` when
+the venue response can be verified; failures and not-found responses never become absence evidence.
 
 With explicit credentials and preloaded instrument scope, the execution client starts a private
 account stream before collecting its REST baseline. It publishes the reported totals-only account
-state and uses bounded mass status recovery for later transport gaps. Connection, synchronization,
-and trading authorization remain separate; this stage never authorizes trading, and every
-submit/modify/cancel path rejects the command. Construction performs no network requests. Cleanup
-is idempotent, bounded, and a later start uses a new cancellation domain.
+state, delivers deduplicated ordinary order/fill updates as typed execution reports, and uses
+bounded mass status recovery for account changes and later transport gaps. Connection,
+synchronization, delivery, application, and trading authorization remain separate. Trading is
+default-off. With explicit trading configuration, supported commands use durable admission and
+single-dispatch transport, but increase-risk submission remains fail-closed until authenticated PM
+risk evidence is installed. Construction performs no network requests. Cleanup is idempotent,
+bounded, and a later start uses a new cancellation domain.
 
 The independent factory name and default client ID are `BINANCE_PAPI`. Instrument venue
 remains `BINANCE`. The default account ID is `BINANCE-PAPI-001`, keeping its issuer
@@ -27,22 +32,131 @@ aligned with the venue used by the core account cache. Use `BinanceDataClientFac
 `load_binance_instruments` from `nautilus_trader.adapters.binance` for existing public
 market data and instrument loading. No Binance code is copied or reconfigured by this adapter.
 
+## Trading command contract
+
+The durable operation ledger, account-level admission coordinator, quota-to-dispatch durability
+barrier, typed ordinary UM write transport, and execution-engine application acknowledgment are
+connected. Constructing a `BinancePapiTradingConfig` enables only this command machinery; it does
+not make the client trading-ready or synthesize admission evidence. Production increase-risk
+submission remains fail-closed until authenticated PM semantics produce a current
+`PapiVerifiedRiskSnapshot`. Offline tests use provenance-tagged synthetic evidence.
+
+The first command scope is fixed as follows. `QueryOrder` is connected through the read-only report
+path. State-changing commands use the same coordinator for RiskEngine admission and the final
+adapter check, then emit native lifecycle events from confirmed outcomes.
+
+| Nautilus command    | PAPI operation                         | Required wire identity and parameters                                                                                                                                                                      | Required native result                                                                                                                                  |
+| ------------------- | -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SubmitOrder`       | `POST /papi/v1/um/order`               | Explicit allowlisted symbol, side, `MARKET` or `LIMIT`, exact base quantity, client order ID, and `reduceOnly`; LIMIT additionally requires exact price and GTC/IOC/FOK, with post-only mapped only to GTX | Local denial before dispatch, or native submitted/accepted/rejected/order facts according to confirmed evidence; an ambiguous result remains unresolved |
+| `QueryOrder`        | `GET /papi/v1/um/order`                | Exactly one scoped symbol plus venue order ID or original client order ID                                                                                                                                  | One `OrderStatusReport`, or a distinct query failure/not-found result                                                                                   |
+| `CancelOrder`       | `DELETE /papi/v1/um/order`             | Scoped symbol plus venue order ID or original client order ID                                                                                                                                              | Native cancel/final-order fact only when confirmed; an ambiguous result remains unresolved                                                              |
+| `BatchCancelOrders` | Bounded per-order DELETE orchestration | A fixed, validated set of owned ordinary UM orders                                                                                                                                                         | One result per target; no atomic-success claim                                                                                                          |
+| `CancelAllOrders`   | Bounded per-order DELETE orchestration | A fixed snapshot honoring the command's account, instrument, and side filters                                                                                                                              | One result per target; no wider venue cancel-all request                                                                                                |
+
+`SubmitOrderList`, modify and cancel-replace commands, conditional/algo creation, OCO/OTO,
+trailing, GTD, `closePosition`, quote-quantity, hedge-mode, CM/margin trading, transfers, borrowing,
+leverage changes, and account-mode changes are outside this scope. Unsupported commands or field
+combinations must fail before a trading HTTP request is made; fields must never be ignored or
+silently downgraded. Observed algo orders remain part of reconciliation but are not tradable.
+
+### Trading configuration boundary
+
+`BinancePapiExecutionClientConfig.trading` defaults to `None`. An explicit trading configuration is
+accepted only when all of these static conditions hold:
+
+- Every trading instrument has unique positive Decimal limits for one order, absolute position,
+  order notional, and total instrument exposure. The trading allowlist must be a subset of the
+  complete report scope.
+- All configured notionals share one explicit `risk_currency`. An instrument's actual settlement
+  asset and every conversion input must later be verified against this unit. Instruments settled in
+  another asset cannot inherit this authorization.
+- Account exposure, in-flight operations, risk age and collection span, recovery requests and
+  rounds, recheck interval, adverse market-price buffer, and fee buffer are finite and positive.
+- The command journal uses an explicit absolute file path with an existing parent directory. Client
+  startup opens an account-bound, checksummed append-only journal under an exclusive process lock;
+  corrupt state, an account mismatch, or an uncertain durability result fails closed. The
+  coordinator reconstructs exact quantity, notional, exposure, and initial-margin reservations;
+  unresolved restart state blocks new increase-risk admission.
+- Read-only credentials and the shared request budget are present. Recovery cannot configure more
+  requests than that shared budget permits.
+
+Decimal limits serialize as strings and Python accepts `decimal.Decimal`; no amount passes through
+`f64`. These are independent hard ceilings. Reconciliation or installation of a new risk baseline
+must not reset position, exposure, or in-flight limits.
+
+### PM risk semantics required before admission
+
+The existing PM risk observation being `available` means only that its source was readable. It does
+not establish a trading unit, incremental-margin formula, or buying power. Admission remains closed
+until authenticated evidence verifies the account status and one-way mode, the selected risk
+currency, each required source field and unit, bracket/rule inputs, market-price source, source
+generation, receipt age, and collection span.
+
+The admission coordinator calculates its conservative order estimate from exact base quantity and
+a fresh adverse buffered reference price, then adds the configured fee reserve. It accounts for
+current position, same-direction open and unresolved operations, and a provenance-tagged PM
+incremental-margin rule. Opposite open orders do not offset this exposure. Missing or stale prices,
+rules, conversions, units, source fields, or unsupported nonzero product exposure close
+increase-risk admission. A market estimate is a risk bound, not an execution-price guarantee.
+
+The meaning and units of `accountInitialMargin`, `totalAvailableBalance`, and related PM fields have
+not yet been accepted as sufficient admission evidence. No fallback uses withdrawal capacity,
+totals-only wallet `free`, `accountEquity - accountMaintMargin`, or an arbitrary leverage divisor.
+Until the required semantics are verified and mapped into the coordinator, configured trading
+permission, current increase-risk permission, targeted cancellation permission, and safe
+reduce-only permission all remain separate states; none can be inferred from `is_connected` or
+`is_synchronized`.
+
+The core risk engine has a generic totals-only native-capital delegation point bound to the exact
+account and cached execution-client route. It does not bypass instrument, price, quantity,
+notional, trading-state, or rate checks, and an absent or mismatched provider still fails closed.
+PAPI deliberately does not register a provider until the authenticated PM units and formulas above
+can populate the verified risk snapshot; configuration alone cannot activate the delegation.
+
+On restart, a trading-configured client holds the journal lock before becoming started. Its
+coordinator keeps every unresolved reservation and runs only bounded targeted GET recovery during
+connection. A matching authoritative report can advance an operation to observed or terminal.
+Repeated `-2011`/`-2013`, query failures, or an exhausted recovery budget remain ambiguous, retain
+the reservation, and keep increase-risk admission restricted. Recovery never replays an unknown
+POST.
+
+Offline command verification enforces the authenticated instrument trading state, settlement
+currency, tick/step alignment, quantity, price and notional bounds before durable preparation.
+Targeted cancellation and cancel-all planning accept only ordinary UM orders whose ownership is
+established by the journal; a verified open-order row cannot adopt an external order. Cancel-all
+freezes a sorted account/strategy/instrument/side target set, and batch cancellation dispatches the
+prepared set one request at a time with an independent result per target. An empty target set is an
+error and no venue-wide cancel-all endpoint is used.
+
+Risk rebaseline is a generation-bound durable transition. It requires an explicitly applied fact
+checkpoint, a newer complete risk snapshot, no possibly dispatched or pending cancel operation,
+and exact open-order coverage for every observed submit before ending its reservations. Repeated
+rebaseline cannot reset position, open-order, instrument-exposure, or account-exposure limits.
+
 ## Private-stream capability matrix
 
-| Source or event                                                         | Observation behavior                                                                                                                             |
-| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| listen key POST/PUT/DELETE                                              | API-key authenticated lifecycle with empty-response support; no signed query or arbitrary write surface.                                         |
-| `ORDER_TRADE_UPDATE`                                                    | Retains order identity and cumulative state; a fill requires trade ID, quantity, price, signed native commission, currency, liquidity, and time. |
-| `ALGO_UPDATE`                                                           | Accepts the current `ao` UM one-way schema and retains parent/child identity; legacy conditional events are restricted.                          |
-| `ACCOUNT_UPDATE`                                                        | Treats positions as partial rows, never clears an omitted position, and marks wallet/risk/position sources dirty for REST confirmation.          |
-| Balance, liability, risk, and config notices                            | Invalidates the affected source and coalesces a bounded REST refresh; it does not synthesize PM wallet totals from UM deltas.                    |
-| Unknown critical event, unsupported product/mode, conflict, or overflow | Revokes synchronization and latches the session in `restricted` until an explicit new session generation.                                        |
+| Source or event                                                         | Observation behavior                                                                                                                                                |
+| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| listen key POST/PUT/DELETE                                              | API-key authenticated lifecycle with empty-response support; no signed query or arbitrary write surface.                                                            |
+| `ORDER_TRADE_UPDATE`                                                    | Validates ordinary type, side, TIF, quantity, price, reduce-only and one-way terms; emits one deduplicated typed order/fill delivery with signed native commission. |
+| `ALGO_UPDATE`                                                           | Accepts the current `ao` UM one-way schema and retains parent/child identity; legacy conditional events are restricted.                                             |
+| `ACCOUNT_UPDATE`                                                        | Treats positions as partial rows, never clears an omitted position, and marks wallet/risk/position sources dirty for REST confirmation.                             |
+| Balance, liability, risk, and config notices                            | Invalidates the affected source and coalesces a bounded REST refresh; it does not synthesize PM wallet totals from UM deltas.                                       |
+| Unknown critical event, unsupported product/mode, conflict, or overflow | Revokes synchronization and latches the session in `restricted` until an explicit new session generation.                                                           |
 
 The first supported private scope is declared linear UM instruments in one-way mode. WebSocket
 facts and REST history share bounded identity retention. REST remains authoritative for the PM
 wallet baseline and independent risk evidence. A fixed overlap window recovers activity that
 opened and closed during a gap; missing or contradictory coverage fails synchronization rather
 than being inferred from empty current-order results.
+
+Session evidence records separate `received_fact_version`, `delivered_fact_version`, and
+`applied_fact_version` checkpoints. Queueing a recovery or incremental execution report advances
+only delivery and leaves a generation-bound application checkpoint pending. Only an explicit
+application acknowledgement can advance `applied`; stale, skipped, or repeated acknowledgements
+fail. The execution client receives an engine callback after reconciliation, verifies the expected
+account, order, fill, and position effects in the shared cache, and only then acknowledges the
+pending session checkpoint. Queueing alone never advances `applied`.
 
 ## Feature flags
 
@@ -169,7 +283,10 @@ never return a partial success, and a single-order not-found result remains an e
 Every mass status has `reports_complete=false`. Exhausting pages does not prove the venue's
 retention, selection timestamps or algo discovery contract. The real execution-engine tests
 verify that these incomplete snapshots preserve explicit fees while suppressing historical
-position/portfolio effects. They do not establish readiness for live reconciliation.
+position/portfolio effects. Separate local REST/WebSocket tests verify that a typed order/fill
+delta is applied once through the real execution engine and portfolio without forcing a full REST
+recovery, while a duplicate delta has no second effect. These tests do not establish readiness for
+live reconciliation.
 
 Snapshot `to_json()` preserves the fixed window, instrument scope, reports, response metadata,
 and coverage issues. `cancel()` stops outstanding and future calls on that read-only client.
@@ -203,8 +320,7 @@ position. Its one-hour history window returned no orders or fills, so that captu
 order/fill linkage or commission evidence and did not test retention. A separate collection scoped
 to flat instruments failed the explicit `positionRisk` coverage requirement: UM account V1
 supplied explicit zero rows while V2 omitted them. Those captures predate the totals-only projection
-and do not constitute its live acceptance. LiveNode startup remains unavailable. Raw captures and
-credentials stay outside the repository.
+and do not constitute command acceptance. Raw captures and credentials stay outside the repository.
 
 On 2026-09-15, the current projection and collection script completed against an active GWEI UM
 position. All nine account observation sources, the order-rate-limit query, and the bounded mass
@@ -217,10 +333,19 @@ orders or fills and remains explicitly incomplete. Observed account-wide weight 
 for UM ordinary orders, 40 for UM algo orders, 40 for CM orders, and 5 for margin orders. The
 collection used authenticated GET requests only and did not authorize trading.
 
+On 2026-09-19, the current build reproduced that result through an explicitly configured local
+proxy. Public UM metadata used the same proxy without receiving PAPI credentials. All read-only
+collections succeeded, the wallet and PM risk views remained available without issues, and mass
+status returned one position with no orders or fills in its one-hour incomplete window. The
+evidence retained `reports_complete=false` and `trading_authorized=false`; no write request or
+trading command was issued.
+
 Prepare a local JSON credential file with `account_id`, `api_key`, and `api_secret`. Optional
 fields match the Python read-only config constructor, including `base_url` for a configured
-gateway or loopback server and integer request/operation timeout bounds in milliseconds.
-The file contains plaintext secrets and must stay outside version control.
+gateway or loopback server, `proxy_url`, and integer request/operation timeout bounds in
+milliseconds. When the script loads public Binance UM metadata, it also uses the configured proxy
+without forwarding PAPI credentials. The file contains plaintext secrets and must stay outside
+version control.
 
 From an environment containing the newly built PAPI-enabled wheel:
 
@@ -256,15 +381,38 @@ balances deliberately leave native free/locked components unavailable.
 
 ## Request policy
 
-SDK retries are disabled. Nautilus bounded retries cover known transient 5xx statuses and
-adapter-owned timeouts; each retry reacquires endpoint weight before a fresh SDK signature.
-Authentication, clock, decode and unknown SDK failures are not blindly retried. Diagnostics
-retain typed status/code evidence without SDK error strings or signed URLs.
+SDK retries are disabled. Signed GET operations use Nautilus bounded retries for known transient
+5xx statuses and adapter-owned timeouts; each retry reacquires endpoint weight before a fresh SDK
+signature. Authentication, clock, decode and unknown SDK failures are not blindly retried.
+Diagnostics retain typed status/code evidence without SDK error strings or signed URLs.
 
-All Rust client instances share a process-wide 3000-weight/minute gate, a burst of 40, and
-four concurrent attempts. Defaults are five seconds per attempt, sixty seconds per operation,
-256 attempts and 100,000 decoded rows. Clones share cancellation and retained observations;
-other processes sharing the IP require separate quota coordination.
+The ordinary UM write transport allowlists only signed POST and DELETE requests to
+`/papi/v1/um/order`. It accepts validated market or limit submissions and exactly identified
+cancellations, preserves quantity and price as Decimal text, and generates its signature only after
+all quota waits. Every write operation has at most one dispatch and never enters the GET retry loop.
+Cancellation or budget failure before dispatch is `CommandFailure::NotSent`; an explicit supported
+venue rejection is `VenueRejected`; transport loss, timeout, in-flight cancellation, `-1000`,
+`-1001`, `-1006`, `-1007`, rate limiting, 5xx, or response decoding after dispatch is `Ambiguous`.
+Cancel not-found codes also remain ambiguous pending order recovery. SDK 69.2.1 erases 5xx response
+bodies, so its different documented 503 messages cannot be distinguished safely.
+
+All quota waits complete before the coordinator rechecks the evidence generation and send
+permission. The journal then synchronously records `MayHaveDispatched` as the final fallible step
+before the socket request. A failed barrier sends nothing; a valid response must return matching
+symbol, venue order ID, and client order ID. Success is retained as observed until authoritative
+terminal evidence, while not-sent and explicit rejection release the operation and ambiguous
+outcomes keep its reservation.
+
+All Rust client instances share a process-wide 3000-weight/minute gate, a burst of 40, and four
+concurrent attempts. The write transport additionally applies a process-wide 1000 new-order/minute
+gate with burst 20, below the documented account allowance of 1200/minute. Failed dispatched
+submissions conservatively consume this local quota; cancellation does not consume a new-order slot
+but still consumes the shared request gate. Defaults are five seconds per attempt, sixty seconds per
+operation, 256 attempts and 100,000 decoded rows. Clones of one read-only client share cancellation
+and retained observations. The execution session and its ad hoc query/report reader use separate
+cancellation domains while sharing the process-wide gate, so stopping a query cannot prevent the
+session from closing its listen key. Other processes sharing the IP or account require separate
+quota coordination.
 
 Account-wide UM ordinary/algo and CM open-order reads reserve their documented unscoped weight of
 40. The margin open-orders documentation assigns IP weight 5 but separately states that an
@@ -303,9 +451,11 @@ converges. The
 [synthetic account fixtures](test_data/observations/README.md) and
 [official report examples](test_data/reports/README.md) do not establish live compatibility.
 
-The remaining acceptance work must establish authenticated endpoint behavior for the complete
-scope checks and supported wallet projection, plus unobserved historical/algo lifecycle evidence.
-PM admission and trading authorization remain later work.
+Authenticated endpoint behavior for the sampled scope and supported wallet projection is accepted.
+Remaining acceptance work covers unsupported account states and unobserved historical, algo,
+retention, flat-account, and throttling behavior. Authenticated PM risk semantics and separately
+authorized live MARKET/LIMIT/post-only/reduce-only/cancel/fill/rebaseline acceptance remain open;
+the connected production increase-risk path stays closed until that evidence exists.
 The rationale and acceptance obligations are recorded in [RESEARCH.md](RESEARCH.md).
 
 ## Local tests

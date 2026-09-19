@@ -15,11 +15,16 @@
 
 //! Strict, credential-free decoding for Portfolio Margin account-stream facts.
 
+use nautilus_model::enums::{OrderSide, OrderType, TimeInForce};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Account-stream facts are ephemeral and immediately consumed"
+)]
 pub(super) enum PapiWsEvent {
     Order(OrderFact),
     Algo(AlgoFact),
@@ -33,9 +38,19 @@ pub(super) struct OrderFact {
     pub symbol: String,
     pub client_order_id: String,
     pub order_id: i64,
+    pub side: OrderSide,
+    pub order_type: OrderType,
+    pub time_in_force: TimeInForce,
+    pub post_only: bool,
+    pub quantity: Decimal,
+    pub price: Option<Decimal>,
+    pub average_price: Option<Decimal>,
+    pub reduce_only: bool,
+    pub position_side: String,
     pub execution_type: String,
     pub status: String,
     pub accumulated_qty: Decimal,
+    pub accepted_time_ms: i64,
     pub event_time_ms: i64,
     pub transaction_time_ms: i64,
     pub fill: Option<FillFact>,
@@ -166,6 +181,54 @@ fn parse_order(payload: &[u8]) -> Result<PapiWsEvent, PapiWsError> {
     validate_symbol(&event.order.symbol)?;
     validate_identity(&event.order.client_order_id)?;
 
+    if event.order.position_side != "BOTH"
+        || event.order.order_type != event.order.original_order_type
+        || event.order.quantity <= Decimal::ZERO
+        || event.order.accumulated_qty > event.order.quantity
+    {
+        return Err(PapiWsError::Scope);
+    }
+
+    let side = match event.order.side.as_str() {
+        "BUY" => OrderSide::Buy,
+        "SELL" => OrderSide::Sell,
+        _ => return Err(PapiWsError::Fact),
+    };
+    let (order_type, price) = match event.order.order_type.as_str() {
+        "MARKET" if event.order.price.is_zero() => (OrderType::Market, None),
+        "LIMIT" if event.order.price > Decimal::ZERO => (OrderType::Limit, Some(event.order.price)),
+        "MARKET" | "LIMIT" => return Err(PapiWsError::Fact),
+        _ => {
+            return Err(PapiWsError::Unsupported(format!(
+                "order type {}",
+                event.order.order_type
+            )));
+        }
+    };
+    let (time_in_force, post_only) = match event.order.time_in_force.as_str() {
+        "GTC" => (TimeInForce::Gtc, false),
+        "IOC" => (TimeInForce::Ioc, false),
+        "FOK" => (TimeInForce::Fok, false),
+        "GTX" => (TimeInForce::Gtc, true),
+        value => {
+            return Err(PapiWsError::Unsupported(format!("time in force {value}")));
+        }
+    };
+
+    if order_type == OrderType::Market && (time_in_force != TimeInForce::Gtc || post_only) {
+        return Err(PapiWsError::Fact);
+    }
+    let average_price = if event.order.accumulated_qty.is_zero() {
+        if !event.order.average_price.is_zero() {
+            return Err(PapiWsError::Fact);
+        }
+        None
+    } else if event.order.average_price > Decimal::ZERO {
+        Some(event.order.average_price)
+    } else {
+        return Err(PapiWsError::Fact);
+    };
+
     if event.order.order_id <= 0
         || event.order.accumulated_qty < Decimal::ZERO
         || !matches!(
@@ -244,9 +307,19 @@ fn parse_order(payload: &[u8]) -> Result<PapiWsEvent, PapiWsError> {
         symbol: event.order.symbol,
         client_order_id: event.order.client_order_id,
         order_id: event.order.order_id,
+        side,
+        order_type,
+        time_in_force,
+        post_only,
+        quantity: event.order.quantity,
+        price,
+        average_price,
+        reduce_only: event.order.reduce_only,
+        position_side: event.order.position_side,
         execution_type: event.order.execution_type,
         status: event.order.status,
         accumulated_qty: event.order.accumulated_qty,
+        accepted_time_ms: event.transaction_time,
         event_time_ms: event.event_time,
         transaction_time_ms: event.transaction_time,
         fill,
@@ -417,6 +490,24 @@ struct OrderPayload {
     client_order_id: String,
     #[serde(rename = "i")]
     order_id: i64,
+    #[serde(rename = "S")]
+    side: String,
+    #[serde(rename = "o")]
+    order_type: String,
+    #[serde(rename = "ot")]
+    original_order_type: String,
+    #[serde(rename = "f")]
+    time_in_force: String,
+    #[serde(rename = "q", deserialize_with = "deserialize_decimal")]
+    quantity: Decimal,
+    #[serde(rename = "p", deserialize_with = "deserialize_decimal")]
+    price: Decimal,
+    #[serde(rename = "ap", deserialize_with = "deserialize_decimal")]
+    average_price: Decimal,
+    #[serde(rename = "R")]
+    reduce_only: bool,
+    #[serde(rename = "ps")]
+    position_side: String,
     #[serde(rename = "x")]
     execution_type: String,
     #[serde(rename = "X")]
@@ -525,6 +616,9 @@ mod tests {
             "T": 1_700_000_000_000_i64, "fs": "UM",
             "o": {
                 "s": "BTCUSDT", "c": "client-1", "i": 42, "x": "TRADE",
+                "S": "BUY", "o": "LIMIT", "ot": "LIMIT", "f": "GTC",
+                "q": "0.010", "p": "42000.10", "ap": "42000.10",
+                "R": false, "ps": "BOTH",
                 "X": "PARTIALLY_FILLED", "z": "0.002", "l": "0.001",
                 "L": "42000.10", "N": "BNB", "n": "-0.00000123",
                 "m": false, "T": 1_700_000_000_000_i64, "t": 7
@@ -549,6 +643,9 @@ mod tests {
             "T": 1_700_000_000_000_i64, "fs": "UM",
             "o": {
                 "s": "BTCUSDT", "c": "client-1", "i": 42, "x": "TRADE",
+                "S": "BUY", "o": "MARKET", "ot": "MARKET", "f": "GTC",
+                "q": "0.001", "p": "0", "ap": "42000",
+                "R": false, "ps": "BOTH",
                 "X": "FILLED", "z": "0.001", "l": "0.001", "L": "42000",
                 "m": false, "T": 1_700_000_000_000_i64, "t": 7
             }
