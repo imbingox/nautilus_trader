@@ -10,7 +10,7 @@ categories.workspace = true
 keywords.workspace = true
 documentation.workspace = true
 repository.workspace = true
-homepage = "https://github.com/imbingox/nautilus_trader"
+homepage.workspace = true
 publish = false # Never publish to crates.io
 
 [lints]

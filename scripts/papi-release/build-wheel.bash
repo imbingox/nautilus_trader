@@ -29,7 +29,7 @@ if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
 fi
 
 python_bin="${PAPI_RELEASE_PYTHON:-$($uv_bin python find 3.14)}"
-"$python_bin" - <<'PY'
+"$python_bin" - << 'PY'
 import sys
 import sysconfig
 

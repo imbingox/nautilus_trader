@@ -26,7 +26,7 @@ case "$registry" in
 esac
 
 IFS=$'\t' read -r distribution version expected_name expected_sha < <(
-  "$uv_bin" run --no-project --python 3.14 python - "$manifest" <<'PY'
+  "$uv_bin" run --no-project --python 3.14 python - "$manifest" << 'PY'
 import json
 import sys
 
@@ -48,16 +48,16 @@ trap 'rm -rf "$temp_root"' EXIT
 attempt=1
 while ! "$uv_bin" run --no-project --python 3.14 --with "pip==25.2" -- \
   python -m pip download \
-    --dest "$temp_root" \
-    --index-url "$index_url" \
-    --no-cache-dir \
-    --no-deps \
-    --only-binary :all: \
-    --implementation cp \
-    --python-version 3.14 \
-    --abi cp314 \
-    --platform manylinux_2_34_x86_64 \
-    "${distribution}==${version}"; do
+  --dest "$temp_root" \
+  --index-url "$index_url" \
+  --no-cache-dir \
+  --no-deps \
+  --only-binary :all: \
+  --implementation cp \
+  --python-version 3.14 \
+  --abi cp314 \
+  --platform manylinux_2_34_x86_64 \
+  "${distribution}==${version}"; do
   if ((attempt >= max_attempts)); then
     echo "Error: ${registry} download failed after ${attempt} attempts" >&2
     exit 1
