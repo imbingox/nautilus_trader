@@ -177,7 +177,10 @@ def test_verify_wheel_rejects_upstream_homepage(tmp_path: Path) -> None:
 
 def test_manifest_cleanliness_allows_only_untracked_wheel_artifacts(tmp_path: Path) -> None:
     """
-    Allow generated wheel artifacts while rejecting source or unrelated untracked changes.
+    Allow generated wheel artifacts.
+
+    Reject source or unrelated untracked changes.
+
     """
     git = shutil.which("git")
     assert git is not None

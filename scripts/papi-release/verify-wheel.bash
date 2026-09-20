@@ -45,7 +45,7 @@ wheel_python="${environment}/bin/python"
   cd "$temp_root"
   "$wheel_python" -I \
     "$repo_root/python/tests/integration/binance_papi_wheel_smoke.py" enabled
-  "$wheel_python" -I - <<'PY'
+  "$wheel_python" -I - << 'PY'
 import importlib.metadata
 
 try:
@@ -57,7 +57,7 @@ else:
 PY
 )
 
-"$python_bin" - "$report_path" <<'PY'
+"$python_bin" - "$report_path" << 'PY'
 import json
 import sys
 from pathlib import Path

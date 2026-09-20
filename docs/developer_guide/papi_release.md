@@ -6,18 +6,18 @@ conflicts with the official `nautilus-trader` distribution.
 
 ## Frozen first-release contract
 
-| Field | Value |
-| --- | --- |
-| Distribution | `nautilus-trader-papi` |
-| Version | `2.0.0rc6` |
-| Python | CPython 3.14, GIL build |
-| ABI | `cp314` |
-| Platform | Linux x86_64 |
-| Platform baseline | `manylinux_2_34` |
-| Build profile | Cargo `release` |
-| Python extension | Full `nautilus-pyo3` extension with high precision and PAPI |
-| Source distribution | Not published |
-| Release tag | `papi-v2.0.0rc6` |
+| Field               | Value                                                       |
+| ------------------- | ----------------------------------------------------------- |
+| Distribution        | `nautilus-trader-papi`                                      |
+| Version             | `2.0.0rc6`                                                  |
+| Python              | CPython 3.14, GIL build                                     |
+| ABI                 | `cp314`                                                     |
+| Platform            | Linux x86_64                                                |
+| Platform baseline   | `manylinux_2_34`                                            |
+| Build profile       | Cargo `release`                                             |
+| Python extension    | Full `nautilus-pyo3` extension with high precision and PAPI |
+| Source distribution | Not published                                               |
+| Release tag         | `papi-v2.0.0rc6`                                            |
 
 The upstream baseline is
 `46a5658a2f66cf0a798d414dc1b63d98cf10fcc1`. The PAPI feature head before upstream integration is
@@ -85,12 +85,12 @@ run `binance_papi_wheel_smoke.py disabled`. Never upload it under the release na
 
 ## Capability statement
 
-| Status | Scope |
-| --- | --- |
-| Implemented and offline verified | Authenticated account observations, scoped reports, durable command journal, bounded recovery, exact fee/quantity handling, explicit admission limits, default-disabled trading |
-| Limited live evidence | BTCUSDT one-way market open/reduce-only close, GTC/GTX targeted cancellation, FOK behavior, live market fills |
-| Not fully live verified | Partial or multiple fills, direct IOC terminal delivery, every concurrent scheduling case, complete account-flat coverage, retention boundaries, venue throttling, latest dynamic rebaseline optimization |
-| Unsupported and rejected | Hedge mode, coin-margined or margin products, unspecified instruments, ambiguous credentials or account identity, nonzero unsupported borrowing/interest state, unbounded or stale risk evidence |
+| Status                           | Scope                                                                                                                                                                                                     |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Implemented and offline verified | Authenticated account observations, scoped reports, durable command journal, bounded recovery, exact fee/quantity handling, explicit admission limits, default-disabled trading                           |
+| Limited live evidence            | BTCUSDT one-way market open/reduce-only close, GTC/GTX targeted cancellation, FOK behavior, live market fills                                                                                             |
+| Not fully live verified          | Partial or multiple fills, direct IOC terminal delivery, every concurrent scheduling case, complete account-flat coverage, retention boundaries, venue throttling, latest dynamic rebaseline optimization |
+| Unsupported and rejected         | Hedge mode, coin-margined or margin products, unspecified instruments, ambiguous credentials or account identity, nonzero unsupported borrowing/interest state, unbounded or stale risk evidence          |
 
 The release does not broaden the adapter's trading scope. Additional live acceptance requires a
 separate operator decision with explicit account, action, and size; packaging work never authorizes

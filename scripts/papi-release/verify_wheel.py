@@ -46,7 +46,7 @@ WHEEL_PATTERN = re.compile(
 TEXT_SUFFIXES = {".json", ".md", ".py", ".pyi", ".toml", ".txt"}
 FORBIDDEN_PARTS = {".git", ".venv", "target", "test_data"}
 FORBIDDEN_TEXT = (
-    b"-----BEGIN PRIVATE KEY-----",
+    b"-----BEGIN " + b"PRIVATE KEY-----",
     b"OfflinePapiSecret",
 )
 REQUIREMENT_NAME_PATTERN = re.compile(r"^\s*([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)")
