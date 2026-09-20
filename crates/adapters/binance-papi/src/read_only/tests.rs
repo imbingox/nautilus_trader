@@ -816,7 +816,7 @@ async fn test_position_mode_must_be_explicitly_one_way(#[case] mode: Value) {
 }
 
 #[tokio::test]
-async fn test_absent_position_is_an_error_and_explicit_flat_is_a_report() {
+async fn test_scoped_empty_and_explicit_zero_positions_are_flat_reports() {
     let missing = Arc::new(AtomicBool::new(true));
     let state = Arc::clone(&missing);
     let server = MockServer::new(move |request| {
@@ -828,7 +828,13 @@ async fn test_absent_position_is_an_error_and_explicit_flat_is_a_report() {
     })
     .await;
     let client = testing::client(&server, &["BTCUSDT"]);
-    assert!(client.generate_position_status_reports(None).await.is_err());
+    let reports = client.generate_position_status_reports(None).await.unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].position_side, PositionSide::Flat);
+    assert_eq!(
+        reports[0].quantity.as_decimal(),
+        rust_decimal_macros::dec!(0)
+    );
     missing.store(false, Ordering::Release);
     let reports = client.generate_position_status_reports(None).await.unwrap();
     assert_eq!(reports.len(), 1);
@@ -1499,7 +1505,6 @@ async fn test_invalid_scope_fails_before_any_request() {
 }
 
 #[rstest]
-#[case(json!([]))]
 #[case(json!({}))]
 #[case(json!([testing::position("BTCUSDT"), testing::position("BTCUSDT")]))]
 #[case(json!([testing::position("ETHUSDT")]))]

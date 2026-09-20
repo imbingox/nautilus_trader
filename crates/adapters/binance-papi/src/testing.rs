@@ -320,3 +320,57 @@ pub(crate) fn quiet(request: &RecordedRequest) -> Reply {
         _ => Reply::raw(400, r#"{"code":-2013,"msg":"Order does not exist"}"#),
     }
 }
+
+pub(crate) fn supported_trading(request: &RecordedRequest) -> Reply {
+    match request.path.as_str() {
+        "/papi/v1/balance" => Reply::json(&supported_balances()),
+        "/papi/v1/account" => Reply::json(&json!({
+            "uniMMR": "2",
+            "accountEquity": "1000",
+            "actualEquity": "1000",
+            "accountInitialMargin": "0",
+            "accountMaintMargin": "0",
+            "accountStatus": "NORMAL",
+            "virtualMaxWithdrawAmount": "1000",
+            "totalAvailableBalance": "1000",
+            "totalMarginOpenLoss": "0",
+            "updateTime": 1_800_000_000_000_i64,
+        })),
+        "/papi/v1/um/account" | "/papi/v2/um/account" => Reply::json(&json!({
+            "assets": [],
+            "positions": [],
+        })),
+        "/papi/v1/um/leverageBracket" => Reply::json(&json!([{
+            "symbol": "BTCUSDT",
+            "brackets": [
+                {"bracket": 1, "initialLeverage": 20, "notionalFloor": 0, "notionalCap": 100000},
+                {"bracket": 2, "initialLeverage": 10, "notionalFloor": 100000, "notionalCap": 1000000},
+            ],
+        }])),
+        "/fapi/v1/premiumIndex" => Reply::json(&json!({
+            "symbol": "BTCUSDT",
+            "markPrice": "100000.00",
+            "time": 1_800_000_000_000_i64,
+        })),
+        "/fapi/v1/exchangeInfo" => Reply::json(&json!({
+            "serverTime": 1_800_000_000_000_i64,
+            "symbols": [{
+                "symbol": "BTCUSDT",
+                "status": "TRADING",
+                "marginAsset": "USDT",
+                "filters": [
+                    {"filterType": "PRICE_FILTER", "minPrice": "1", "maxPrice": "1000000", "tickSize": "0.01"},
+                    {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "1000", "stepSize": "0.001"},
+                    {"filterType": "MARKET_LOT_SIZE", "minQty": "0.001", "maxQty": "100", "stepSize": "0.001"},
+                    {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                ],
+            }],
+        })),
+        "/sapi/v1/portfolio/asset-index-price" => Reply::json(&json!([{
+            "asset": "USDT",
+            "assetIndexPrice": "0.99",
+            "time": 1_800_000_000_000_i64,
+        }])),
+        _ => quiet(request),
+    }
+}

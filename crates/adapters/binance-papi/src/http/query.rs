@@ -51,6 +51,9 @@ pub(crate) enum PapiRequest {
         algo_id: i64,
     },
     OrderRateLimit,
+    LeverageBrackets {
+        symbol: String,
+    },
 }
 
 impl PapiRequest {
@@ -65,6 +68,7 @@ impl PapiRequest {
             Self::History { endpoint, .. } => endpoint.path(),
             Self::Algo { .. } => HistoryEndpoint::Algos.path(),
             Self::OrderRateLimit => "/papi/v1/rateLimit/order",
+            Self::LeverageBrackets { .. } => "/papi/v1/um/leverageBracket",
         }
     }
 
@@ -87,6 +91,7 @@ impl PapiRequest {
             | Self::Order { .. }
             | Self::OpenAlgos { .. }
             | Self::OrderRateLimit => 1,
+            Self::LeverageBrackets { .. } => 1,
         }
     }
 
@@ -98,6 +103,7 @@ impl PapiRequest {
             | Self::OpenAlgos { symbol }
             | Self::History { symbol, .. }
             | Self::Algo { symbol, .. } => Some(symbol),
+            Self::LeverageBrackets { symbol } => Some(symbol),
             _ => None,
         }
     }
@@ -139,6 +145,63 @@ impl PapiRequest {
         }
 
         params
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PublicOrigin {
+    Fapi,
+    Sapi,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PapiPublicRequest {
+    MarkPrice { symbol: String },
+    ExchangeInfo,
+    AssetIndex { asset: String },
+}
+
+impl PapiPublicRequest {
+    pub(crate) const fn origin(&self) -> PublicOrigin {
+        match self {
+            Self::MarkPrice { .. } | Self::ExchangeInfo => PublicOrigin::Fapi,
+            Self::AssetIndex { .. } => PublicOrigin::Sapi,
+        }
+    }
+
+    pub(crate) const fn endpoint(&self) -> &'static str {
+        match self {
+            Self::MarkPrice { .. } => "/fapi/v1/premiumIndex",
+            Self::ExchangeInfo => "/fapi/v1/exchangeInfo",
+            Self::AssetIndex { .. } => "/sapi/v1/portfolio/asset-index-price",
+        }
+    }
+
+    pub(crate) const fn weight(&self) -> usize {
+        1
+    }
+
+    pub(crate) fn symbol(&self) -> Option<&str> {
+        match self {
+            Self::MarkPrice { symbol } => Some(symbol),
+            Self::ExchangeInfo | Self::AssetIndex { .. } => None,
+        }
+    }
+
+    pub(crate) fn params(&self) -> BTreeMap<String, Value> {
+        match self {
+            Self::MarkPrice { symbol } => {
+                BTreeMap::from([("symbol".to_owned(), Value::from(symbol.as_str()))])
+            }
+            Self::ExchangeInfo => BTreeMap::new(),
+            Self::AssetIndex { asset } => {
+                BTreeMap::from([("asset".to_owned(), Value::from(asset.as_str()))])
+            }
+        }
+    }
+
+    pub(crate) const fn requires_api_key(&self) -> bool {
+        matches!(self, Self::AssetIndex { .. })
     }
 }
 

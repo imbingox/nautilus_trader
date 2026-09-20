@@ -208,6 +208,18 @@ pub(crate) struct PapiApplicationCheckpoint {
     fact_version: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PapiRefreshAcknowledgement {
+    Applied { fact_version: u64 },
+    Superseded { fact_version: u64 },
+}
+
+impl PapiApplicationCheckpoint {
+    pub(crate) const fn fact_version(self) -> u64 {
+        self.fact_version
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct PapiApplicationAcknowledger {
     shared: Arc<SessionShared>,
@@ -224,12 +236,74 @@ impl PapiApplicationAcknowledger {
     pub(crate) fn acknowledge(&self, checkpoint: PapiApplicationCheckpoint) -> anyhow::Result<()> {
         acknowledge_application(&self.shared, checkpoint)
     }
+
+    pub(crate) fn applied_fact_version(&self) -> u64 {
+        self.shared.evidence.lock().applied_fact_version
+    }
+
+    pub(crate) fn set_trading_authorized(&self, authorized: bool) {
+        self.shared.evidence.lock().trading_authorized = authorized;
+    }
+
+    pub(crate) fn refresh_checkpoint(&self) -> anyhow::Result<PapiApplicationCheckpoint> {
+        let fact_version = self.shared.facts.lock().fact_version;
+        let evidence = self.shared.evidence.lock();
+        anyhow::ensure!(
+            evidence.synchronized && evidence.session_generation != 0 && fact_version != 0,
+            "PAPI session has no synchronized refresh checkpoint"
+        );
+        Ok(PapiApplicationCheckpoint {
+            session_generation: evidence.session_generation,
+            recovery_generation: evidence.recovery_generation,
+            fact_version,
+        })
+    }
+
+    pub(crate) fn acknowledge_refresh(
+        &self,
+        checkpoint: PapiApplicationCheckpoint,
+    ) -> anyhow::Result<PapiRefreshAcknowledgement> {
+        let fact_version = self.shared.facts.lock().fact_version;
+        let mut evidence = self.shared.evidence.lock();
+        anyhow::ensure!(
+            evidence.synchronized
+                && evidence.session_generation == checkpoint.session_generation
+                && evidence.recovery_generation == checkpoint.recovery_generation,
+            "Stale PAPI risk-refresh acknowledgement"
+        );
+
+        if fact_version != checkpoint.fact_version {
+            return Ok(PapiRefreshAcknowledgement::Superseded { fact_version });
+        }
+        evidence.delivered_fact_version =
+            evidence.delivered_fact_version.max(checkpoint.fact_version);
+        evidence.applied_fact_version = evidence.applied_fact_version.max(checkpoint.fact_version);
+        if evidence
+            .pending_application_fact_version
+            .is_some_and(|version| version <= checkpoint.fact_version)
+        {
+            evidence.pending_application_fact_version = None;
+        }
+        Ok(PapiRefreshAcknowledgement::Applied {
+            fact_version: evidence.applied_fact_version,
+        })
+    }
 }
 
 pub(crate) type PapiRecoveryHandler =
     Arc<dyn Fn(PapiRecoveryBundle) -> anyhow::Result<()> + Send + Sync>;
 pub(crate) type PapiIncrementalHandler =
     Arc<dyn Fn(PapiIncrementalBundle) -> anyhow::Result<()> + Send + Sync>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PapiRiskRefreshSignal {
+    pub(crate) fact_version: u64,
+    pub(crate) reason: String,
+    pub(crate) symbols: BTreeSet<String>,
+}
+
+pub(crate) type PapiRiskRefreshHandler =
+    Arc<dyn Fn(PapiRiskRefreshSignal) -> anyhow::Result<()> + Send + Sync>;
 
 fn acknowledge_application(
     shared: &SessionShared,
@@ -260,6 +334,7 @@ pub struct BinancePapiAccountSession {
     tasks: TaskGroup,
     handler: PapiRecoveryHandler,
     incremental_handler: PapiIncrementalHandler,
+    risk_refresh_handler: Option<PapiRiskRefreshHandler>,
 }
 
 impl BinancePapiAccountSession {
@@ -280,7 +355,7 @@ impl BinancePapiAccountSession {
         instruments: Vec<InstrumentAny>,
         handler: PapiRecoveryHandler,
     ) -> anyhow::Result<Self> {
-        Self::with_handlers(config, instruments, handler, Arc::new(|_| Ok(())))
+        Self::with_handlers(config, instruments, handler, Arc::new(|_| Ok(())), None)
     }
 
     pub(crate) fn with_handlers(
@@ -288,18 +363,38 @@ impl BinancePapiAccountSession {
         instruments: Vec<InstrumentAny>,
         handler: PapiRecoveryHandler,
         incremental_handler: PapiIncrementalHandler,
+        risk_refresh_handler: Option<PapiRiskRefreshHandler>,
+    ) -> anyhow::Result<Self> {
+        let reader = BinancePapiReadOnlyClient::new(config, instruments.clone())?;
+        Self::with_reader(
+            config,
+            instruments,
+            reader,
+            handler,
+            incremental_handler,
+            risk_refresh_handler,
+        )
+    }
+
+    fn with_reader(
+        config: &BinancePapiReadOnlyConfig,
+        instruments: Vec<InstrumentAny>,
+        reader: BinancePapiReadOnlyClient,
+        handler: PapiRecoveryHandler,
+        incremental_handler: PapiIncrementalHandler,
+        risk_refresh_handler: Option<PapiRiskRefreshHandler>,
     ) -> anyhow::Result<Self> {
         config.validate()?;
+        let instrument_count = instruments.len();
         let instrument_map: BTreeMap<_, _> = instruments
-            .iter()
-            .map(|instrument| (instrument.raw_symbol().to_string(), instrument.clone()))
+            .into_iter()
+            .map(|instrument| (instrument.raw_symbol().to_string(), instrument))
             .collect();
         anyhow::ensure!(
-            instrument_map.len() == instruments.len(),
+            instrument_map.len() == instrument_count,
             "PAPI private-session instrument symbols must be unique"
         );
         let symbols = instrument_map.keys().cloned().collect();
-        let reader = BinancePapiReadOnlyClient::new(config, instruments)?;
         let evidence =
             BinancePapiRecoveryEvidence::stopped(config.account_id, reader.instrument_ids());
 
@@ -323,6 +418,7 @@ impl BinancePapiAccountSession {
             tasks: TaskGroup::new(),
             handler,
             incremental_handler,
+            risk_refresh_handler,
         })
     }
 
@@ -354,6 +450,10 @@ impl BinancePapiAccountSession {
     #[must_use]
     pub fn is_synchronized(&self) -> bool {
         self.shared.evidence.lock().synchronized
+    }
+
+    pub(crate) fn set_trading_authorized(&self, authorized: bool) {
+        self.shared.evidence.lock().trading_authorized = authorized;
     }
 
     /// Confirms that the execution engine applied the exact delivered recovery generation.
@@ -456,6 +556,7 @@ impl BinancePapiAccountSession {
             listen_key: Arc::clone(&self.listen_key),
             handler: Arc::clone(&self.handler),
             incremental_handler: Arc::clone(&self.incremental_handler),
+            risk_refresh_handler: self.risk_refresh_handler.clone(),
             tx,
         };
         let initial = async {
@@ -602,6 +703,7 @@ struct DriverContext {
     listen_key: Arc<Mutex<Option<OwnedListenKey>>>,
     handler: PapiRecoveryHandler,
     incremental_handler: PapiIncrementalHandler,
+    risk_refresh_handler: Option<PapiRiskRefreshHandler>,
     tx: tokio::sync::mpsc::Sender<Inbound>,
 }
 
@@ -814,6 +916,20 @@ async fn run_driver(
 
         match process_inbound(&context.shared, &context.symbols, inbound) {
             Ok(InboundAction::Ignore) => continue,
+            Ok(InboundAction::RefreshRisk { signal })
+                if context.shared.evidence.lock().synchronized
+                    && context.risk_refresh_handler.is_some() =>
+            {
+                if let Err(e) =
+                    context
+                        .risk_refresh_handler
+                        .as_ref()
+                        .expect("risk refresh handler was checked")(signal)
+                {
+                    context.shared.restrict(e.to_string());
+                }
+                continue;
+            }
             Ok(InboundAction::ReplaceListenKey) => {
                 if let Err(e) = replace_listen_key(&context, &cancel).await {
                     context.shared.restrict(e.to_string());
@@ -831,17 +947,73 @@ async fn run_driver(
                 }
                 continue;
             }
-            Ok(InboundAction::DeliverOrder { .. } | InboundAction::Recover) => {}
+            Ok(
+                InboundAction::DeliverOrder { .. }
+                | InboundAction::RefreshRisk { .. }
+                | InboundAction::Recover,
+            ) => {}
             Err(e) => {
                 context.shared.restrict(e);
                 continue;
             }
         }
 
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => break,
-            () = nautilus_common::live::dst::time::sleep(context.config.refresh_debounce) => {}
+        let debounce = nautilus_common::live::dst::time::sleep(context.config.refresh_debounce);
+        tokio::pin!(debounce);
+        let mut replace_owner = false;
+
+        loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return,
+                () = &mut debounce => break,
+                inbound = rx.recv() => {
+                    let Some(inbound) = inbound else {
+                        return;
+                    };
+
+                    match process_inbound(&context.shared, &context.symbols, inbound) {
+                        Ok(InboundAction::DeliverOrder {
+                            delta,
+                            fact_version,
+                        }) if context.shared.evidence.lock().synchronized => {
+                            let owner = context.shared.current_owner.load(Ordering::Acquire);
+
+                            if let Err(e) =
+                                deliver_incremental(&context, &delta, fact_version, owner)
+                            {
+                                context.shared.restrict(e.to_string());
+                                break;
+                            }
+                        }
+                        Ok(InboundAction::ReplaceListenKey) => {
+                            replace_owner = true;
+                            break;
+                        }
+                        Ok(
+                            InboundAction::Ignore
+                            | InboundAction::DeliverOrder { .. }
+                            | InboundAction::RefreshRisk { .. }
+                            | InboundAction::Recover,
+                        ) => {}
+                        Err(e) => {
+                            context.shared.restrict(e);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if context.shared.restricted.load(Ordering::Acquire) {
+            continue;
+        }
+
+        if replace_owner {
+            if let Err(e) = replace_listen_key(&context, &cancel).await {
+                context.shared.restrict(e.to_string());
+            }
+            continue;
         }
 
         let owner = context.shared.current_owner.load(Ordering::Acquire);
@@ -1113,6 +1285,7 @@ async fn recover(
                     return Ok(RecoveryOutcome::ReplaceListenKey);
                 }
                 InboundAction::DeliverOrder { .. }
+                | InboundAction::RefreshRisk { .. }
                 | InboundAction::Recover
                 | InboundAction::Ignore => {}
             }
@@ -1265,6 +1438,9 @@ enum InboundAction {
         delta: OrderDelta,
         fact_version: u64,
     },
+    RefreshRisk {
+        signal: PapiRiskRefreshSignal,
+    },
     Recover,
     ReplaceListenKey,
 }
@@ -1295,6 +1471,17 @@ fn process_inbound(
             if matches!(event, PapiWsEvent::ListenKeyExpired { .. }) {
                 return Ok(InboundAction::ReplaceListenKey);
             }
+            let risk_refresh = match &event {
+                PapiWsEvent::Account(account) => Some((
+                    account.reason.clone(),
+                    account
+                        .positions
+                        .iter()
+                        .map(|position| position.symbol.clone())
+                        .collect(),
+                )),
+                _ => None,
+            };
             let application = shared.facts.lock().apply(event)?;
 
             if !application.changed {
@@ -1303,6 +1490,17 @@ fn process_inbound(
                 Ok(InboundAction::DeliverOrder {
                     delta,
                     fact_version: application.version,
+                })
+            } else if application.refresh_risk {
+                let (reason, symbols) = risk_refresh.ok_or_else(|| {
+                    "PAPI risk refresh did not come from an account event".to_string()
+                })?;
+                Ok(InboundAction::RefreshRisk {
+                    signal: PapiRiskRefreshSignal {
+                        fact_version: application.version,
+                        reason,
+                        symbols,
+                    },
                 })
             } else if application.requires_recovery {
                 Ok(InboundAction::Recover)
@@ -1348,7 +1546,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use futures_util::{SinkExt, StreamExt};
-    use nautilus_core::string::secret::SecretString;
+    use nautilus_core::{string::secret::SecretString, time::AtomicTime};
     use rstest::rstest;
     use rust_decimal_macros::dec;
     use serde_json::json;
@@ -1356,6 +1554,31 @@ mod tests {
 
     use super::*;
     use crate::testing::{self, MockServer, Reply};
+
+    fn test_session(
+        config: &BinancePapiReadOnlyConfig,
+        handler: PapiRecoveryHandler,
+        incremental_handler: PapiIncrementalHandler,
+        risk_refresh_handler: Option<PapiRiskRefreshHandler>,
+    ) -> BinancePapiAccountSession {
+        let instruments = vec![testing::instrument("BTCUSDT")];
+        let reader = BinancePapiReadOnlyClient::from_parts(
+            config,
+            instruments.clone(),
+            testing::gate(),
+            Arc::new(AtomicTime::default()),
+        )
+        .unwrap();
+        BinancePapiAccountSession::with_reader(
+            config,
+            instruments,
+            reader,
+            handler,
+            incremental_handler,
+            risk_refresh_handler,
+        )
+        .unwrap()
+    }
 
     async fn websocket_server(
         first_event: String,
@@ -1518,12 +1741,7 @@ mod tests {
             callback_observed.fetch_add(1, Ordering::AcqRel);
             Ok(())
         });
-        let mut session = BinancePapiAccountSession::with_handler(
-            &config,
-            vec![testing::instrument("BTCUSDT")],
-            handler,
-        )
-        .unwrap();
+        let mut session = test_session(&config, handler, Arc::new(|_| Ok(())), None);
 
         session.start().await.unwrap();
         let evidence = session.evidence();
@@ -1601,13 +1819,12 @@ mod tests {
             observed_deliveries.lock().push(bundle);
             Ok(())
         });
-        let mut session = BinancePapiAccountSession::with_handlers(
+        let mut session = test_session(
             &config,
-            vec![testing::instrument("BTCUSDT")],
             handler,
             incremental_handler,
-        )
-        .unwrap();
+            Some(Arc::new(|_| Ok(()))),
+        );
 
         session.start().await.unwrap();
         let baseline_requests = server.requests().len();
@@ -1653,6 +1870,74 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
+    async fn account_update_notifies_risk_refresh_without_delaying_order_delta_or_using_rest() {
+        let (websocket_url, websocket_tx, websocket_task, _) =
+            websocket_server(partial_account_event()).await;
+        let server = MockServer::new(|request| {
+            if request.path == "/papi/v1/balance" {
+                Reply::json(&testing::supported_balances())
+            } else {
+                testing::quiet(request)
+            }
+        })
+        .await;
+        let mut config = testing::config(&server.url);
+        config.websocket_url = SecretString::from(websocket_url);
+        config.listen_key_keepalive_interval = Duration::from_secs(60);
+        config.transport_rotation_interval = Duration::from_secs(60);
+        config.refresh_debounce = Duration::from_secs(2);
+        let deliveries = Arc::new(Mutex::new(Vec::new()));
+        let observed_deliveries = Arc::clone(&deliveries);
+        let handler: PapiRecoveryHandler = Arc::new(|_| Ok(()));
+        let incremental_handler: PapiIncrementalHandler = Arc::new(move |bundle| {
+            observed_deliveries.lock().push(bundle);
+            Ok(())
+        });
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let observed_refreshes = Arc::clone(&refreshes);
+        let mut session = test_session(
+            &config,
+            handler,
+            incremental_handler,
+            Some(Arc::new(move |_| {
+                observed_refreshes.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            })),
+        );
+
+        session.start().await.unwrap();
+        let baseline_requests = server.requests().len();
+        let refresh_acknowledger = session.application_acknowledger();
+        let refresh_checkpoint = refresh_acknowledger.refresh_checkpoint().unwrap();
+        websocket_tx.send(partial_account_event()).unwrap();
+        websocket_tx.send(order_trade_event()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if deliveries.lock().len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(server.requests().len(), baseline_requests);
+        assert_eq!(refreshes.load(Ordering::Acquire), 1);
+        assert_eq!(
+            refresh_acknowledger
+                .acknowledge_refresh(refresh_checkpoint)
+                .unwrap(),
+            PapiRefreshAcknowledgement::Superseded { fact_version: 3 }
+        );
+        let checkpoint = deliveries.lock()[0].checkpoint;
+        session.acknowledge_application(checkpoint).unwrap();
+        session.stop().await.unwrap();
+        websocket_task.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
     async fn listen_key_expiry_during_recovery_replaces_owner_without_early_delete() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let websocket_url = format!("ws://{}/ws", listener.local_addr().unwrap());
@@ -1682,8 +1967,7 @@ mod tests {
         .await;
         let mut config = testing::config(&server.url);
         config.websocket_url = SecretString::from(websocket_url);
-        let mut session =
-            BinancePapiAccountSession::new(&config, vec![testing::instrument("BTCUSDT")]).unwrap();
+        let mut session = test_session(&config, Arc::new(|_| Ok(())), Arc::new(|_| Ok(())), None);
 
         session.start().await.unwrap();
         let evidence = session.evidence();
@@ -1725,8 +2009,7 @@ mod tests {
         let server = MockServer::new(testing::quiet).await;
         let mut config = testing::config(&server.url);
         config.websocket_url = SecretString::from(websocket_url);
-        let mut session =
-            BinancePapiAccountSession::new(&config, vec![testing::instrument("BTCUSDT")]).unwrap();
+        let mut session = test_session(&config, Arc::new(|_| Ok(())), Arc::new(|_| Ok(())), None);
 
         assert!(session.start().await.is_err());
         assert_eq!(

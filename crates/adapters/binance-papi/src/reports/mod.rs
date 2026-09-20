@@ -30,9 +30,11 @@ use nautilus_binance::common::{
 };
 use nautilus_core::time::AtomicTime;
 use nautilus_model::{
+    enums::PositionSide,
     identifiers::{AccountId, ClientOrderId, InstrumentId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
+    types::Quantity,
 };
 use rust_decimal::Decimal;
 use serde::{Serialize, de::DeserializeOwned};
@@ -344,16 +346,35 @@ impl ReportCollector<'_> {
         let mut reports = Vec::with_capacity(symbols.len());
 
         for symbol in symbols {
-            let rows: Vec<PositionRow> = self
-                .rows(&PapiRequest::Positions {
+            let response = self
+                .raw(&PapiRequest::Positions {
                     symbol: symbol.clone(),
                 })
                 .await?;
+            let rows: Vec<JsonObject<PositionRow>> =
+                serde_json::from_str(response.body.get()).map_err(|_| PapiSchemaError)?;
+            self.budget.charge_rows(rows.len())?;
             anyhow::ensure!(
-                rows.len() == 1 && rows[0].symbol == *symbol,
-                "PAPI position response does not explicitly cover the requested symbol"
+                rows.len() <= 1 && rows.first().is_none_or(|row| row.0.symbol == *symbol),
+                "PAPI position response does not uniquely cover the requested symbol"
             );
-            reports.push(position_report(&rows[0], self.context(symbol)?)?);
+
+            if let Some(JsonObject(row)) = rows.first() {
+                reports.push(position_report(row, self.context(symbol)?)?);
+            } else {
+                let context = self.context(symbol)?;
+                reports.push(PositionStatusReport::new(
+                    context.account_id,
+                    context.instrument.id(),
+                    PositionSide::Flat,
+                    Quantity::zero(context.instrument.size_precision()),
+                    response.metadata.ts_received,
+                    context.ts_init,
+                    None,
+                    None,
+                    None,
+                ));
+            }
         }
 
         Ok(reports)

@@ -58,7 +58,7 @@ use self::{
         SubmitUmOrderRequest, UM_ORDER_ENDPOINT,
     },
     error::PapiHttpError,
-    query::PapiRequest,
+    query::{PapiPublicRequest, PapiRequest, PublicOrigin},
 };
 use crate::{observations::MAX_RESPONSE_BYTES, read_only::BinancePapiReadOnlyConfig};
 
@@ -100,6 +100,10 @@ pub struct BinancePapiResponseMetadata {
 
 pub(crate) struct PapiHttpClient {
     sdk: RestApi,
+    public: reqwest::Client,
+    public_api_key: SecretString,
+    fapi_base_url: String,
+    sapi_base_url: String,
     gate: Arc<RequestGate>,
     request_timeout: Duration,
     clock: Arc<AtomicTime>,
@@ -119,6 +123,7 @@ impl PapiHttpClient {
             .map(|url| reqwest::Proxy::all(url.expose_secret()))
             .transpose()
             .map_err(|_| anyhow::anyhow!("Could not configure PAPI proxy"))?;
+        let sdk_proxy = proxy.clone();
 
         // The adapter's timeout expires first, keeping timeout classification out of SDK strings
         let sdk_config = ConfigurationRestApi::builder()
@@ -134,16 +139,49 @@ impl PapiHttpClient {
                     .no_proxy()
                     .redirect(reqwest::redirect::Policy::none());
 
-                match &proxy {
+                match &sdk_proxy {
                     Some(proxy) => builder.proxy(proxy.clone()),
                     None => builder,
                 }
             })))
             .build()
             .map_err(|_| anyhow::anyhow!("Could not configure PAPI SDK"))?;
+        let mut public_builder = reqwest::Client::builder()
+            .use_rustls_tls()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(config.request_timeout);
+
+        if let Some(proxy) = proxy {
+            public_builder = public_builder.proxy(proxy);
+        }
+        let public = public_builder
+            .build()
+            .map_err(|_| anyhow::anyhow!("Could not configure PAPI public HTTP client"))?;
+        let configured = url::Url::parse(config.base_url.expose_secret())?;
+        let official = configured.scheme() == "https"
+            && configured.host_str() == Some("papi.binance.com")
+            && configured.port().is_none();
+        let fallback = config
+            .base_url
+            .expose_secret()
+            .trim_end_matches('/')
+            .to_owned();
 
         Ok(Self {
             sdk: DerivativesTradingPortfolioMarginRestApi::from_config(sdk_config),
+            public,
+            public_api_key: config.api_key.clone(),
+            fapi_base_url: if official {
+                "https://fapi.binance.com".to_owned()
+            } else {
+                fallback.clone()
+            },
+            sapi_base_url: if official {
+                "https://api.binance.com".to_owned()
+            } else {
+                fallback
+            },
             gate,
             request_timeout: config.request_timeout,
             clock,
@@ -185,6 +223,38 @@ impl PapiHttpClient {
             .invocation(
                 request.endpoint(),
                 || self.attempt(request, budget, requested_at),
+                PapiHttpError::retryable,
+                |e| PapiHttpError::from_retry(&e),
+            )
+            .cancellation_token(cancel)
+            .execute()
+            .await?;
+        budget.check()?;
+        Ok(response)
+    }
+
+    pub(crate) async fn get_public(
+        &self,
+        request: &PapiPublicRequest,
+        budget: &RequestBudget,
+        cancel: &CancellationToken,
+    ) -> Result<RawResponse, PapiHttpError> {
+        let requested_at = Instant::now();
+        let retry = RetryManager::new(RetryConfig {
+            max_retries: 2,
+            initial_delay_ms: 200,
+            max_delay_ms: 1_000,
+            backoff_factor: 2.0,
+            jitter_ms: 0,
+            operation_timeout_ms: None,
+            immediate_first: false,
+            max_elapsed_ms: Some(budget.remaining_ms()?),
+        });
+
+        let response = retry
+            .invocation(
+                request.endpoint(),
+                || self.attempt_public(request, budget, requested_at),
                 PapiHttpError::retryable,
                 |e| PapiHttpError::from_retry(&e),
             )
@@ -614,6 +684,47 @@ impl PapiHttpClient {
         result
     }
 
+    async fn attempt_public(
+        &self,
+        request: &PapiPublicRequest,
+        budget: &RequestBudget,
+        requested_at: Instant,
+    ) -> Result<RawResponse, PapiHttpError> {
+        budget.charge_request()?;
+
+        let permit = tokio::select! {
+            biased;
+            () = self.gate.closed.cancelled() => return Err(PapiHttpError::GateClosed),
+            permit = self.gate.concurrent.acquire() => {
+                permit.map_err(|_| PapiHttpError::GateClosed)?
+            }
+        };
+        let keys = vec![(); request.weight()];
+
+        tokio::select! {
+            biased;
+            () = self.gate.closed.cancelled() => return Err(PapiHttpError::GateClosed),
+            () = self.gate.limiter.await_keys_ready(Some(&keys)) => {}
+        }
+
+        budget.check()?;
+        let result = tokio::select! {
+            biased;
+            () = self.gate.closed.cancelled() => Err(PapiHttpError::GateClosed),
+            result = timeout(
+                self.request_timeout,
+                self.send_public(request, requested_at),
+            ) => result.unwrap_or(Err(PapiHttpError::Timeout)),
+        };
+
+        if matches!(result, Err(PapiHttpError::Throttled { .. })) {
+            self.gate.closed.cancel();
+        }
+
+        drop(permit);
+        result
+    }
+
     async fn send(
         &self,
         request: &PapiRequest,
@@ -671,6 +782,80 @@ impl PapiHttpClient {
             metadata,
             requested_at,
             received_at,
+        })
+    }
+
+    async fn send_public(
+        &self,
+        request: &PapiPublicRequest,
+        requested_at: Instant,
+    ) -> Result<RawResponse, PapiHttpError> {
+        let base_url = match request.origin() {
+            PublicOrigin::Fapi => &self.fapi_base_url,
+            PublicOrigin::Sapi => &self.sapi_base_url,
+        };
+        let url = format!("{base_url}{}", request.endpoint());
+        let mut builder = self.public.get(url).query(&request.params());
+
+        if request.requires_api_key() {
+            builder = builder.header("X-MBX-APIKEY", self.public_api_key.expose_secret());
+        }
+        let ts_requested = self.clock.get_time_ns();
+        let response = builder.send().await.map_err(|_| PapiHttpError::Sdk)?;
+        let status = response.status().as_u16();
+
+        if !(200..300).contains(&status) {
+            return Err(match status {
+                401 | 403 => PapiHttpError::Authentication {
+                    status: Some(status),
+                    code: None,
+                },
+                418 | 429 => PapiHttpError::Throttled {
+                    status: Some(status),
+                    code: None,
+                },
+                500 | 502 | 503 | 504 => PapiHttpError::Server(status),
+                _ => PapiHttpError::Rejected {
+                    status: Some(status),
+                    code: None,
+                },
+            });
+        }
+        let metadata = BinancePapiResponseMetadata {
+            endpoint: request.endpoint(),
+            symbol: request.symbol().map(str::to_owned),
+            status,
+            ts_requested,
+            ts_received: self.clock.get_time_ns(),
+            used_weight_1m: response
+                .headers()
+                .get("x-mbx-used-weight-1m")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok()),
+            order_count_1m: response
+                .headers()
+                .get("x-mbx-order-count-1m")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok()),
+            retry_after_seconds: response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok()),
+        };
+        let bytes = response.bytes().await.map_err(|_| PapiHttpError::Decode)?;
+
+        if bytes.len() > MAX_RESPONSE_BYTES {
+            return Err(PapiHttpError::ResponseTooLarge);
+        }
+        let body =
+            serde_json::from_slice::<Box<RawValue>>(&bytes).map_err(|_| PapiHttpError::Decode)?;
+
+        Ok(RawResponse {
+            body,
+            metadata,
+            requested_at,
+            received_at: Instant::now(),
         })
     }
 }

@@ -182,7 +182,11 @@ fn parse_order(payload: &[u8]) -> Result<PapiWsEvent, PapiWsError> {
     validate_identity(&event.order.client_order_id)?;
 
     if event.order.position_side != "BOTH"
-        || event.order.order_type != event.order.original_order_type
+        || event
+            .order
+            .original_order_type
+            .as_deref()
+            .is_some_and(|original| original != event.order.order_type.as_str())
         || event.order.quantity <= Decimal::ZERO
         || event.order.accumulated_qty > event.order.quantity
     {
@@ -494,8 +498,8 @@ struct OrderPayload {
     side: String,
     #[serde(rename = "o")]
     order_type: String,
-    #[serde(rename = "ot")]
-    original_order_type: String,
+    #[serde(rename = "ot", default)]
+    original_order_type: Option<String>,
     #[serde(rename = "f")]
     time_in_force: String,
     #[serde(rename = "q", deserialize_with = "deserialize_decimal")]
@@ -610,13 +614,13 @@ mod tests {
     use super::*;
 
     #[rstest]
-    fn parses_complete_trade_with_signed_native_commission() {
+    fn parses_official_trade_without_original_order_type() {
         let payload = json!({
             "e": "ORDER_TRADE_UPDATE", "E": 1_700_000_000_001_i64,
             "T": 1_700_000_000_000_i64, "fs": "UM",
             "o": {
                 "s": "BTCUSDT", "c": "client-1", "i": 42, "x": "TRADE",
-                "S": "BUY", "o": "LIMIT", "ot": "LIMIT", "f": "GTC",
+                "S": "BUY", "o": "LIMIT", "f": "GTC",
                 "q": "0.010", "p": "42000.10", "ap": "42000.10",
                 "R": false, "ps": "BOTH",
                 "X": "PARTIALLY_FILLED", "z": "0.002", "l": "0.001",
@@ -633,6 +637,25 @@ mod tests {
         assert_eq!(
             fill.commission,
             Decimal::from_str_exact("-0.00000123").unwrap()
+        );
+    }
+
+    #[rstest]
+    fn rejects_conflicting_optional_original_order_type() {
+        let payload = json!({
+            "e": "ORDER_TRADE_UPDATE", "E": 1_700_000_000_001_i64,
+            "T": 1_700_000_000_000_i64, "fs": "UM",
+            "o": {
+                "s": "BTCUSDT", "c": "client-1", "i": 42, "x": "NEW",
+                "S": "BUY", "o": "LIMIT", "ot": "MARKET", "f": "GTC",
+                "q": "0.010", "p": "42000.10", "ap": "0",
+                "R": false, "ps": "BOTH", "X": "NEW", "z": "0"
+            }
+        });
+
+        assert_eq!(
+            parse_event(payload.to_string().as_bytes()),
+            Err(PapiWsError::Scope)
         );
     }
 

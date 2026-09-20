@@ -85,7 +85,7 @@ def test_trading_config_preserves_exact_finite_limits(tmp_path: Path) -> None:
         instrument_limits=[instrument_limits],
         max_account_exposure=Decimal("15000.00"),
         max_in_flight_operations=4,
-        max_risk_age_ms=2_000,
+        max_risk_age_ms=10_000,
         max_risk_collection_span_ms=1_000,
         max_recovery_requests=32,
         max_recovery_rounds=3,

@@ -16,7 +16,7 @@
 //! Account-level admission, reservation, and restart-recovery coordination.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -39,7 +39,7 @@ use tokio_util::sync::CancellationToken;
 use super::journal::{
     JournalError, PapiCommandJournal, PapiIntentSide, PapiIntentTimeInForce,
     PapiOperationResolution, PapiOperationStage, PapiPersistedCommand, PapiPersistedOperation,
-    PapiReservation, PapiSubmitIntent, PapiUnknownReason,
+    PapiRecoveredOperation, PapiReservation, PapiSubmitIntent, PapiUnknownReason,
 };
 use crate::{
     config::{BinancePapiInstrumentTradingConfig, BinancePapiTradingConfig},
@@ -221,6 +221,7 @@ impl PapiCommandCoordinator {
         now: Instant,
     ) -> Result<(), CoordinatorError> {
         self.validate_evidence(&evidence, now)?;
+        self.validate_evidence_replacement(&evidence)?;
         self.evidence = Some(evidence);
         Ok(())
     }
@@ -246,32 +247,50 @@ impl PapiCommandCoordinator {
         }
     }
 
+    pub(crate) fn covers_order_account_update(
+        &self,
+        reason: &str,
+        symbols: &BTreeSet<String>,
+    ) -> bool {
+        if reason != "ORDER" {
+            return false;
+        }
+        let Some(evidence) = self.evidence.as_ref() else {
+            return false;
+        };
+        let covered_symbols: HashSet<_> = self
+            .journal
+            .operations()
+            .values()
+            .filter(|operation| risk_reservation_active(operation, evidence.generation))
+            .filter(|operation| {
+                matches!(operation.operation.command, PapiPersistedCommand::Submit(_))
+            })
+            .map(|operation| format_binance_symbol(&operation.operation.instrument_id))
+            .collect();
+
+        !covered_symbols.is_empty()
+            && (symbols.is_empty()
+                || symbols
+                    .iter()
+                    .all(|symbol| covered_symbols.contains(symbol)))
+    }
+
     /// Freezes increase-risk admission and starts a generation-bound rebaseline attempt.
     pub(crate) fn begin_rebaseline(
         &mut self,
         applied_fact_version: u64,
-        now: Instant,
+        _now: Instant,
     ) -> Result<PapiRebaselineToken, CoordinatorError> {
         if self.rebaseline.is_some() {
             return Err(CoordinatorError::RebaselineInProgress);
         }
 
-        let evidence_generation = self.current_evidence(now)?.generation;
-        if applied_fact_version == 0 {
-            return Err(CoordinatorError::ApplicationCheckpoint);
-        }
-
-        if self.journal.unresolved().any(|operation| {
-            !matches!(
-                (&operation.operation.command, &operation.stage),
-                (
-                    PapiPersistedCommand::Submit(_),
-                    PapiOperationStage::Observed { .. }
-                )
-            )
-        }) {
-            return Err(CoordinatorError::RebaselinePendingOperation);
-        }
+        let evidence_generation = self
+            .evidence
+            .as_ref()
+            .ok_or(CoordinatorError::MissingEvidence)?
+            .generation;
 
         let token = PapiRebaselineToken {
             id: UUID4::new(),
@@ -296,12 +315,14 @@ impl PapiCommandCoordinator {
         }
 
         if evidence.generation <= token.starting_evidence_generation
+            || applied_fact_version == 0
             || applied_fact_version < token.starting_applied_fact_version
         {
             return Err(CoordinatorError::RebaselineGeneration);
         }
 
         self.validate_evidence(&evidence, now)?;
+        self.validate_evidence_replacement(&evidence)?;
         self.validate_rebaseline_hard_limits(&evidence)?;
         let operation_ids = self.validate_rebaseline_coverage(&evidence)?;
 
@@ -324,6 +345,38 @@ impl PapiCommandCoordinator {
             .values()
             .any(|operation| matches!(operation.stage, PapiOperationStage::Unknown { .. }));
         self.rebaseline = None;
+        Ok(())
+    }
+
+    pub(crate) fn install_refresh(
+        &mut self,
+        evidence: PapiVerifiedRiskSnapshot,
+        applied_fact_version: u64,
+        now: Instant,
+        ts_event: UnixNanos,
+    ) -> Result<(), CoordinatorError> {
+        if self.rebaseline.is_some() || applied_fact_version == 0 {
+            return Err(CoordinatorError::RebaselineGeneration);
+        }
+
+        self.validate_evidence(&evidence, now)?;
+        self.validate_evidence_replacement(&evidence)?;
+        self.validate_rebaseline_hard_limits(&evidence)?;
+        let operation_ids = self.validate_rebaseline_coverage(&evidence)?;
+
+        if !operation_ids.is_empty() {
+            self.journal.rebaseline(
+                &operation_ids,
+                evidence.generation,
+                applied_fact_version,
+                ts_event,
+            )?;
+        }
+
+        for operation_id in &operation_ids {
+            self.recovered_unresolved.remove(operation_id);
+        }
+        self.evidence = Some(evidence);
         Ok(())
     }
 
@@ -602,14 +655,14 @@ impl PapiCommandCoordinator {
         operation_id: UUID4,
         acknowledgement: &PapiCommandAcknowledgement,
         ts_event: UnixNanos,
-    ) -> Result<(), CoordinatorError> {
-        let operation = self
+    ) -> Result<CommandSuccessApplication, CoordinatorError> {
+        let recovered = self
             .journal
             .operations()
             .get(&operation_id)
-            .ok_or(CoordinatorError::UnknownOperation(operation_id))?
-            .operation
-            .clone();
+            .ok_or(CoordinatorError::UnknownOperation(operation_id))?;
+        let operation = recovered.operation.clone();
+        let current_stage = recovered.stage.clone();
         let venue_identity_matches = match operation.command {
             PapiPersistedCommand::Cancel {
                 venue_order_id: Some(expected),
@@ -631,13 +684,30 @@ impl PapiCommandCoordinator {
             return Err(CoordinatorError::CommandResponseIdentity);
         }
 
+        match current_stage {
+            PapiOperationStage::Observed { venue_order_id }
+                if venue_order_id == acknowledgement.venue_order_id =>
+            {
+                return Ok(CommandSuccessApplication::Superseded);
+            }
+            PapiOperationStage::Resolved {
+                resolution:
+                    PapiOperationResolution::VenueRejected
+                    | PapiOperationResolution::Canceled
+                    | PapiOperationResolution::Expired
+                    | PapiOperationResolution::Filled,
+            } => return Ok(CommandSuccessApplication::Superseded),
+            _ => {}
+        }
+
         self.transition(
             operation_id,
             PapiOperationStage::Observed {
                 venue_order_id: acknowledgement.venue_order_id,
             },
             ts_event,
-        )
+        )?;
+        Ok(CommandSuccessApplication::Applied)
     }
 
     /// Dispatches one prepared submit from its durable intent and records every outcome.
@@ -819,27 +889,39 @@ impl PapiCommandCoordinator {
     }
 
     /// Applies one authoritative report to every unresolved operation with the same identity.
+    ///
+    /// Returns the number of durable operations which own that order identity, including operations
+    /// already resolved by an earlier report.
     pub(crate) fn apply_matching_order_report(
         &mut self,
         report: &OrderStatusReport,
         ts_event: UnixNanos,
     ) -> Result<usize, CoordinatorError> {
-        let operation_ids: Vec<_> = self
+        let matching: Vec<_> = self
             .journal
-            .unresolved()
+            .operations()
+            .values()
             .filter(|operation| {
                 operation.operation.account_id == report.account_id
                     && operation.operation.instrument_id == report.instrument_id
                     && report.client_order_id == Some(operation.operation.client_order_id)
                     && !matches!(operation.stage, PapiOperationStage::Prepared)
             })
-            .map(|operation| operation.operation.operation_id)
+            .map(|operation| {
+                (
+                    operation.operation.operation_id,
+                    matches!(operation.stage, PapiOperationStage::Resolved { .. }),
+                )
+            })
             .collect();
 
-        for operation_id in &operation_ids {
+        for (operation_id, resolved) in &matching {
+            if *resolved {
+                continue;
+            }
             self.apply_order_report(*operation_id, report, ts_event)?;
         }
-        Ok(operation_ids.len())
+        Ok(matching.len())
     }
 
     pub(crate) async fn recover_unknowns(
@@ -1027,10 +1109,21 @@ impl PapiCommandCoordinator {
     ) -> Result<PapiCommandResponse, CoordinatorDispatchError> {
         match result {
             Ok(response) => {
-                self.apply_command_success(operation_id, &response.acknowledgement, ts_event)?;
-                Ok(response)
+                match self.apply_command_success(
+                    operation_id,
+                    &response.acknowledgement,
+                    ts_event,
+                )? {
+                    CommandSuccessApplication::Applied => Ok(response),
+                    CommandSuccessApplication::Superseded => {
+                        Err(CoordinatorDispatchError::Superseded)
+                    }
+                }
             }
             Err(PapiCommandDispatchError::Command(failure)) => {
+                if self.report_already_applied(operation_id)? {
+                    return Err(CoordinatorDispatchError::Superseded);
+                }
                 self.apply_command_failure(operation_id, &failure, ts_event)?;
                 Err(CoordinatorDispatchError::Command(failure))
             }
@@ -1038,6 +1131,24 @@ impl PapiCommandCoordinator {
                 Err(CoordinatorDispatchError::Barrier(error))
             }
         }
+    }
+
+    fn report_already_applied(&self, operation_id: UUID4) -> Result<bool, CoordinatorError> {
+        let recovered = self
+            .journal
+            .operations()
+            .get(&operation_id)
+            .ok_or(CoordinatorError::UnknownOperation(operation_id))?;
+        Ok(matches!(
+            recovered.stage,
+            PapiOperationStage::Observed { .. }
+                | PapiOperationStage::Resolved {
+                    resolution: PapiOperationResolution::VenueRejected
+                        | PapiOperationResolution::Canceled
+                        | PapiOperationResolution::Expired
+                        | PapiOperationResolution::Filled,
+                }
+        ))
     }
 
     fn validate_dispatch(&self, operation_id: UUID4, now: Instant) -> Result<(), CoordinatorError> {
@@ -1211,6 +1322,34 @@ impl PapiCommandCoordinator {
             if !open_order_ids.insert(order.client_order_id) {
                 return Err(CoordinatorError::InvalidEvidence(
                     "open-order client identities must be unique",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_evidence_replacement(
+        &self,
+        evidence: &PapiVerifiedRiskSnapshot,
+    ) -> Result<(), CoordinatorError> {
+        let Some(current) = &self.evidence else {
+            return Ok(());
+        };
+
+        if evidence.generation <= current.generation {
+            return Err(CoordinatorError::EvidenceGenerationNotIncreasing);
+        }
+
+        for (instrument_id, risk) in &evidence.instruments {
+            let Some(current_risk) = current.instruments.get(instrument_id) else {
+                continue;
+            };
+
+            if risk.price_generation < current_risk.price_generation
+                || risk.rules.generation < current_risk.rules.generation
+            {
+                return Err(CoordinatorError::InstrumentGenerationRollback(
+                    *instrument_id,
                 ));
             }
         }
@@ -1405,9 +1544,10 @@ impl PapiCommandCoordinator {
             )?;
         }
 
-        for operation in self.journal.unresolved().filter(|operation| {
+        for operation in self.journal.operations().values().filter(|operation| {
             operation.operation.instrument_id == instrument_id
                 && matches!(operation.operation.command, PapiPersistedCommand::Submit(_))
+                && risk_reservation_active(operation, evidence.generation)
         }) {
             let PapiPersistedCommand::Submit(submit) = &operation.operation.command else {
                 continue;
@@ -1472,7 +1612,12 @@ impl PapiCommandCoordinator {
         let mut open_order_exposure = Decimal::ZERO;
         let mut open_instrument_exposure = Decimal::ZERO;
 
-        for operation in self.journal.unresolved() {
+        for operation in self
+            .journal
+            .operations()
+            .values()
+            .filter(|operation| risk_reservation_active(operation, evidence.generation))
+        {
             let Some(existing) = &operation.operation.reservation else {
                 continue;
             };
@@ -1862,6 +2007,10 @@ pub(crate) enum CoordinatorError {
     CollectionSpan,
     #[error("PAPI admission evidence generations do not agree")]
     GenerationMismatch,
+    #[error("PAPI admission evidence generation did not advance")]
+    EvidenceGenerationNotIncreasing,
+    #[error("PAPI instrument evidence generation moved backward for {0}")]
+    InstrumentGenerationRollback(InstrumentId),
     #[error("PAPI admission evidence risk currency does not match configuration")]
     RiskCurrencyMismatch,
     #[error("Invalid PAPI admission evidence: {0}")]
@@ -1880,8 +2029,6 @@ pub(crate) enum CoordinatorError {
     RecoveryRestricted,
     #[error("PAPI risk rebaseline is already in progress")]
     RebaselineInProgress,
-    #[error("PAPI risk rebaseline requires an applied execution fact checkpoint")]
-    ApplicationCheckpoint,
     #[error("PAPI risk rebaseline has an unmatched attempt token")]
     RebaselineToken,
     #[error("PAPI risk rebaseline evidence or application generation did not advance")]
@@ -1966,8 +2113,16 @@ pub(crate) enum CoordinatorDispatchError {
     Command(PapiCommandFailure),
     #[error("PAPI durable dispatch barrier failed")]
     Barrier(#[source] anyhow::Error),
+    #[error("PAPI command result was superseded by an authoritative order report")]
+    Superseded,
     #[error(transparent)]
     Coordinator(#[from] CoordinatorError),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommandSuccessApplication {
+    Applied,
+    Superseded,
 }
 
 fn intent_side(intent: &PapiSubmitIntent) -> PapiIntentSide {
@@ -2006,6 +2161,25 @@ fn intent_reduce_only(intent: &PapiSubmitIntent) -> bool {
     match intent {
         PapiSubmitIntent::Market { reduce_only, .. }
         | PapiSubmitIntent::Limit { reduce_only, .. } => *reduce_only,
+    }
+}
+
+fn risk_reservation_active(operation: &PapiRecoveredOperation, evidence_generation: u64) -> bool {
+    if operation.operation.reservation.is_none()
+        || !matches!(operation.operation.command, PapiPersistedCommand::Submit(_))
+    {
+        return false;
+    }
+
+    match operation.stage {
+        PapiOperationStage::Resolved {
+            resolution:
+                PapiOperationResolution::Filled
+                | PapiOperationResolution::Canceled
+                | PapiOperationResolution::Expired,
+        } => operation.operation.generation >= evidence_generation,
+        PapiOperationStage::Resolved { .. } => false,
+        _ => true,
     }
 }
 
@@ -2166,7 +2340,7 @@ mod tests {
             }],
             max_account_exposure: dec!(200000),
             max_in_flight_operations: 4,
-            max_risk_age_ms: 2_000,
+            max_risk_age_ms: 10_000,
             max_risk_collection_span_ms: 1_000,
             max_recovery_requests: 32,
             max_recovery_rounds: 3,
@@ -2560,6 +2734,95 @@ mod tests {
     }
 
     #[rstest]
+    #[case("prepared", true)]
+    #[case("may_have_dispatched", true)]
+    #[case("unknown", true)]
+    #[case("observed", true)]
+    #[case("resolved", false)]
+    fn restart_preserves_restriction_for_every_durable_operation_stage(
+        #[case] stage: &str,
+        #[case] restricted: bool,
+    ) {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("commands.journal");
+        let now = Instant::now();
+
+        {
+            let mut coordinator =
+                PapiCommandCoordinator::open(config(&path), AccountId::from("BINANCE-PAPI-001"))
+                    .unwrap();
+            coordinator
+                .install_evidence(evidence(now, Decimal::ZERO), now)
+                .unwrap();
+            let operation = submit("O-001", PapiIntentSide::Buy, false);
+            let operation_id = operation.operation_id;
+            coordinator.prepare_submit(operation, now).unwrap();
+
+            if stage != "prepared" {
+                coordinator
+                    .transition(
+                        operation_id,
+                        PapiOperationStage::MayHaveDispatched,
+                        UnixNanos::from(2),
+                    )
+                    .unwrap();
+            }
+
+            match stage {
+                "prepared" | "may_have_dispatched" => {}
+                "unknown" => coordinator
+                    .transition(
+                        operation_id,
+                        PapiOperationStage::Unknown {
+                            reason: PapiUnknownReason::Timeout,
+                        },
+                        UnixNanos::from(3),
+                    )
+                    .unwrap(),
+                "observed" | "resolved" => {
+                    coordinator
+                        .transition(
+                            operation_id,
+                            PapiOperationStage::Observed { venue_order_id: 42 },
+                            UnixNanos::from(3),
+                        )
+                        .unwrap();
+
+                    if stage == "resolved" {
+                        coordinator
+                            .transition(
+                                operation_id,
+                                PapiOperationStage::Resolved {
+                                    resolution: PapiOperationResolution::Canceled,
+                                },
+                                UnixNanos::from(4),
+                            )
+                            .unwrap();
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        let mut recovered =
+            PapiCommandCoordinator::open(config(&path), AccountId::from("BINANCE-PAPI-001"))
+                .unwrap();
+        recovered
+            .install_evidence(evidence(now, Decimal::ZERO), now)
+            .unwrap();
+
+        assert_eq!(!recovered.permissions(now).increase_risk, restricted);
+        assert_eq!(recovered.journal().unresolved().count() > 0, restricted);
+
+        let result = recovered.prepare_submit(submit("O-002", PapiIntentSide::Buy, false), now);
+        if restricted {
+            assert!(matches!(result, Err(CoordinatorError::RecoveryRestricted)));
+        } else {
+            result.unwrap();
+        }
+    }
+
+    #[rstest]
     fn ambiguous_result_freezes_new_increase_risk_and_keeps_reservation() {
         let directory = TempDir::new().unwrap();
         let now = Instant::now();
@@ -2777,6 +3040,214 @@ mod tests {
     }
 
     #[rstest]
+    #[case(
+        OrderStatus::Accepted,
+        PapiOperationStage::Observed { venue_order_id: 42 }
+    )]
+    #[case(
+        OrderStatus::Filled,
+        PapiOperationStage::Resolved {
+            resolution: PapiOperationResolution::Filled,
+        }
+    )]
+    fn authoritative_report_supersedes_late_successful_response(
+        #[case] status: OrderStatus,
+        #[case] expected_stage: PapiOperationStage,
+    ) {
+        let directory = TempDir::new().unwrap();
+        let now = Instant::now();
+        let mut coordinator = PapiCommandCoordinator::open(
+            config(&directory.path().join("commands.journal")),
+            AccountId::from("BINANCE-PAPI-001"),
+        )
+        .unwrap();
+        coordinator
+            .install_evidence(evidence(now, Decimal::ZERO), now)
+            .unwrap();
+        let operation = submit("O-001", PapiIntentSide::Buy, false);
+        let operation_id = operation.operation_id;
+        coordinator.prepare_submit(operation, now).unwrap();
+        coordinator
+            .dispatch_barrier(operation_id, now, UnixNanos::from(2))
+            .unwrap();
+        coordinator
+            .apply_order_report(operation_id, &report("O-001", status), UnixNanos::from(3))
+            .unwrap();
+
+        let result = coordinator
+            .apply_command_success(
+                operation_id,
+                &PapiCommandAcknowledgement {
+                    venue_order_id: 42,
+                    client_order_id: "O-001".to_owned(),
+                },
+                UnixNanos::from(4),
+            )
+            .unwrap();
+
+        assert_eq!(result, CommandSuccessApplication::Superseded);
+        assert_eq!(
+            coordinator.journal().operations()[&operation_id].stage,
+            expected_stage
+        );
+    }
+
+    #[rstest]
+    fn filled_reservation_remains_charged_while_immediate_capacity_is_available() {
+        let directory = TempDir::new().unwrap();
+        let now = Instant::now();
+        let mut coordinator = PapiCommandCoordinator::open(
+            config(&directory.path().join("commands.journal")),
+            AccountId::from("BINANCE-PAPI-001"),
+        )
+        .unwrap();
+        coordinator
+            .install_evidence(evidence(now, Decimal::ZERO), now)
+            .unwrap();
+        let first = submit("O-001", PapiIntentSide::Buy, false);
+        let first_id = first.operation_id;
+        coordinator.prepare_submit(first, now).unwrap();
+        coordinator
+            .dispatch_barrier(first_id, now, UnixNanos::from(2))
+            .unwrap();
+        coordinator
+            .apply_order_report(
+                first_id,
+                &report("O-001", OrderStatus::Filled),
+                UnixNanos::from(3),
+            )
+            .unwrap();
+
+        let recovered = &coordinator.journal().operations()[&first_id];
+        assert!(risk_reservation_active(recovered, 7));
+        coordinator
+            .prepare_submit(submit("O-002", PapiIntentSide::Buy, false), now)
+            .unwrap();
+    }
+
+    #[rstest]
+    fn newer_soft_refresh_releases_terminal_carry_only_after_installation() {
+        let directory = TempDir::new().unwrap();
+        let now = Instant::now();
+        let mut baseline = evidence(now, Decimal::ZERO);
+        baseline.available_initial_margin = dec!(2000);
+        let mut coordinator = PapiCommandCoordinator::open(
+            config(&directory.path().join("commands.journal")),
+            AccountId::from("BINANCE-PAPI-001"),
+        )
+        .unwrap();
+        coordinator.install_evidence(baseline, now).unwrap();
+        let first = submit("O-001", PapiIntentSide::Buy, false);
+        let first_id = first.operation_id;
+        coordinator.prepare_submit(first, now).unwrap();
+        coordinator
+            .dispatch_barrier(first_id, now, UnixNanos::from(2))
+            .unwrap();
+        coordinator
+            .apply_order_report(
+                first_id,
+                &report("O-001", OrderStatus::Filled),
+                UnixNanos::from(3),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            coordinator
+                .prepare_submit(submit("O-002", PapiIntentSide::Buy, false), now)
+                .unwrap_err(),
+            CoordinatorError::InitialMarginCapacity
+        ));
+
+        let mut refreshed = advance_evidence_generation(evidence(now, dec!(0.5)), 8);
+        refreshed.available_initial_margin = dec!(2000);
+        coordinator
+            .install_refresh(refreshed, 11, now, UnixNanos::from(4))
+            .unwrap();
+        assert!(!risk_reservation_active(
+            &coordinator.journal().operations()[&first_id],
+            8
+        ));
+        coordinator
+            .prepare_submit(submit("O-002", PapiIntentSide::Buy, false), now)
+            .unwrap();
+    }
+
+    #[rstest]
+    fn order_account_update_is_soft_only_when_active_owned_risk_covers_its_symbols() {
+        let directory = TempDir::new().unwrap();
+        let now = Instant::now();
+        let mut coordinator = PapiCommandCoordinator::open(
+            config(&directory.path().join("commands.journal")),
+            AccountId::from("BINANCE-PAPI-001"),
+        )
+        .unwrap();
+        coordinator
+            .install_evidence(evidence(now, Decimal::ZERO), now)
+            .unwrap();
+        coordinator
+            .prepare_submit(submit("O-001", PapiIntentSide::Buy, false), now)
+            .unwrap();
+
+        assert!(
+            coordinator
+                .covers_order_account_update("ORDER", &BTreeSet::from(["BTCUSDT".to_string()]))
+        );
+        assert!(
+            !coordinator.covers_order_account_update(
+                "FUNDING_FEE",
+                &BTreeSet::from(["BTCUSDT".to_string()])
+            )
+        );
+        assert!(
+            !coordinator
+                .covers_order_account_update("ORDER", &BTreeSet::from(["ETHUSDT".to_string()]))
+        );
+    }
+
+    #[rstest]
+    fn matching_report_count_retains_owned_identity_after_resolution() {
+        let directory = TempDir::new().unwrap();
+        let now = Instant::now();
+        let mut coordinator = PapiCommandCoordinator::open(
+            config(&directory.path().join("commands.journal")),
+            AccountId::from("BINANCE-PAPI-001"),
+        )
+        .unwrap();
+        coordinator
+            .install_evidence(evidence(now, Decimal::ZERO), now)
+            .unwrap();
+        let operation = submit("O-001", PapiIntentSide::Buy, false);
+        let operation_id = operation.operation_id;
+        coordinator.prepare_submit(operation, now).unwrap();
+        coordinator
+            .dispatch_barrier(operation_id, now, UnixNanos::from(2))
+            .unwrap();
+
+        let filled = report("O-001", OrderStatus::Filled);
+        assert_eq!(
+            coordinator
+                .apply_matching_order_report(&filled, UnixNanos::from(3))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            coordinator
+                .apply_matching_order_report(&filled, UnixNanos::from(4))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            coordinator
+                .apply_matching_order_report(
+                    &report("EXTERNAL", OrderStatus::Accepted),
+                    UnixNanos::from(5),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[rstest]
     fn rebaseline_requires_covered_orders_and_atomically_ends_old_reservations() {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("commands.journal");
@@ -2849,6 +3320,33 @@ mod tests {
                 resolution: PapiOperationResolution::RebasedAfterReconciliation,
             }
         );
+    }
+
+    #[rstest]
+    fn hard_rebaseline_freezes_increase_risk_with_a_pending_operation() {
+        let directory = TempDir::new().unwrap();
+        let now = Instant::now();
+        let mut coordinator = PapiCommandCoordinator::open(
+            config(&directory.path().join("commands.journal")),
+            AccountId::from("BINANCE-PAPI-001"),
+        )
+        .unwrap();
+        coordinator
+            .install_evidence(evidence(now, Decimal::ZERO), now)
+            .unwrap();
+        coordinator
+            .prepare_submit(submit("O-001", PapiIntentSide::Buy, false), now)
+            .unwrap();
+
+        coordinator.begin_rebaseline(10, now).unwrap();
+
+        assert!(!coordinator.permissions(now).increase_risk);
+        assert!(matches!(
+            coordinator
+                .prepare_submit(submit("O-002", PapiIntentSide::Buy, false), now)
+                .unwrap_err(),
+            CoordinatorError::RecoveryRestricted
+        ));
     }
 
     #[rstest]
@@ -2926,6 +3424,71 @@ mod tests {
                 .unwrap_err(),
             CoordinatorError::PositionLimit
         ));
+    }
+
+    #[rstest]
+    #[case("price")]
+    #[case("rules")]
+    fn rebaseline_rejects_instrument_source_generation_rollback(#[case] source: &str) {
+        let directory = TempDir::new().unwrap();
+        let now = Instant::now();
+        let mut coordinator = PapiCommandCoordinator::open(
+            config(&directory.path().join("commands.journal")),
+            AccountId::from("BINANCE-PAPI-001"),
+        )
+        .unwrap();
+        coordinator
+            .install_evidence(evidence(now, Decimal::ZERO), now)
+            .unwrap();
+        let token = coordinator.begin_rebaseline(10, now).unwrap();
+        let mut replacement = advance_evidence_generation(evidence(now, Decimal::ZERO), 8);
+        let risk = replacement.instruments.get_mut(&instrument_id()).unwrap();
+
+        match source {
+            "price" => risk.price_generation -= 1,
+            "rules" => risk.rules.generation -= 1,
+            _ => unreachable!(),
+        }
+
+        assert!(matches!(
+            coordinator
+                .install_rebaseline(token, replacement, 11, now, UnixNanos::from(2))
+                .unwrap_err(),
+            CoordinatorError::InstrumentGenerationRollback(id) if id == instrument_id()
+        ));
+        assert_eq!(coordinator.evidence.as_ref().unwrap().generation, 7);
+        assert!(!coordinator.permissions(now).increase_risk);
+    }
+
+    #[rstest]
+    fn rebaseline_cannot_replace_evidence_installed_after_attempt_started() {
+        let directory = TempDir::new().unwrap();
+        let now = Instant::now();
+        let mut coordinator = PapiCommandCoordinator::open(
+            config(&directory.path().join("commands.journal")),
+            AccountId::from("BINANCE-PAPI-001"),
+        )
+        .unwrap();
+        coordinator
+            .install_evidence(evidence(now, Decimal::ZERO), now)
+            .unwrap();
+        let token = coordinator.begin_rebaseline(10, now).unwrap();
+        coordinator
+            .install_evidence(
+                advance_evidence_generation(evidence(now, Decimal::ZERO), 9),
+                now,
+            )
+            .unwrap();
+
+        let older = advance_evidence_generation(evidence(now, Decimal::ZERO), 8);
+        assert!(matches!(
+            coordinator
+                .install_rebaseline(token, older, 11, now, UnixNanos::from(2))
+                .unwrap_err(),
+            CoordinatorError::EvidenceGenerationNotIncreasing
+        ));
+        assert_eq!(coordinator.evidence.as_ref().unwrap().generation, 9);
+        assert!(!coordinator.permissions(now).increase_risk);
     }
 
     #[tokio::test]
@@ -3719,6 +4282,70 @@ mod tests {
     }
 
     #[rstest]
+    fn evidence_replacement_requires_a_newer_complete_generation() {
+        let directory = TempDir::new().unwrap();
+        let now = Instant::now();
+        let mut coordinator = PapiCommandCoordinator::open(
+            config(&directory.path().join("commands.journal")),
+            AccountId::from("BINANCE-PAPI-001"),
+        )
+        .unwrap();
+        coordinator
+            .install_evidence(evidence(now, Decimal::ZERO), now)
+            .unwrap();
+
+        let same = advance_evidence_generation(evidence(now, Decimal::ZERO), 7);
+        assert!(matches!(
+            coordinator.install_evidence(same, now).unwrap_err(),
+            CoordinatorError::EvidenceGenerationNotIncreasing
+        ));
+
+        let older = advance_evidence_generation(evidence(now, Decimal::ZERO), 6);
+        assert!(matches!(
+            coordinator.install_evidence(older, now).unwrap_err(),
+            CoordinatorError::EvidenceGenerationNotIncreasing
+        ));
+        assert_eq!(coordinator.evidence.as_ref().unwrap().generation, 7);
+
+        let newer = advance_evidence_generation(evidence(now, Decimal::ZERO), 8);
+        coordinator.install_evidence(newer, now).unwrap();
+        assert_eq!(coordinator.evidence.as_ref().unwrap().generation, 8);
+    }
+
+    #[rstest]
+    #[case("price")]
+    #[case("rules")]
+    fn evidence_replacement_rejects_instrument_source_generation_rollback(#[case] source: &str) {
+        let directory = TempDir::new().unwrap();
+        let now = Instant::now();
+        let mut coordinator = PapiCommandCoordinator::open(
+            config(&directory.path().join("commands.journal")),
+            AccountId::from("BINANCE-PAPI-001"),
+        )
+        .unwrap();
+        coordinator
+            .install_evidence(evidence(now, Decimal::ZERO), now)
+            .unwrap();
+        let mut replacement = advance_evidence_generation(evidence(now, Decimal::ZERO), 8);
+        let risk = replacement.instruments.get_mut(&instrument_id()).unwrap();
+
+        match source {
+            "price" => risk.price_generation -= 1,
+            "rules" => risk.rules.generation -= 1,
+            _ => unreachable!(),
+        }
+
+        assert!(matches!(
+            coordinator
+                .install_evidence(replacement, now)
+                .unwrap_err(),
+            CoordinatorError::InstrumentGenerationRollback(id) if id == instrument_id()
+        ));
+        assert_eq!(coordinator.evidence.as_ref().unwrap().generation, 7);
+        assert!(coordinator.permissions(now).increase_risk);
+    }
+
+    #[rstest]
     fn stale_mismatched_or_incomplete_evidence_fails_closed() {
         let directory = TempDir::new().unwrap();
         let now = Instant::now();
@@ -3728,7 +4355,7 @@ mod tests {
         )
         .unwrap();
         let mut stale = evidence(
-            now.checked_sub(Duration::from_secs(3)).unwrap(),
+            now.checked_sub(Duration::from_secs(11)).unwrap(),
             Decimal::ZERO,
         );
         stale

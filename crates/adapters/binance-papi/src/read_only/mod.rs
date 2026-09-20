@@ -20,6 +20,7 @@
 
 mod config;
 mod projection;
+mod risk;
 
 #[cfg(test)]
 mod engine_tests;
@@ -690,7 +691,8 @@ impl BinancePapiReadOnlyClient {
 
     /// Returns explicit one-way position rows for every requested instrument.
     ///
-    /// An omitted row is an error. Sparse account V2 data is never used to infer a flat position.
+    /// A successful symbol-scoped empty response is a flat position. Sparse account V2 data is
+    /// never used by itself to infer a flat position.
     ///
     /// # Errors
     ///

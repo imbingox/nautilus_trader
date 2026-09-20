@@ -19,12 +19,13 @@ the venue response can be verified; failures and not-found responses never becom
 With explicit credentials and preloaded instrument scope, the execution client starts a private
 account stream before collecting its REST baseline. It publishes the reported totals-only account
 state, delivers deduplicated ordinary order/fill updates as typed execution reports, and uses
-bounded mass status recovery for account changes and later transport gaps. Connection,
-synchronization, delivery, application, and trading authorization remain separate. Trading is
-default-off. With explicit trading configuration, supported commands use durable admission and
-single-dispatch transport, but increase-risk submission remains fail-closed until authenticated PM
-risk evidence is installed. Construction performs no network requests. Cleanup is idempotent,
-bounded, and a later start uses a new cancellation domain.
+coalesced current-state risk refreshes for account changes. Historical mass status recovery is
+reserved for startup and transport gaps. Connection, synchronization, delivery, application, and
+trading authorization remain separate. Trading is default-off. With explicit trading
+configuration, supported commands use durable admission and single-dispatch transport, but
+increase-risk submission remains fail-closed until authenticated PM risk evidence is installed.
+Construction performs no network requests. Cleanup is idempotent, bounded, and a later start uses
+a new cancellation domain.
 
 The independent factory name and default client ID are `BINANCE_PAPI`. Instrument venue
 remains `BINANCE`. The default account ID is `BINANCE-PAPI-001`, keeping its issuer
@@ -132,6 +133,22 @@ Risk rebaseline is a generation-bound durable transition. It requires an explici
 checkpoint, a newer complete risk snapshot, no possibly dispatched or pending cancel operation,
 and exact open-order coverage for every observed submit before ending its reservations. Repeated
 rebaseline cannot reset position, open-order, instrument-exposure, or account-exposure limits.
+Every replacement risk snapshot, including rebaseline, must advance the complete evidence
+generation; per-instrument price and rule source generations may remain unchanged but cannot move
+backward. Rejected replacements leave the last valid evidence installed.
+
+An `ACCOUNT_UPDATE` attributable to a journal-owned order starts a soft refresh window while the
+previous reservation remains charged, so another order can proceed immediately when the retained
+risk and the new reservation remain within every limit. Updates are coalesced after three quiet
+seconds and continuous updates force a refresh within five seconds. Unowned orders, non-order
+account changes, transport uncertainty, conflicts, and failed refresh application immediately
+freeze increase-risk admission. The configured risk evidence age must be at least ten seconds so
+the refresh window cannot expire otherwise valid evidence. The worker reuses the risk collection's
+account, scoped position, and open-order responses to publish current state, so it performs no
+historical order or fill scan and does not duplicate current position/order reads. WebSocket order
+and fill delivery continues while the worker is awaiting REST. A newer risk generation is installed
+only after the execution engine applies the matching current-state report; failure leaves
+increase-risk admission closed.
 
 ## Private-stream capability matrix
 
@@ -140,7 +157,7 @@ rebaseline cannot reset position, open-order, instrument-exposure, or account-ex
 | listen key POST/PUT/DELETE                                              | API-key authenticated lifecycle with empty-response support; no signed query or arbitrary write surface.                                                            |
 | `ORDER_TRADE_UPDATE`                                                    | Validates ordinary type, side, TIF, quantity, price, reduce-only and one-way terms; emits one deduplicated typed order/fill delivery with signed native commission. |
 | `ALGO_UPDATE`                                                           | Accepts the current `ao` UM one-way schema and retains parent/child identity; legacy conditional events are restricted.                                             |
-| `ACCOUNT_UPDATE`                                                        | Treats positions as partial rows, never clears an omitted position, and marks wallet/risk/position sources dirty for REST confirmation.                             |
+| `ACCOUNT_UPDATE`                                                        | Treats positions as partial rows, never clears an omitted position, and schedules one 3-5 second current-state risk refresh without historical scans.               |
 | Balance, liability, risk, and config notices                            | Invalidates the affected source and coalesces a bounded REST refresh; it does not synthesize PM wallet totals from UM deltas.                                       |
 | Unknown critical event, unsupported product/mode, conflict, or overflow | Revokes synchronization and latches the session in `restricted` until an explicit new session generation.                                                           |
 
@@ -285,8 +302,9 @@ retention, selection timestamps or algo discovery contract. The real execution-e
 verify that these incomplete snapshots preserve explicit fees while suppressing historical
 position/portfolio effects. Separate local REST/WebSocket tests verify that a typed order/fill
 delta is applied once through the real execution engine and portfolio without forcing a full REST
-recovery, while a duplicate delta has no second effect. These tests do not establish readiness for
-live reconciliation.
+recovery, while a duplicate delta has no second effect. Risk-refresh tests verify burst coalescing,
+current-state report construction from the risk reads, and the absence of historical endpoints.
+These tests do not establish readiness for live reconciliation.
 
 Snapshot `to_json()` preserves the fixed window, instrument scope, reports, response metadata,
 and coverage issues. `cancel()` stops outstanding and future calls on that read-only client.
@@ -452,11 +470,15 @@ converges. The
 [official report examples](test_data/reports/README.md) do not establish live compatibility.
 
 Authenticated endpoint behavior for the sampled scope and supported wallet projection is accepted.
-Remaining acceptance work covers unsupported account states and unobserved historical, algo,
-retention, flat-account, and throttling behavior. Authenticated PM risk semantics and separately
-authorized live MARKET/LIMIT/post-only/reduce-only/cancel/fill/rebaseline acceptance remain open;
-the connected production increase-risk path stays closed until that evidence exists.
-The rationale and acceptance obligations are recorded in [RESEARCH.md](RESEARCH.md).
+A bounded 2026-09-20 live run also accepted authenticated PM risk startup and ordinary UM MARKET,
+LIMIT GTC/IOC/FOK, GTX post-only, reduce-only close and exact targeted cancellation for one
+allowlisted BTCUSDT scope. Final REST observations showed BTCUSDT flat with no open order and the
+pre-existing read-only GWEIUSDT position unchanged. A follow-up decoder and stream-scheduling fix
+delivered MARKET open and reduce-only close fills about 160 ms after submission, before subsequent
+REST account recovery. Direct IOC expiration, partial and multi-fill orders, dynamic production
+rebaseline, unsupported account states, unobserved historical/algo retention and live throttling
+remain open acceptance work. The rationale and detailed evidence are recorded in
+[ACCOUNT_VERIFICATION.md](ACCOUNT_VERIFICATION.md).
 
 ## Local tests
 

@@ -28,6 +28,7 @@ pub(super) struct FactApplication {
     pub(super) changed: bool,
     pub(super) version: u64,
     pub(super) order: Option<OrderDelta>,
+    pub(super) refresh_risk: bool,
     pub(super) requires_recovery: bool,
 }
 
@@ -70,11 +71,11 @@ impl FactState {
                     self.dirty
                         .insert(DirtySourceKey::Instrument(position.symbol));
                 }
-                self.changed(true, None)
+                self.changed(false, true, None)
             }
             PapiWsEvent::Dirty(dirty) => {
                 self.dirty.insert(dirty.source.into());
-                self.changed(true, None)
+                self.changed(true, false, None)
             }
             PapiWsEvent::ListenKeyExpired { .. } => Err("PAPI listen key expired".to_string()),
         }
@@ -164,6 +165,7 @@ impl FactState {
             };
             self.changed(
                 false,
+                false,
                 Some(OrderDelta {
                     order: retained,
                     fill: inserted_fill,
@@ -200,7 +202,7 @@ impl FactState {
         self.dirty
             .insert(DirtySourceKey::Instrument(algo.symbol.clone()));
         self.algos.insert(key, algo);
-        self.changed(true, None)
+        self.changed(true, false, None)
     }
 
     fn ensure_capacity(&self) -> Result<(), String> {
@@ -222,6 +224,7 @@ impl FactState {
     fn changed(
         &mut self,
         requires_recovery: bool,
+        refresh_risk: bool,
         order: Option<OrderDelta>,
     ) -> Result<FactApplication, String> {
         self.advance_version()?;
@@ -229,6 +232,7 @@ impl FactState {
             changed: true,
             version: self.fact_version,
             order,
+            refresh_risk,
             requires_recovery,
         })
     }
@@ -238,6 +242,7 @@ impl FactState {
             changed: false,
             version: self.fact_version,
             order: None,
+            refresh_risk: false,
             requires_recovery: false,
         }
     }
@@ -287,7 +292,7 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use super::*;
-    use crate::websocket::messages::FillFact;
+    use crate::websocket::messages::{AccountFact, FillFact};
 
     fn order(trade_id: i64, accumulated_qty: rust_decimal::Decimal) -> OrderFact {
         OrderFact {
@@ -332,6 +337,24 @@ mod tests {
             .unwrap();
         assert_eq!(state.trades.len(), 2);
         assert_eq!(state.fact_version, 2);
+    }
+
+    #[rstest]
+    fn account_update_requests_risk_refresh_without_full_recovery() {
+        let mut state = FactState::new(8);
+        let application = state
+            .apply(PapiWsEvent::Account(AccountFact {
+                reason: "ORDER".to_string(),
+                positions: Vec::new(),
+                event_time_ms: 1_700_000_000_000,
+                transaction_time_ms: 1_700_000_000_000,
+            }))
+            .unwrap();
+
+        assert!(application.changed);
+        assert!(application.refresh_risk);
+        assert!(!application.requires_recovery);
+        assert!(application.order.is_none());
     }
 
     #[rstest]

@@ -31,6 +31,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::read_only::BinancePapiReadOnlyConfig;
 
+const MIN_TRADING_RISK_AGE_MS: u64 = 10_000;
+
 /// Hard trading limits for one explicitly allowed linear UM instrument.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -163,9 +165,9 @@ impl BinancePapiTradingConfig {
             "Invalid PAPI in-flight operation limit"
         );
         anyhow::ensure!(
-            (1..=60_000).contains(&self.max_risk_age_ms)
+            (MIN_TRADING_RISK_AGE_MS..=60_000).contains(&self.max_risk_age_ms)
                 && (1..=self.max_risk_age_ms).contains(&self.max_risk_collection_span_ms),
-            "Invalid PAPI risk evidence timing"
+            "PAPI risk evidence age must be 10000 to 60000 milliseconds and cover the collection span"
         );
         anyhow::ensure!(
             (1..=10_000).contains(&self.max_recovery_requests)
@@ -332,7 +334,7 @@ mod tests {
             instrument_limits: vec![instrument_limits(instrument_id)],
             max_account_exposure: dec!(15000.00),
             max_in_flight_operations: 4,
-            max_risk_age_ms: 2_000,
+            max_risk_age_ms: 10_000,
             max_risk_collection_span_ms: 1_000,
             max_recovery_requests: 32,
             max_recovery_rounds: 3,
@@ -504,7 +506,7 @@ mod tests {
             "instrument_above_account" => {
                 config.max_account_exposure = dec!(9000.00);
             }
-            "invalid_risk_timing" => config.max_risk_collection_span_ms = 2_001,
+            "invalid_risk_timing" => config.max_risk_age_ms = MIN_TRADING_RISK_AGE_MS - 1,
             "zero_price_buffer" => config.market_order_price_buffer_bps = 0,
             "relative_journal" => config.command_journal_path = "relative.journal".into(),
             "journal_is_directory" => config.command_journal_path = std::env::temp_dir(),

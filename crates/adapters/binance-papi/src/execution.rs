@@ -21,7 +21,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -61,25 +61,297 @@ use nautilus_model::{
 use parking_lot::Mutex;
 
 use crate::{
-    config::BinancePapiExecutionClientConfig,
+    config::{BinancePapiExecutionClientConfig, BinancePapiTradingConfig},
     read_only::BinancePapiReadOnlyClient,
     reports::parse::{OrderFamily, venue_order_id},
     trading::{
         commands::{batch_cancel_operations, cancel_operation, submit_operation},
-        coordinator::{CoordinatorDispatchError, PapiCancelPreparation, PapiCommandCoordinator},
+        coordinator::{
+            CoordinatorDispatchError, PapiCancelPreparation, PapiCommandCoordinator,
+            PapiRebaselineToken, PapiVerifiedRiskSnapshot,
+        },
         journal::{PapiOperationResolution, PapiOperationStage, PapiPersistedOperation},
     },
-    websocket::{BinancePapiAccountSession, PapiIncrementalBundle, PapiRecoveryBundle},
+    websocket::{
+        BinancePapiAccountSession, PapiIncrementalBundle, PapiRecoveryBundle,
+        PapiRefreshAcknowledgement, PapiRiskRefreshHandler, PapiRiskRefreshSignal,
+    },
 };
 
 const TASK_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const TASK_SHUTDOWN_ABORT: Duration = Duration::from_secs(2);
+const RISK_REFRESH_QUIET_DELAY: Duration = Duration::from_secs(3);
+const RISK_REFRESH_MAX_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 struct PapiPendingApplication {
     checkpoint: crate::websocket::PapiApplicationCheckpoint,
     account_state: Option<AccountState>,
     report: ExecutionReport,
+}
+
+#[derive(Clone, Debug)]
+struct PapiPendingRiskApplication {
+    application: PapiPendingApplication,
+    dirty_generation: u64,
+    token: Option<PapiRebaselineToken>,
+    evidence: PapiVerifiedRiskSnapshot,
+}
+
+#[derive(Debug, Default)]
+struct PapiRiskRefreshState {
+    token: Option<PapiRebaselineToken>,
+    pending: Option<PapiPendingRiskApplication>,
+}
+
+#[derive(Debug, Default)]
+struct PapiRiskRefreshControl {
+    ready: AtomicBool,
+    dirty_generation: AtomicU64,
+    hard_generation: AtomicU64,
+    clean_generation: AtomicU64,
+    notify: tokio::sync::Notify,
+    completion: tokio::sync::Notify,
+    state: Mutex<PapiRiskRefreshState>,
+}
+
+impl PapiRiskRefreshControl {
+    fn mark_dirty(&self, fact_version: u64, hard: bool) {
+        let _state = self.state.lock();
+        self.dirty_generation
+            .fetch_max(fact_version, Ordering::AcqRel);
+
+        if hard {
+            self.hard_generation
+                .fetch_max(fact_version, Ordering::AcqRel);
+        }
+        self.notify.notify_one();
+    }
+
+    fn hard_refresh_pending(&self) -> bool {
+        self.hard_generation.load(Ordering::Acquire) > self.clean_generation.load(Ordering::Acquire)
+    }
+
+    fn mark_clean(&self) {
+        let generation = self.dirty_generation.load(Ordering::Acquire);
+        self.clean_generation.store(generation, Ordering::Release);
+    }
+
+    fn reset(&self) {
+        self.ready.store(false, Ordering::Release);
+        self.dirty_generation.store(0, Ordering::Release);
+        self.hard_generation.store(0, Ordering::Release);
+        self.clean_generation.store(0, Ordering::Release);
+        let mut state = self.state.lock();
+        state.pending = None;
+        state.token = None;
+    }
+}
+
+fn ensure_risk_rebaseline_started(
+    control: &PapiRiskRefreshControl,
+    coordinator: &Mutex<Option<PapiCommandCoordinator>>,
+    acknowledger: &Mutex<Option<crate::websocket::PapiApplicationAcknowledger>>,
+) -> anyhow::Result<PapiRebaselineToken> {
+    if let Some(token) = control.state.lock().token {
+        return Ok(token);
+    }
+    let applied_fact_version = acknowledger
+        .lock()
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("PAPI application acknowledger is unavailable"))?
+        .applied_fact_version();
+    let token = coordinator
+        .lock()
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("PAPI command coordinator is unavailable"))?
+        .begin_rebaseline(applied_fact_version, Instant::now())?;
+    control.state.lock().token = Some(token);
+    Ok(token)
+}
+
+async fn coalesced_risk_generation(
+    control: &PapiRiskRefreshControl,
+    refresh_debounce: Duration,
+    maximum_delay: Duration,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Option<u64> {
+    let started = tokio::time::Instant::now();
+    let maximum = started + maximum_delay;
+    let mut quiet = started + refresh_debounce;
+    let mut observed = control.dirty_generation.load(Ordering::Acquire);
+
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= maximum {
+            return Some(control.dirty_generation.load(Ordering::Acquire));
+        }
+        let deadline = quiet.min(maximum);
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return None,
+            () = nautilus_common::live::dst::time::sleep(deadline.duration_since(now)) => {
+                return Some(control.dirty_generation.load(Ordering::Acquire));
+            }
+            () = control.notify.notified() => {}
+        }
+        let current = control.dirty_generation.load(Ordering::Acquire);
+        if current != observed {
+            observed = current;
+            quiet = tokio::time::Instant::now() + refresh_debounce;
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Long-lived risk refresh worker owns an explicit immutable runtime context"
+)]
+async fn run_risk_refresh_worker(
+    reader: BinancePapiReadOnlyClient,
+    trading: BinancePapiTradingConfig,
+    client_id: ClientId,
+    account_id: AccountId,
+    venue: Venue,
+    emitter: ExecutionEventEmitter,
+    coordinator: Arc<Mutex<Option<PapiCommandCoordinator>>>,
+    acknowledger: Arc<Mutex<Option<crate::websocket::PapiApplicationAcknowledger>>>,
+    control: Arc<PapiRiskRefreshControl>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<()> {
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(()),
+            () = control.notify.notified() => {}
+        }
+
+        if control.dirty_generation.load(Ordering::Acquire)
+            <= control.clean_generation.load(Ordering::Acquire)
+        {
+            continue;
+        }
+
+        let Some(dirty_generation) = coalesced_risk_generation(
+            &control,
+            RISK_REFRESH_QUIET_DELAY,
+            RISK_REFRESH_MAX_DELAY,
+            &cancel,
+        )
+        .await
+        else {
+            return Ok(());
+        };
+        let token = if control.hard_refresh_pending() {
+            match ensure_risk_rebaseline_started(&control, &coordinator, &acknowledger) {
+                Ok(token) => Some(token),
+                Err(e) => {
+                    log::warn!("PAPI risk rebaseline could not start: {e}");
+                    control.notify.notify_one();
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let checkpoint = match acknowledger
+            .lock()
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PAPI application acknowledger is unavailable"))
+            .and_then(|acknowledger| acknowledger.refresh_checkpoint())
+        {
+            Ok(checkpoint) => checkpoint,
+            Err(e) => {
+                log::warn!("PAPI risk refresh has no application checkpoint: {e}");
+                control.notify.notify_one();
+                continue;
+            }
+        };
+        let rebaseline = match reader.collect_verified_risk_rebaseline(&trading).await {
+            Ok(rebaseline) => rebaseline,
+            Err(e) => {
+                log::warn!("PAPI risk refresh failed: {e}");
+                control.notify.notify_one();
+                continue;
+            }
+        };
+        let mut mass_status =
+            ExecutionMassStatus::new(client_id, account_id, venue, reader.now(), None);
+        mass_status.set_report_window(None, false);
+        mass_status.add_order_reports(rebaseline.order_reports);
+        mass_status.add_position_reports(rebaseline.position_reports);
+        let report = ExecutionReport::MassStatus(Box::new(mass_status));
+        let pending = PapiPendingRiskApplication {
+            application: PapiPendingApplication {
+                checkpoint,
+                account_state: Some(rebaseline.account_state.clone()),
+                report: report.clone(),
+            },
+            dirty_generation,
+            token,
+            evidence: rebaseline.snapshot,
+        };
+        let admitted = {
+            let mut state = control.state.lock();
+            if control.dirty_generation.load(Ordering::Acquire) == dirty_generation
+                && state.token == token
+                && state.pending.is_none()
+            {
+                state.pending = Some(pending);
+                true
+            } else {
+                false
+            }
+        };
+
+        if !admitted {
+            log::warn!("PAPI risk refresh state changed during collection");
+            control.notify.notify_one();
+            continue;
+        }
+
+        if let Err(e) = emitter.try_send_account_state(rebaseline.account_state) {
+            control.state.lock().pending = None;
+            log::warn!("PAPI risk account-state delivery failed: {e}");
+            control.notify.notify_one();
+            continue;
+        }
+
+        if let Err(e) = emitter.try_send_execution_report(report) {
+            control.state.lock().pending = None;
+            log::warn!("PAPI risk report delivery failed: {e}");
+            control.notify.notify_one();
+            continue;
+        }
+
+        let completion = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(()),
+            result = tokio::time::timeout(trading_risk_application_timeout(&trading), control.completion.notified()) => result,
+        };
+
+        if completion.is_err() {
+            let mut state = control.state.lock();
+            if state
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.application.checkpoint == checkpoint)
+            {
+                state.pending = None;
+            }
+            drop(state);
+            log::warn!("PAPI risk refresh application acknowledgement timed out");
+            control.notify.notify_one();
+        } else if control.dirty_generation.load(Ordering::Acquire)
+            > control.clean_generation.load(Ordering::Acquire)
+        {
+            control.notify.notify_one();
+        }
+    }
+}
+
+fn trading_risk_application_timeout(config: &BinancePapiTradingConfig) -> Duration {
+    Duration::from_millis(config.max_risk_age_ms.max(1_000))
 }
 
 #[derive(Debug)]
@@ -91,6 +363,7 @@ pub(crate) struct BinancePapiExecutionClient {
     trading_connected: Arc<AtomicBool>,
     application_acknowledger: Arc<Mutex<Option<crate::websocket::PapiApplicationAcknowledger>>>,
     pending_application: Arc<Mutex<Option<PapiPendingApplication>>>,
+    risk_refresh: Arc<PapiRiskRefreshControl>,
     reader: RefCell<Option<BinancePapiReadOnlyClient>>,
     session: Option<BinancePapiAccountSession>,
     pending_tasks: TaskGroup,
@@ -114,6 +387,7 @@ impl BinancePapiExecutionClient {
             trading_connected: Arc::new(AtomicBool::new(false)),
             application_acknowledger: Arc::new(Mutex::new(None)),
             pending_application: Arc::new(Mutex::new(None)),
+            risk_refresh: Arc::new(PapiRiskRefreshControl::default()),
             reader: RefCell::new(None),
             session: None,
             pending_tasks: TaskGroup::new(),
@@ -194,6 +468,8 @@ impl BinancePapiExecutionClient {
         self.trading_connected.store(false, Ordering::Release);
         self.application_acknowledger.lock().take();
         self.pending_application.lock().take();
+        self.risk_refresh.reset();
+        self.risk_refresh.completion.notify_waiters();
         let has_session = self.session.is_some();
         if let Some(session) = self.session.as_ref() {
             session.begin_shutdown();
@@ -421,6 +697,10 @@ impl BinancePapiExecutionClient {
                     order.client_order_id()
                 ),
             },
+            Err(CoordinatorDispatchError::Superseded) => log::debug!(
+                "PAPI submit response for {} was superseded by an authoritative order report",
+                order.client_order_id()
+            ),
             Err(e) => log::warn!(
                 "PAPI submit stopped before a venue outcome for {}: {e}",
                 order.client_order_id()
@@ -462,6 +742,10 @@ impl BinancePapiExecutionClient {
                     order.client_order_id()
                 ),
             },
+            Err(CoordinatorDispatchError::Superseded) => log::debug!(
+                "PAPI cancel response for {} was superseded by an authoritative order report",
+                order.client_order_id()
+            ),
             Err(e) => log::warn!(
                 "PAPI cancel stopped before a venue outcome for {}: {e}",
                 order.client_order_id()
@@ -595,7 +879,124 @@ impl BinancePapiExecutionClient {
         }
     }
 
-    fn apply_report_to_coordinator(&self, report: &ExecutionReport) {
+    fn acknowledge_pending_risk_application(&self, report: &ExecutionReport) {
+        let ExecutionReport::MassStatus(applied) = report else {
+            return;
+        };
+        let pending = {
+            let refresh = self.risk_refresh.state.lock();
+            refresh
+                .pending
+                .as_ref()
+                .and_then(|pending| match &pending.application.report {
+                    ExecutionReport::MassStatus(expected)
+                        if expected.report_id == applied.report_id =>
+                    {
+                        Some(pending.clone())
+                    }
+                    _ => None,
+                })
+        };
+        let Some(pending) = pending else {
+            return;
+        };
+
+        if !self.expected_application_is_applied(&pending.application) {
+            return;
+        }
+        let acknowledgement = self
+            .application_acknowledger
+            .lock()
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PAPI application acknowledger is unavailable"))
+            .and_then(|acknowledger| {
+                acknowledger.acknowledge_refresh(pending.application.checkpoint)
+            });
+
+        let mut refresh = self.risk_refresh.state.lock();
+        let is_current = refresh.pending.as_ref().is_some_and(|current| {
+            current.application.checkpoint == pending.application.checkpoint
+        });
+        let mut superseded_fact_version = None;
+        let result = acknowledgement.and_then(|acknowledgement| match acknowledgement {
+            PapiRefreshAcknowledgement::Superseded { fact_version } => {
+                superseded_fact_version = Some(fact_version);
+                Ok(false)
+            }
+            PapiRefreshAcknowledgement::Applied {
+                fact_version: applied_fact_version,
+            } => {
+                if !is_current
+                    || self.risk_refresh.dirty_generation.load(Ordering::Acquire)
+                        > pending.dirty_generation
+                {
+                    return Ok(false);
+                }
+
+                let mut coordinator = self.coordinator.lock();
+                let coordinator = coordinator
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("PAPI command coordinator is unavailable"))?;
+                let result = match pending.token {
+                    Some(token) => coordinator.install_rebaseline(
+                        token,
+                        pending.evidence.clone(),
+                        applied_fact_version,
+                        Instant::now(),
+                        get_atomic_clock_realtime().get_time_ns(),
+                    ),
+                    None => coordinator.install_refresh(
+                        pending.evidence.clone(),
+                        applied_fact_version,
+                        Instant::now(),
+                        get_atomic_clock_realtime().get_time_ns(),
+                    ),
+                };
+                result.map_err(anyhow::Error::from)?;
+                Ok(true)
+            }
+        });
+
+        if is_current {
+            refresh.pending = None;
+        }
+
+        if result.as_ref().is_ok_and(|installed| *installed) {
+            refresh.token = None;
+            self.risk_refresh
+                .clean_generation
+                .store(pending.dirty_generation, Ordering::Release);
+        }
+        drop(refresh);
+
+        if let Some(fact_version) = superseded_fact_version {
+            self.risk_refresh.mark_dirty(fact_version, false);
+        }
+
+        if let Err(e) = result {
+            self.risk_refresh.mark_dirty(pending.dirty_generation, true);
+
+            if let Some(session) = self.session.as_ref() {
+                session.set_trading_authorized(false);
+            }
+            log::warn!("PAPI risk refresh application was rejected: {e}");
+        } else if result.is_ok_and(|installed| installed) {
+            if let Some(session) = self.session.as_ref() {
+                session.set_trading_authorized(!self.risk_refresh.hard_refresh_pending());
+            }
+        } else if self.risk_refresh.dirty_generation.load(Ordering::Acquire)
+            > self.risk_refresh.clean_generation.load(Ordering::Acquire)
+        {
+            self.risk_refresh.notify.notify_one();
+        }
+        self.risk_refresh.completion.notify_one();
+    }
+
+    fn apply_report_to_coordinator(&self, report: &ExecutionReport) -> Option<bool> {
+        let incremental = matches!(
+            report,
+            ExecutionReport::Order(_) | ExecutionReport::OrderWithFills(_, _)
+        );
         let reports: Vec<OrderStatusReport> = match report {
             ExecutionReport::Order(report) | ExecutionReport::OrderWithFills(report, _) => {
                 vec![(**report).clone()]
@@ -605,15 +1006,64 @@ impl BinancePapiExecutionClient {
         };
         let mut guard = self.coordinator.lock();
         let Some(coordinator) = guard.as_mut() else {
-            return;
+            return incremental.then_some(false);
         };
+        let mut owned = true;
 
         for report in reports {
-            if let Err(e) = coordinator
+            match coordinator
                 .apply_matching_order_report(&report, get_atomic_clock_realtime().get_time_ns())
             {
-                log::warn!("PAPI command journal rejected an applied order report: {e}");
+                Ok(matched) => owned &= matched > 0,
+                Err(e) => {
+                    owned = false;
+                    log::warn!("PAPI command journal rejected an applied order report: {e}");
+                }
             }
+        }
+        incremental.then_some(owned)
+    }
+
+    fn pending_incremental_fact_version(&self, report: &ExecutionReport) -> Option<u64> {
+        let applied_report_id = match report {
+            ExecutionReport::Order(report) | ExecutionReport::OrderWithFills(report, _) => {
+                report.report_id
+            }
+            ExecutionReport::Fill(_)
+            | ExecutionReport::Position(_)
+            | ExecutionReport::MassStatus(_) => return None,
+        };
+        let pending = self.pending_application.lock();
+        let pending = pending.as_ref()?;
+        let pending_report_id = match &pending.report {
+            ExecutionReport::Order(report) | ExecutionReport::OrderWithFills(report, _) => {
+                report.report_id
+            }
+            ExecutionReport::Fill(_)
+            | ExecutionReport::Position(_)
+            | ExecutionReport::MassStatus(_) => return None,
+        };
+        (pending_report_id == applied_report_id).then(|| pending.checkpoint.fact_version())
+    }
+
+    fn mark_unowned_incremental_report(&self, report: &ExecutionReport) {
+        let Some(fact_version) = self.pending_incremental_fact_version(report) else {
+            return;
+        };
+        self.risk_refresh.mark_dirty(fact_version, true);
+
+        if let Some(session) = self.session.as_ref() {
+            session.set_trading_authorized(false);
+        }
+
+        if self.risk_refresh.ready.load(Ordering::Acquire)
+            && let Err(e) = ensure_risk_rebaseline_started(
+                &self.risk_refresh,
+                &self.coordinator,
+                &self.application_acknowledger,
+            )
+        {
+            log::warn!("PAPI unowned-order risk rebaseline could not start: {e}");
         }
     }
 }
@@ -652,6 +1102,7 @@ impl ExecutionClient for BinancePapiExecutionClient {
         self.config.trading.as_ref()?;
         let coordinator = Arc::clone(&self.coordinator);
         let trading_connected = Arc::clone(&self.trading_connected);
+        let risk_refresh = Arc::clone(&self.risk_refresh);
         let account_id = self.core.account_id;
         let client_id = self.core.client_id;
 
@@ -666,6 +1117,10 @@ impl ExecutionClient for BinancePapiExecutionClient {
 
             if !trading_connected.load(Ordering::Acquire) {
                 return deny("PAPI execution client is not connected for trading".to_string());
+            }
+
+            if risk_refresh.hard_refresh_pending() {
+                return deny("PAPI account risk refresh is pending".to_string());
             }
 
             if request.full_position_exit || request.orders.len() != 1 {
@@ -704,8 +1159,11 @@ impl ExecutionClient for BinancePapiExecutionClient {
     }
 
     fn on_execution_report_applied(&self, report: &ExecutionReport) {
-        self.apply_report_to_coordinator(report);
+        if self.apply_report_to_coordinator(report) == Some(false) {
+            self.mark_unowned_incremental_report(report);
+        }
         self.acknowledge_pending_application();
+        self.acknowledge_pending_risk_application(report);
     }
 
     fn provides_bulk_position_coverage(&self, instrument_id: InstrumentId) -> bool {
@@ -835,23 +1293,53 @@ impl ExecutionClient for BinancePapiExecutionClient {
             }
             Ok(())
         });
+        let risk_refresh_handler: Option<PapiRiskRefreshHandler> =
+            self.config.trading.as_ref().map(|_| {
+                let control = Arc::clone(&self.risk_refresh);
+                let coordinator = Arc::clone(&self.coordinator);
+                let acknowledger = Arc::clone(&self.application_acknowledger);
+
+                Arc::new(move |signal: PapiRiskRefreshSignal| {
+                    let hard = !coordinator.lock().as_ref().is_some_and(|coordinator| {
+                        coordinator.covers_order_account_update(&signal.reason, &signal.symbols)
+                    });
+                    control.mark_dirty(signal.fact_version, hard);
+
+                    if hard && control.ready.load(Ordering::Acquire) {
+                        if let Some(acknowledger) = acknowledger.lock().as_ref() {
+                            acknowledger.set_trading_authorized(false);
+                        }
+
+                        match ensure_risk_rebaseline_started(&control, &coordinator, &acknowledger)
+                        {
+                            Ok(_) => {}
+                            Err(e) => {
+                                log::warn!("PAPI risk rebaseline could not start: {e}");
+                            }
+                        }
+                    }
+                    Ok(())
+                }) as PapiRiskRefreshHandler
+            });
         let mut session = BinancePapiAccountSession::with_handlers(
             config,
             instruments,
             handler,
             incremental_handler,
+            risk_refresh_handler,
         )?;
         *self.application_acknowledger.lock() = Some(session.application_acknowledger());
         session.start().await?;
         let reader = session.read_only_client();
+        self.risk_refresh.mark_clean();
 
         let mut coordinator = self.coordinator.lock().take();
         if let Some(mut value) = coordinator.take() {
             let recovery = value.recover_unknowns(&reader).await;
-            *self.coordinator.lock() = Some(value);
             let summary = match recovery {
                 Ok(summary) => summary,
                 Err(e) => {
+                    *self.coordinator.lock() = Some(value);
                     session.stop().await?;
                     return Err(e.into());
                 }
@@ -866,6 +1354,60 @@ impl ExecutionClient for BinancePapiExecutionClient {
                     summary.budget_exhausted,
                 );
             }
+
+            let trading = self
+                .config
+                .trading
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("PAPI trading configuration is unavailable"))?;
+            let risk = match reader.collect_verified_risk_snapshot(trading).await {
+                Ok(risk) => risk,
+                Err(e) => {
+                    *self.coordinator.lock() = Some(value);
+                    session.stop().await?;
+                    return Err(e);
+                }
+            };
+
+            if let Err(e) = value.install_evidence(risk, Instant::now()) {
+                *self.coordinator.lock() = Some(value);
+                session.stop().await?;
+                return Err(e.into());
+            }
+            *self.coordinator.lock() = Some(value);
+            session.set_trading_authorized(true);
+            self.risk_refresh.ready.store(true, Ordering::Release);
+
+            if self.risk_refresh.hard_refresh_pending() {
+                session.set_trading_authorized(false);
+
+                if let Err(e) = ensure_risk_rebaseline_started(
+                    &self.risk_refresh,
+                    &self.coordinator,
+                    &self.application_acknowledger,
+                ) {
+                    log::warn!("PAPI startup risk rebaseline could not start: {e}");
+                }
+            }
+        }
+
+        if let Some(trading) = self.config.trading.clone() {
+            let cancel = self.pending_tasks.cancellation_token();
+            self.spawn_task(
+                "risk refresh",
+                run_risk_refresh_worker(
+                    reader,
+                    trading,
+                    self.core.client_id,
+                    self.core.account_id,
+                    self.core.venue,
+                    self.emitter.clone(),
+                    Arc::clone(&self.coordinator),
+                    Arc::clone(&self.application_acknowledger),
+                    Arc::clone(&self.risk_refresh),
+                    cancel,
+                ),
+            )?;
         }
         self.session = Some(session);
         self.core.set_connected();
@@ -1351,6 +1893,76 @@ mod tests {
         replace_exec_event_sender(sender);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn repeated_account_updates_extend_one_bounded_risk_refresh_window() {
+        let control = Arc::new(PapiRiskRefreshControl::default());
+        let updates = Arc::clone(&control);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        control.mark_dirty(1, false);
+        let started = tokio::time::Instant::now();
+        let producer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            updates.mark_dirty(2, false);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            updates.mark_dirty(3, false);
+        });
+
+        let generation = coalesced_risk_generation(
+            &control,
+            Duration::from_millis(15),
+            Duration::from_millis(100),
+            &cancel,
+        )
+        .await;
+
+        producer.await.unwrap();
+        assert_eq!(generation, Some(3));
+        assert_eq!(started.elapsed(), Duration::from_millis(25));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continuous_account_updates_cannot_extend_risk_refresh_past_maximum_delay() {
+        let control = Arc::new(PapiRiskRefreshControl::default());
+        let updates = Arc::clone(&control);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        control.mark_dirty(1, false);
+        let started = tokio::time::Instant::now();
+        let producer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            updates.mark_dirty(2, false);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            updates.mark_dirty(3, false);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            updates.mark_dirty(4, false);
+        });
+
+        let generation = coalesced_risk_generation(
+            &control,
+            Duration::from_secs(3),
+            Duration::from_secs(5),
+            &cancel,
+        )
+        .await;
+
+        producer.await.unwrap();
+        assert_eq!(generation, Some(4));
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+    }
+
+    #[rstest]
+    fn soft_dirty_does_not_activate_hard_admission_gate() {
+        let control = PapiRiskRefreshControl::default();
+
+        control.mark_dirty(1, false);
+        assert!(!control.hard_refresh_pending());
+
+        control.mark_dirty(2, true);
+        assert!(control.hard_refresh_pending());
+
+        control.mark_clean();
+        assert!(!control.hard_refresh_pending());
+    }
+
     fn trading_config(path: std::path::PathBuf) -> BinancePapiTradingConfig {
         BinancePapiTradingConfig {
             command_journal_path: path,
@@ -1364,7 +1976,7 @@ mod tests {
             }],
             max_account_exposure: dec!(100000.00),
             max_in_flight_operations: 4,
-            max_risk_age_ms: 2_000,
+            max_risk_age_ms: 10_000,
             max_risk_collection_span_ms: 1_000,
             max_recovery_requests: 32,
             max_recovery_rounds: 3,

@@ -102,9 +102,9 @@ evidence:
 - No nonzero borrowing or accrued-interest state was available. The implementation detects and
   rejects that state; its economic mapping is deliberately unsupported rather than inferred from
   zero-liability samples.
-- The account was not entirely flat and no live nonzero-to-zero transition was observed. Explicit
-  zero rows and closing behavior have offline integration coverage, but not flat-account live
-  evidence.
+- The account was not entirely flat because an existing GWEIUSDT position remained untouched.
+  BTCUSDT nonzero-to-zero transitions and explicit flat rows now have live evidence, but an
+  entirely flat account does not.
 - No real algo parent-trigger-child lifecycle was present. Parent/child/fill correlation and
   contradictions have offline fixture coverage only.
 - No venue retention boundary was reached. Returned bounded history does not prove full retention
@@ -317,9 +317,9 @@ Existing adapter and engine tests passed for these failure behaviors:
   cancellation, redirect, authentication, malformed-response, and 429/418 behavior is covered
   offline. No live faults or real algo triggers were manufactured.
 
-[BinancePapiExecutionClient::connect](src/execution.rs) still deliberately rejects LiveNode
-startup. A diagnostic account projection is implemented; account publication, order writes, PM
-admission/reservations, and stream recovery are not implemented or accepted. Current mass statuses always have
+[BinancePapiExecutionClient::connect](src/execution.rs) now supports default-off LiveNode startup,
+account publication, ordinary UM commands, PM admission and bounded stream recovery. The live
+command acceptance and remaining stream limitation are recorded below. Current mass statuses have
 `reports_complete=false`; the core suppresses historical position/portfolio effects, but that flag
 is not itself a universal LiveNode startup failure.
 
@@ -369,9 +369,9 @@ the order submitted and the journal operation unknown without retrying or invent
 
 The completed local selections were:
 
-- `nautilus-binance-papi --lib`: 404 passed, covering command transport, coordinator, journal,
+- `nautilus-binance-papi --lib`: 419 passed, covering command transport, coordinator, journal,
   recovery, private-stream application, and the engine-wired order lifecycle.
-- `nautilus-binance-papi --features python --lib`: 405 passed, covering the same behavior with
+- `nautilus-binance-papi --features python --lib`: 420 passed, covering the same behavior with
   Python bindings enabled.
 - `nautilus-execution --lib`: 923 passed, covering core reconciliation, post-application callback
   ordering, and exact client routing.
@@ -382,15 +382,98 @@ The completed local selections were:
 
 Relevant Rust clippy selections passed with warnings denied, generated Python stubs were refreshed,
 and repository formatting completed. On macOS, the Python-feature Rust test required the installed
-Python 3.14 library path and allowing the linker's compact-unwind size warning; all 405 tests then
+Python 3.14 library path and allowing the linker's compact-unwind size warning; all 420 tests then
 ran and passed.
 
-Production increase-risk admission remains fail-closed because authenticated observations do not
-yet construct a `PapiVerifiedRiskSnapshot`. Separately authorized live acceptance still needs to
-verify the PM field units and conservative incremental-margin inputs, then exercise bounded real
-MARKET, LIMIT GTC/IOC/FOK, GTX post-only, reduce-only, targeted cancellation, actual fills, and
-risk rebaseline behavior. The account, instrument, maximum order and position exposure, permitted
-actions, and credentials must be confirmed explicitly before that work.
+Production increase-risk admission remains default-off and fail-closed unless authenticated
+observations construct and install a current `PapiVerifiedRiskSnapshot`. The 2026-09-20 acceptance
+below exercised that path for one explicitly bounded BTCUSDT scope. Other account states,
+instruments and risk-rebaseline behavior remain outside that live evidence.
+
+### Issue #5 acceptance continuation
+
+The 2026-09-20 follow-up first audited the failure matrix against the tests and the owner-only
+2026-09-19 evidence bundle. A later explicitly authorized run then loaded current public BTCUSDT
+metadata and authenticated account-wide observations through the configured proxy. It limited
+trading to `BTCUSDT-PERP.BINANCE`, `0.001 BTC` per order, `0.001 BTC` maximum position, and
+`200 USDT` maximum order, instrument and account exposure. The pre-existing
+`GWEIUSDT-PERP.BINANCE` long position remained in the read-only report scope and was never included
+in the trading allowlist or modified.
+
+The private values also reconfirm the previously recorded wallet boundary: borrowing and accrued
+interest are zero, while one negative wallet row has `negativeBalance = totalWalletBalance =
+umWalletBalance < 0`. The deficit is already included in the total and must not be deducted again.
+This remains evidence only for that sampled state, not for nonzero borrowing or interest.
+
+The installed risk snapshot required `NORMAL` account status, one-way position mode, a current
+BTCUSDT mark price, exchange filters, authenticated leverage brackets and an authenticated USDT
+asset index. It converted the reported USD available-margin value with the observed asset index,
+using `max(index, 1)` as the conservative conversion denominator, and derived the maximum initial
+margin rate from every valid bracket rather than a configured leverage constant. The live startup
+collected and validated these inputs before the first increase-risk command was admitted.
+
+The bounded live command results were:
+
+| Action                         | Venue result                                                                         | Final account check                 |
+| ------------------------------ | ------------------------------------------------------------------------------------ | ----------------------------------- |
+| MARKET buy                     | Filled `0.001` at `80408.20`; taker fee `0.04020410 USDT`                            | Long `0.001`, no open BTCUSDT order |
+| Reduce-only MARKET sell        | Filled `0.001` at `80241.40`; taker fee `0.04012070 USDT`                            | BTCUSDT flat, no open order         |
+| LIMIT GTC plus targeted cancel | Accepted and canceled by exact owned order identity, with zero fill                  | BTCUSDT flat, no open order         |
+| LIMIT IOC                      | REST reported `EXPIRED` with `filled_qty=0.000`                                      | BTCUSDT flat, no open order         |
+| Unmarketable LIMIT FOK         | Explicit Binance `-5021` rejection because the order could not be filled immediately | BTCUSDT flat, no open order         |
+| Marketable LIMIT FOK           | Filled `0.001` at `80411.60`; taker fee `0.04020580 USDT`                            | Long `0.001`, no open order         |
+| FOK cleanup, reduce-only sell  | Filled `0.001` at `80432.80`; taker fee `0.04021640 USDT`                            | BTCUSDT flat, no open order         |
+| GTX post-only plus cancel      | REST retained `post_only=true`; targeted cancel completed with zero fill             | BTCUSDT flat, no open order         |
+| Private-stream MARKET retest   | Filled `0.001` at `80465.20`; taker fee `0.04023260 USDT`                            | Long `0.001`, no open BTCUSDT order |
+| Retest reduce-only close       | Filled `0.001` at `80420.50`; taker fee `0.04021025 USDT`                            | BTCUSDT flat, no open order         |
+
+The final independent authenticated read reported no BTCUSDT open order and an explicit flat
+`0.000` BTCUSDT position. It also reported the original GWEIUSDT long quantity unchanged at `24`.
+The owner-only evidence and command journals were created with mode `0600`; no credentials,
+balances or raw private responses are stored in the repository.
+
+The initial MARKET open and close, IOC, and the second reduce-only close emitted submitted and
+accepted events but no prompt filled or expired event. REST mass status later proved every
+terminal result. The marketable FOK fill was delivered only after a WebSocket Pong timeout,
+reconnect and recovery, while GTC and GTX cancellations did deliver their canceled events.
+
+Follow-up analysis found two private-stream causes. The official PAPI `ORDER_TRADE_UPDATE` model
+does not include the USD-M `ot` field that the decoder had required. Also, an `ACCOUNT_UPDATE`
+could start REST recovery before the immediately following order update was consumed. The decoder
+now accepts an absent `ot` while still rejecting a conflicting value, and ordinary account updates
+schedule a separate coalesced current-state risk refresh while the stream driver continues
+delivering order deltas. A rebuilt-client retest delivered both MARKET fills about 160 ms after
+submission. The later optimization was validated offline and has not been exercised by a new live
+order.
+The retest also exposed and fixed the race where that authoritative stream report could supersede
+the still-returning HTTP response; a matching late response no longer repeats the durable journal
+transition or emits a duplicate acceptance. Direct IOC expiration, partial fills and multi-fill
+ordering remain unaccepted. One public WebSocket startup timeout and one malformed account response
+failed before dispatch and left the account state unchanged.
+
+The matrix audit has these results:
+
+| Area                                          | Result                                | Current evidence                                                                                                                                                                                                                                                                                                                                    |
+| --------------------------------------------- | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Parameter, precision and capability rejection | Covered offline                       | Typed command and engine-wired tests preserve Decimal text, reject unsupported terms and assert zero writes before dispatch.                                                                                                                                                                                                                        |
+| Write outcome classification                  | Covered offline and bounded live      | Live accepted, filled, expired, canceled and explicit `-5021` rejection outcomes complement offline timeout, response-loss, decode, 503 and throttle cases.                                                                                                                                                                                         |
+| Durable intent and restart stages             | Covered offline                       | Journal corruption and truncation fail closed; reopening `Prepared`, `MayHaveDispatched`, `Unknown` and `Observed` retains restriction, while `Resolved` does not.                                                                                                                                                                                  |
+| Concurrent admission and dispatch freeze      | Partially covered offline             | Atomic reservations, in-flight limits and the final generation recheck are covered; a deterministic multi-task schedule matrix is still absent.                                                                                                                                                                                                     |
+| Response/fact ordering and cancellation races | Partial live and offline coverage     | Targeted GTC/GTX cancellation completed live. MARKET fills arrive directly from the stream while account updates schedule an independent refresh; matching late HTTP responses are suppressed offline. Direct IOC expiration and the partial-fill cancellation matrix remain incomplete.                                                            |
+| Execution application and accounting          | Partial live and offline coverage     | Live full fills, fees, open and reduce-only close were applied exactly, including prompt private-stream MARKET fills. Partial and multi-fill orders and other fee currencies remain incomplete.                                                                                                                                                     |
+| Recovery scope and identity                   | Covered offline for implemented cases | Not-found ambiguity, bounded targeted recovery, old active orders, algo parent/child linkage, same-millisecond trade IDs and incomplete history are explicit. Venue retention remains live-unverified.                                                                                                                                              |
+| Risk refresh and rebaseline                   | Startup live; dynamic path offline    | Authenticated startup installed current BTCUSDT risk evidence. Owned-order updates retain the prior reservation and coalesce a 3-5 second refresh without freezing admission; unknown changes freeze immediately. Refreshes avoid history scans and install only after current-state application. Sustained venue-risk lag remains live-unaccepted. |
+| Restricted states and quota failure           | Covered offline                       | Missing/stale/inconsistent evidence, unsupported scope, failed sources, budget exhaustion and process-wide 429/418 latching fail closed. Live throttling is intentionally untested.                                                                                                                                                                 |
+| Native core and Python boundaries             | Covered offline                       | Exact account/client routing, totals-only fallback, ordinary account regressions, explicit Python config, default-off behavior and credential redaction are tested.                                                                                                                                                                                 |
+
+The follow-up adds regression coverage for non-advancing or source-regressing risk replacements,
+every durable operation stage across coordinator reopen, official PAPI order payloads without
+`ot`, account-before-order stream sequencing, stream/HTTP response races, and coalesced dynamic
+risk refresh without historical reads. The remaining acceptance work centers on a live dynamic
+rebaseline, partial and multi-fill orders, direct IOC expiration, unsupported account states,
+venue retention and live throttling. Real commands
+continue to require explicit trading configuration and bounded risk evidence; configuration
+remains default-off.
 
 [account-api]: https://developers.binance.com/en/docs/catalog/advanced-trading-derivatives-trading-portfolio-margin/api/rest-api/account
 [income-api]: https://developers.binance.com/en/docs/catalog/advanced-trading-derivatives-trading-portfolio-margin/api/rest-api/account#get-um-income-history

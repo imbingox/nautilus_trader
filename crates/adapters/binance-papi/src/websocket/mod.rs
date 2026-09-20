@@ -26,5 +26,5 @@ pub use session::{
 };
 pub(crate) use session::{
     PapiApplicationAcknowledger, PapiApplicationCheckpoint, PapiIncrementalBundle,
-    PapiRecoveryBundle,
+    PapiRecoveryBundle, PapiRefreshAcknowledgement, PapiRiskRefreshHandler, PapiRiskRefreshSignal,
 };

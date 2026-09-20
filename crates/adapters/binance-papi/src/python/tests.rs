@@ -180,7 +180,7 @@ fn test_python_read_only_constructors_registry_and_secret_boundaries() {
         trading_kwargs
             .set_item("max_in_flight_operations", 4)
             .unwrap();
-        trading_kwargs.set_item("max_risk_age_ms", 2_000).unwrap();
+        trading_kwargs.set_item("max_risk_age_ms", 10_000).unwrap();
         trading_kwargs
             .set_item("max_risk_collection_span_ms", 1_000)
             .unwrap();
