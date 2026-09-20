@@ -1,14 +1,13 @@
 [project]
 name = "nautilus-trader-papi"
 version = "2.0.0rc6"
-description = "Production-grade Rust-native trading engine with deterministic event-driven architecture"
+description = "Unofficial NautilusTrader distribution with guarded Binance Portfolio Margin support"
 authors = [{ name = "Nautech Systems", email = "info@nautechsystems.io" }]
+maintainers = [{ name = "imbingox" }]
 classifiers = [
-  "Operating System :: OS Independent",
+  "Operating System :: POSIX :: Linux",
   "Development Status :: 4 - Beta",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.12",
-  "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
   "Programming Language :: Rust",
   "Topic :: Software Development :: Libraries",
@@ -21,8 +20,8 @@ classifiers = [
 ]
 license = "LGPL-3.0-only"
 license-files = ["LICENSE"]
-readme = "../README.md"
-requires-python = ">=3.12,<3.15"
+readme = "README_PAPI.md"
+requires-python = ">=3.14,<3.15"
 dependencies = []
 
 [project.optional-dependencies]
@@ -34,9 +33,10 @@ visualization = [
 ]
 
 [project.urls]
-homepage = "https://nautilustrader.io"
-repository = "https://github.com/nautechsystems/nautilus_trader"
-docs = "https://nautilustrader.io/docs"
+homepage = "https://github.com/imbingox/nautilus_trader"
+repository = "https://github.com/imbingox/nautilus_trader"
+issues = "https://github.com/imbingox/nautilus_trader/issues"
+upstream = "https://github.com/nautechsystems/nautilus_trader"
 
 [build-system]
 # Keep the maturin pin exact; scripts/maturin-version.bash uses it for CI wheel builds.
@@ -53,13 +53,14 @@ features = [
   "betfair",
   "high-precision",
   "mimalloc",
+  "papi",
   "redis",
   "postgres",
   "defi",
   "hypersync",
   "tracing-bridge",
 ]
-strip = false
+strip = true
 
 include = ["**/*.pyi"]
 
