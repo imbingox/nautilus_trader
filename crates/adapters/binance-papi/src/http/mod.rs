@@ -1060,7 +1060,7 @@ impl RequestBudget {
     fn charge_request(&self) -> Result<(), PapiHttpError> {
         self.check()?;
         self.requests_left
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
             .map_err(|_| PapiHttpError::Budget)?;
         Ok(())
     }
@@ -1068,7 +1068,7 @@ impl RequestBudget {
     pub(crate) fn charge_rows(&self, count: usize) -> Result<(), PapiHttpError> {
         self.check()?;
         self.rows
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 n.checked_add(count).filter(|n| *n <= self.max_rows)
             })
             .map_err(|_| PapiHttpError::Budget)?;

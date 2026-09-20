@@ -18,7 +18,7 @@
 use std::{cell::RefCell, rc::Rc};
 
 #[cfg(test)]
-use nautilus_common::clock::TestClock;
+use nautilus_common::clock::VirtualClock;
 use nautilus_common::{
     cache::CacheView,
     clients::ExecutionClient,
@@ -121,7 +121,7 @@ mod tests {
                 "PAPI-CUSTOM",
                 &config,
                 Rc::new(RefCell::new(Cache::default())).into(),
-                Rc::new(RefCell::new(TestClock::new())),
+                Rc::new(RefCell::new(VirtualClock::new())),
             )
             .unwrap();
         assert_eq!(client.client_id(), ClientId::from("PAPI-CUSTOM"));
@@ -139,7 +139,7 @@ mod tests {
             BINANCE_PAPI,
             &BinanceDataClientConfig::default(),
             Rc::new(RefCell::new(Cache::default())).into(),
-            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(VirtualClock::new())),
         );
         assert!(
             result

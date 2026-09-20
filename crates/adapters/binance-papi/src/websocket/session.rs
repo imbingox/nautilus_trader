@@ -837,7 +837,7 @@ async fn build_websocket(
         if bytes.len() > max_message_bytes
             || frame_shared
                 .queued_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
                     queued
                         .checked_add(bytes.len())
                         .filter(|total| *total <= max_buffer_bytes)
@@ -1152,7 +1152,7 @@ async fn replace_listen_key(
 fn allocate_owner(shared: &SessionShared) -> anyhow::Result<u64> {
     let previous = shared
         .next_owner
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |owner| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |owner| {
             owner.checked_add(1)
         })
         .map_err(|_| anyhow::anyhow!("PAPI listen-key generation overflow"))?;

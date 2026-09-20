@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
-    clock::TestClock,
+    clock::VirtualClock,
     messages::execution::{
         GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
         GeneratePositionStatusReports,
@@ -111,7 +111,7 @@ async fn incomplete_history_keeps_exact_explicit_fees_without_position_or_portfo
     assert_eq!(fills[0].trade_id, TradeId::from("67880589"));
     assert_eq!(fills[0].last_qty.as_decimal(), dec!(0.010));
     assert_eq!(fills[0].last_px.as_decimal(), dec!(28511));
-    assert!(!fills[0].reconciliation);
+    assert!(fills[0].reconciliation);
     let cache = ctx.cache.borrow();
     let order = cache.order(&ClientOrderId::from("abc")).unwrap();
     assert_eq!(order.status(), OrderStatus::Filled);
@@ -360,7 +360,7 @@ impl EngineContext {
     }
 
     fn with_config(client: ReadClient, config: ExecutionManagerConfig) -> Self {
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         clock
             .borrow_mut()
             .advance_time(ms(TRADE_TIME + 1_000), true);

@@ -955,7 +955,7 @@ impl SocketClientInner {
                         match writer_tx.send(msg) {
                             Ok(()) => log::trace!("Sent heartbeat to writer task"),
                             Err(e) => {
-                                log::error!("Failed to send heartbeat to writer task: {e}");
+                                log::warn!("Failed to send heartbeat to writer task: {e}");
                             }
                         }
                     }
@@ -1540,6 +1540,7 @@ impl Drop for SocketClient {
 #[cfg(not(all(feature = "simulation", madsim)))] // transport-layer I/O not simulated
 #[cfg(target_os = "linux")] // Only run network tests on Linux (CI stability)
 mod tests {
+    use log::Level;
     use nautilus_common::testing::wait_until_async;
     use parking_lot::Mutex as BlockingMutex;
     use rstest::rstest;
@@ -1552,7 +1553,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{SocketState, socket::SocketHeartbeat};
+    use crate::{SocketState, logging::tests::capture_logs_for, socket::SocketHeartbeat};
 
     async fn bind_test_server() -> (u16, TcpListener) {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -1593,6 +1594,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[rstest]
+    #[case::drain_failed(
+        Some(false),
+        std::io::ErrorKind::Other,
+        "Failed to drain reconnection buffer"
+    )]
+    #[case::reply_dropped(
+        None,
+        std::io::ErrorKind::BrokenPipe,
+        "Writer task dropped response channel"
+    )]
+    #[tokio::test]
+    async fn test_reconnect_writer_failure_preserves_reconnect_state(
+        #[case] reply: Option<bool>,
+        #[case] kind: std::io::ErrorKind,
+        #[case] message: &str,
+    ) {
+        let (port, listener) = bind_test_server().await;
+        let config = SocketConfig::builder()
+            .url(format!("127.0.0.1:{port}"))
+            .mode(Mode::Plain)
+            .suffix(b"\r\n".to_vec())
+            .build()
+            .unwrap();
+        let mut client = SocketClientInner::connect_url(config, None).await.unwrap();
+        let (_peer, _) = listener.accept().await.unwrap();
+        client.read_task.abort();
+        client.write_task.abort();
+        let _ = (&mut client.read_task).await;
+        let _ = (&mut client.write_task).await;
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::unbounded_channel();
+        client.writer_tx = writer_tx;
+        client
+            .connection_mode
+            .store(ConnectionMode::Reconnect.as_u8(), Ordering::SeqCst);
+
+        let writer = tokio::spawn(async move {
+            let WriterCommand::Update(_, sender) = writer_rx.recv().await.unwrap() else {
+                panic!("expected writer update");
+            };
+
+            if let Some(reply) = reply {
+                sender.send(reply).unwrap();
+            }
+        });
+
+        let error = client.reconnect(None).await.unwrap_err();
+        writer.await.unwrap();
+
+        let Error::Io(error) = error else {
+            panic!("expected I/O error, was {error}");
+        };
+
+        assert_eq!(error.kind(), kind);
+        assert_eq!(error.to_string(), message);
+        assert_eq!(
+            ConnectionMode::from_atomic(&client.connection_mode),
+            ConnectionMode::Reconnect
+        );
     }
 
     #[tokio::test]
@@ -1774,6 +1836,45 @@ mod tests {
         );
 
         server_task.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_heartbeat_task_warns_when_writer_channel_closed() {
+        let capture = capture_logs_for(&["nautilus_network::socket::client"]).await;
+        let connection_state = Arc::new(AtomicU8::new(ConnectionMode::Active.as_u8()));
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = SocketClientInner::spawn_heartbeat_task(
+            Arc::clone(&connection_state),
+            1,
+            b"ping".to_vec(),
+            writer_tx,
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), writer_rx.recv())
+            .await
+            .expect("timed out waiting for the first heartbeat")
+            .expect("heartbeat channel closed before the first heartbeat");
+        drop(writer_rx);
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+        let messages = capture.messages();
+        assert!(
+            messages.iter().any(|(level, message)| {
+                *level == Level::Warn && message.contains("Failed to send heartbeat to writer task")
+            }),
+            "expected WARN when the writer channel is closed, was {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|(level, _)| *level == Level::Error),
+            "a closed writer channel must not log ERROR, was {messages:?}"
+        );
+
+        connection_state.store(ConnectionMode::Closed.as_u8(), Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("heartbeat task should stop after close")
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2160,6 +2261,48 @@ mod rust_tests {
             ConnectionMode::Active
         );
         server.abort();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_reconnect_aborts_retired_reader() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut inner = SocketClientInner::connect_url(reconnect_test_config(port), None)
+            .await
+            .unwrap();
+        let (_peer, _) = listener.accept().await.unwrap();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let pending_reader = tokio::spawn(async move {
+            let _sender = dropped_tx;
+            std::future::pending::<()>().await;
+        });
+
+        let previous_reader = std::mem::replace(&mut inner.read_task, pending_reader);
+        previous_reader.abort();
+        let _ = previous_reader.await;
+        let old_fence = inner.read_fence.clone();
+        inner
+            .connection_mode
+            .store(ConnectionMode::Reconnect.as_u8(), Ordering::SeqCst);
+
+        let outcome = inner.reconnect(None).await.unwrap();
+        let reader_result = tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("retired reader task must be canceled");
+
+        assert_eq!(outcome, ReconnectOutcome::Reconnected);
+        assert!(
+            reader_result.is_err(),
+            "retired reader must drop its sender without sending"
+        );
+        assert!(!old_fence.is_valid());
+        assert!(inner.read_fence.is_valid());
+        assert_eq!(
+            ConnectionMode::from_atomic(&inner.connection_mode),
+            ConnectionMode::Active
+        );
     }
 
     #[rstest]

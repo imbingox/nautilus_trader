@@ -20,9 +20,9 @@ use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::{
     data::{
         Bar, BarSpecification, BarType, BookOrder, CustomData, Data, DataType, FundingRateUpdate,
-        HasTsInit, IndexPriceUpdate, MarkPriceUpdate, OptionGreekValues, OptionGreeks,
-        OrderBookDelta, OrderBookDepth10, QuoteTick, TradeTick, depth::DEPTH10_LEN,
-        is_monotonically_increasing_by_init, to_variant,
+        HasTsInit, IndexPriceUpdate, MarkPriceUpdate, NautilusDataType, NautilusRecordType,
+        OptionGreekValues, OptionGreeks, OrderBookDelta, OrderBookDepth, QuoteTick, TradeTick,
+        depth::DEPTH10_LEN, is_monotonically_increasing_by_init, to_variant,
     },
     enums::{
         AccountType, AggregationSource, AggressorSide, BarAggregation, BookAction, CurrencyType,
@@ -38,16 +38,21 @@ use nautilus_model::{
 };
 use nautilus_persistence::{
     backend::{
-        catalog::ParquetDataCatalog,
+        catalog::{ParquetDataCatalog, timestamps_to_filename},
+        parquet::delete::DeleteOperationKind,
         session::{DataBackendSession, QueryResult},
     },
+    catalog::traits::CatalogWriter,
     test_data::{
         MacroYieldCurveData, RustTestBytesCustomData, RustTestCustomData,
         RustTestHashMapCustomData, RustTestParamsCustomData, RustTestPriceMapCustomData,
     },
 };
-use nautilus_serialization::{arrow::ArrowSchemaProvider, ensure_custom_data_registered};
-use nautilus_testkit::common::get_nautilus_test_data_file_path;
+use nautilus_serialization::{
+    arrow::{ArrowSchemaProvider, DecodeTypedFromRecordBatch, EncodeToRecordBatch},
+    ensure_custom_data_registered,
+};
+use nautilus_testkit::common::get_test_data_file_path;
 use object_store::local::LocalFileSystem;
 use rstest::rstest;
 use rust_decimal::Decimal;
@@ -71,6 +76,34 @@ fn ensure_test_custom_data_registered() {
         ensure_custom_data_registered::<RustTestParamsCustomData>();
         ensure_custom_data_registered::<RustTestPriceMapCustomData>();
     });
+}
+
+/// Snapshots every file under a catalog directory as sorted (relative path, bytes) pairs.
+fn snapshot_catalog_files(temp_dir: &TempDir) -> Vec<(String, Vec<u8>)> {
+    fn visit(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let mut entries: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+        entries.sort_by_key(|entry| entry.path());
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, root, out);
+            } else {
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push((relative, fs::read(&path).unwrap()));
+            }
+        }
+    }
+
+    let mut snapshot = Vec::new();
+    visit(temp_dir.path(), temp_dir.path(), &mut snapshot);
+    snapshot
 }
 
 fn audusd_sim_id() -> InstrumentId {
@@ -102,7 +135,7 @@ fn create_order_book_delta(ts_init: u64) -> OrderBookDelta {
     )
 }
 
-fn create_order_book_depth10(ts_init: u64) -> OrderBookDepth10 {
+fn create_order_book_depth(ts_init: u64) -> OrderBookDepth {
     let mut bids: [BookOrder; DEPTH10_LEN] = [BookOrder::default(); DEPTH10_LEN];
     let mut asks: [BookOrder; DEPTH10_LEN] = [BookOrder::default(); DEPTH10_LEN];
 
@@ -151,7 +184,7 @@ fn create_order_book_depth10(ts_init: u64) -> OrderBookDepth10 {
     let bid_counts = [1_u32; DEPTH10_LEN];
     let ask_counts = [1_u32; DEPTH10_LEN];
 
-    OrderBookDepth10::new(
+    OrderBookDepth::new(
         ethusdt_binance_id(),
         bids,
         asks,
@@ -300,11 +333,11 @@ fn create_index_bar(ts_init: u64) -> Bar {
 #[rstest]
 fn test_quote_tick_query() {
     let expected_length = 9_500;
-    let file_path = get_nautilus_test_data_file_path("quotes.parquet");
+    let file_path = get_test_data_file_path("nautilus/arrow/quotes.parquet");
 
     let mut catalog = DataBackendSession::new(10_000);
     catalog
-        .add_file::<QuoteTick>("quote_005", file_path.as_str(), None, None)
+        .add_file::<QuoteTick>("quote_005", &file_path, None, None)
         .unwrap();
     let query_result: QueryResult = catalog.get_query_result();
     let ticks: Vec<Data> = query_result.collect::<Result<_, _>>().unwrap();
@@ -321,14 +354,14 @@ fn test_quote_tick_query() {
 
 #[rstest]
 fn test_quote_tick_query_with_filter() {
-    let file_path = get_nautilus_test_data_file_path("quotes-3-groups-filter-query.parquet");
+    let file_path = get_test_data_file_path("nautilus/arrow/quotes-3-groups-filter-query.parquet");
 
     let mut catalog = DataBackendSession::new(10);
     catalog
         .add_file::<QuoteTick>(
             "quote_005",
-            file_path.as_str(),
-            Some("SELECT * FROM quote_005 WHERE ts_init >= 1701388832486000000 ORDER BY ts_init"),
+            &file_path,
+            Some("SELECT * FROM quote_005 WHERE ts_init >= to_timestamp_nanos(1701388832486000000) ORDER BY ts_init"),
             None,
         )
         .unwrap();
@@ -341,14 +374,14 @@ fn test_quote_tick_query_with_filter() {
 fn test_quote_tick_multiple_query() {
     let expected_length = 9_600;
     let mut catalog = DataBackendSession::new(5_000);
-    let file_path_quotes = get_nautilus_test_data_file_path("quotes.parquet");
-    let file_path_trades = get_nautilus_test_data_file_path("trades.parquet");
+    let file_path_quotes = get_test_data_file_path("nautilus/arrow/quotes.parquet");
+    let file_path_trades = get_test_data_file_path("nautilus/arrow/trades.parquet");
 
     catalog
-        .add_file::<QuoteTick>("quote_tick", file_path_quotes.as_str(), None, None)
+        .add_file::<QuoteTick>("quote_tick", &file_path_quotes, None, None)
         .unwrap();
     catalog
-        .add_file::<TradeTick>("quote_tick_2", file_path_trades.as_str(), None, None)
+        .add_file::<TradeTick>("quote_tick_2", &file_path_trades, None, None)
         .unwrap();
     let query_result: QueryResult = catalog.get_query_result();
     let ticks: Vec<Data> = query_result.collect::<Result<_, _>>().unwrap();
@@ -360,11 +393,11 @@ fn test_quote_tick_multiple_query() {
 #[rstest]
 fn test_trade_tick_query() {
     let expected_length = 100;
-    let file_path = get_nautilus_test_data_file_path("trades.parquet");
+    let file_path = get_test_data_file_path("nautilus/arrow/trades.parquet");
 
     let mut catalog = DataBackendSession::new(10_000);
     catalog
-        .add_file::<TradeTick>("trade_001", file_path.as_str(), None, None)
+        .add_file::<TradeTick>("trade_001", &file_path, None, None)
         .unwrap();
     let query_result: QueryResult = catalog.get_query_result();
     let ticks: Vec<Data> = query_result.collect::<Result<_, _>>().unwrap();
@@ -382,11 +415,11 @@ fn test_trade_tick_query() {
 #[rstest]
 fn test_bar_query() {
     let expected_length = 10;
-    let file_path = get_nautilus_test_data_file_path("bars.parquet");
+    let file_path = get_test_data_file_path("nautilus/arrow/bars.parquet");
 
     let mut catalog = DataBackendSession::new(10_000);
     catalog
-        .add_file::<Bar>("bar_001", file_path.as_str(), None, None)
+        .add_file::<Bar>("bar_001", &file_path, None, None)
         .unwrap();
     let query_result: QueryResult = catalog.get_query_result();
     let ticks: Vec<Data> = query_result.collect::<Result<_, _>>().unwrap();
@@ -410,11 +443,11 @@ fn test_datafusion_parquet_round_trip() {
     use pretty_assertions::assert_eq;
 
     // Read original data from parquet
-    let file_path = get_nautilus_test_data_file_path("quotes.parquet");
+    let file_path = get_test_data_file_path("nautilus/arrow/quotes.parquet");
 
     let mut session = DataBackendSession::new(1000);
     session
-        .add_file::<QuoteTick>("test_data", file_path.as_str(), None, None)
+        .add_file::<QuoteTick>("test_data", &file_path, None, None)
         .unwrap();
     let query_result: QueryResult = session.get_query_result();
     let quote_ticks: Vec<Data> = query_result.collect::<Result<_, _>>().unwrap();
@@ -570,7 +603,7 @@ fn test_rust_get_intervals_without_identifier_on_empty_directory() {
 
 #[rstest]
 fn test_rust_consolidate_catalog() {
-    let (_temp_dir, catalog) = create_temp_catalog();
+    let (_temp_dir, mut catalog) = create_temp_catalog();
 
     let bars1 = vec![create_bar(1), create_bar(2)];
     catalog.write_to_parquet(&bars1, None, None, None).unwrap();
@@ -589,7 +622,7 @@ fn test_rust_consolidate_catalog() {
 
 #[rstest]
 fn test_rust_consolidate_catalog_with_time_range() {
-    let (_temp_dir, catalog) = create_temp_catalog();
+    let (_temp_dir, mut catalog) = create_temp_catalog();
 
     let bars1 = vec![create_bar(1)];
     catalog.write_to_parquet(&bars1, None, None, None).unwrap();
@@ -741,7 +774,7 @@ fn test_rust_consolidate_index_with_deduplication() {
 #[rstest]
 fn test_register_object_store_from_uri_local_file() {
     // Test registering object store from local file URI
-    let file_path = get_nautilus_test_data_file_path("trades.parquet");
+    let file_path = get_test_data_file_path("nautilus/arrow/trades.parquet");
     let parent_path = std::path::Path::new(&file_path).parent().unwrap();
     let file_uri = format!("file://{}", parent_path.display());
 
@@ -850,6 +883,377 @@ fn test_rust_extend_file_name() {
         .get_intervals("bars", Some(bar_type.as_str()))
         .unwrap();
     assert_eq!(intervals, vec![(1, 3), (4, 4)]);
+}
+
+#[rstest]
+fn test_rust_extend_file_name_rejects_forward_overlap() {
+    let (temp_dir, catalog) = create_temp_catalog();
+
+    let bars1 = vec![create_bar(1)];
+    catalog.write_to_parquet(&bars1, None, None, None).unwrap();
+
+    let bars2 = vec![create_bar(10)];
+    catalog.write_to_parquet(&bars2, None, None, None).unwrap();
+
+    let bar_type = bars1[0].bar_type.to_string();
+    let before = snapshot_catalog_files(&temp_dir);
+
+    // Adjacent to the first file but overlapping the second: must fail before renaming
+    let result = catalog.extend_file_name(
+        "bars",
+        Some(bar_type.as_str()),
+        UnixNanos::from(2),
+        UnixNanos::from(15),
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("(1, 1)"), "missing original interval: {err}");
+    assert!(err.contains("(1, 15)"), "missing proposed interval: {err}");
+    assert!(err.contains("bars"), "missing directory: {err}");
+
+    assert_eq!(snapshot_catalog_files(&temp_dir), before);
+    assert_eq!(
+        catalog
+            .get_intervals("bars", Some(bar_type.as_str()))
+            .unwrap(),
+        vec![(1, 1), (10, 10)],
+    );
+
+    // A failed extension must not poison later writes: reopen and append disjoint data
+    let reopened = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
+    let bars3 = vec![create_bar(20)];
+    reopened.write_to_parquet(&bars3, None, None, None).unwrap();
+    assert_eq!(
+        reopened
+            .get_intervals("bars", Some(bar_type.as_str()))
+            .unwrap(),
+        vec![(1, 1), (10, 10), (20, 20)],
+    );
+}
+
+#[rstest]
+fn test_rust_extend_file_name_rejects_backward_overlap() {
+    let (temp_dir, catalog) = create_temp_catalog();
+
+    let bars1 = vec![create_bar(5)];
+    catalog.write_to_parquet(&bars1, None, None, None).unwrap();
+
+    let bars2 = vec![create_bar(10)];
+    catalog.write_to_parquet(&bars2, None, None, None).unwrap();
+
+    let bar_type = bars1[0].bar_type.to_string();
+    let before = snapshot_catalog_files(&temp_dir);
+
+    // Adjacent to the second file but overlapping the first: must fail before renaming
+    let result = catalog.extend_file_name(
+        "bars",
+        Some(bar_type.as_str()),
+        UnixNanos::from(5),
+        UnixNanos::from(9),
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("(10, 10)"), "missing original interval: {err}");
+    assert!(err.contains("(5, 10)"), "missing proposed interval: {err}");
+
+    assert_eq!(snapshot_catalog_files(&temp_dir), before);
+    assert_eq!(
+        catalog
+            .get_intervals("bars", Some(bar_type.as_str()))
+            .unwrap(),
+        vec![(5, 5), (10, 10)],
+    );
+}
+
+#[rstest]
+fn test_rust_extend_file_name_rejects_shared_endpoint() {
+    let (temp_dir, catalog) = create_temp_catalog();
+
+    let bars1 = vec![create_bar(1)];
+    catalog.write_to_parquet(&bars1, None, None, None).unwrap();
+
+    let bars2 = vec![create_bar(10)];
+    catalog.write_to_parquet(&bars2, None, None, None).unwrap();
+
+    let bar_type = bars1[0].bar_type.to_string();
+    let before = snapshot_catalog_files(&temp_dir);
+
+    // Closed intervals sharing an endpoint overlap: (1, 10) touches (10, 10)
+    let result = catalog.extend_file_name(
+        "bars",
+        Some(bar_type.as_str()),
+        UnixNanos::from(2),
+        UnixNanos::from(10),
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("(1, 1)"), "missing original interval: {err}");
+    assert!(err.contains("(1, 10)"), "missing proposed interval: {err}");
+
+    assert_eq!(snapshot_catalog_files(&temp_dir), before);
+    assert_eq!(
+        catalog
+            .get_intervals("bars", Some(bar_type.as_str()))
+            .unwrap(),
+        vec![(1, 1), (10, 10)],
+    );
+}
+
+#[rstest]
+fn test_rust_extend_file_name_valid_backward_extension() {
+    let (_temp_dir, catalog) = create_temp_catalog();
+
+    let bars = vec![create_bar(10)];
+    catalog.write_to_parquet(&bars, None, None, None).unwrap();
+
+    let bar_type = bars[0].bar_type.to_string();
+    catalog
+        .extend_file_name(
+            "bars",
+            Some(bar_type.as_str()),
+            UnixNanos::from(8),
+            UnixNanos::from(9),
+        )
+        .unwrap();
+
+    assert_eq!(
+        catalog
+            .get_intervals("bars", Some(bar_type.as_str()))
+            .unwrap(),
+        vec![(8, 10)],
+    );
+}
+
+#[rstest]
+fn test_rust_extend_file_name_rejects_reversed_bounds() {
+    let (temp_dir, catalog) = create_temp_catalog();
+
+    let bars = vec![create_bar(1)];
+    catalog.write_to_parquet(&bars, None, None, None).unwrap();
+
+    let bar_type = bars[0].bar_type.to_string();
+    let before = snapshot_catalog_files(&temp_dir);
+
+    let result = catalog.extend_file_name(
+        "bars",
+        Some(bar_type.as_str()),
+        UnixNanos::from(10),
+        UnixNanos::from(5),
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("reversed"), "unexpected error: {err}");
+
+    assert_eq!(snapshot_catalog_files(&temp_dir), before);
+}
+
+#[rstest]
+fn test_rust_extend_file_name_rejects_overlapping_directory() {
+    let (temp_dir, catalog) = create_temp_catalog();
+
+    let bars1 = vec![create_bar(1)];
+    catalog.write_to_parquet(&bars1, None, None, None).unwrap();
+
+    let bars2 = vec![create_bar(10)];
+    catalog.write_to_parquet(&bars2, None, None, None).unwrap();
+
+    let bar_type = bars1[0].bar_type.to_string();
+
+    // Simulate pre-existing filename damage: the first file claims (1, 15)
+    let before_damage = snapshot_catalog_files(&temp_dir);
+    let damaged_name = timestamps_to_filename(UnixNanos::from(1), UnixNanos::from(15));
+    let old_path = temp_dir.path().join(&before_damage[0].0);
+    let damaged_path = old_path.parent().unwrap().join(damaged_name);
+    fs::rename(&old_path, &damaged_path).unwrap();
+
+    let before = snapshot_catalog_files(&temp_dir);
+
+    // No adjacent file, but the directory already overlaps: must fail without changes
+    let result = catalog.extend_file_name(
+        "bars",
+        Some(bar_type.as_str()),
+        UnixNanos::from(30),
+        UnixNanos::from(40),
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("not disjoint"), "unexpected error: {err}");
+
+    assert_eq!(snapshot_catalog_files(&temp_dir), before);
+
+    // An adjacent range reports the pre-existing overlap, not a would-create one
+    let result = catalog.extend_file_name(
+        "bars",
+        Some(bar_type.as_str()),
+        UnixNanos::from(11),
+        UnixNanos::from(15),
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("not disjoint"), "unexpected error: {err}");
+    assert!(
+        !err.contains("would create"),
+        "misleading message for pre-existing overlap: {err}"
+    );
+
+    assert_eq!(snapshot_catalog_files(&temp_dir), before);
+}
+
+#[rstest]
+fn test_rust_extend_file_name_timestamp_boundaries_are_noop() {
+    let (temp_dir, catalog) = create_temp_catalog();
+
+    let bars = vec![create_bar(100)];
+    catalog.write_to_parquet(&bars, None, None, None).unwrap();
+
+    let bar_type = bars[0].bar_type.to_string();
+    let before = snapshot_catalog_files(&temp_dir);
+
+    // Neither bound can be adjacent past the u64 edges: no match, no arithmetic panic
+    catalog
+        .extend_file_name(
+            "bars",
+            Some(bar_type.as_str()),
+            UnixNanos::from(0),
+            UnixNanos::from(50),
+        )
+        .unwrap();
+    catalog
+        .extend_file_name(
+            "bars",
+            Some(bar_type.as_str()),
+            UnixNanos::from(150),
+            UnixNanos::from(u64::MAX),
+        )
+        .unwrap();
+
+    assert_eq!(snapshot_catalog_files(&temp_dir), before);
+    assert_eq!(
+        catalog
+            .get_intervals("bars", Some(bar_type.as_str()))
+            .unwrap(),
+        vec![(100, 100)],
+    );
+}
+
+#[rstest]
+fn test_rust_extend_file_name_no_adjacent_file_is_noop() {
+    let (temp_dir, catalog) = create_temp_catalog();
+
+    let bars = vec![create_bar(1)];
+    catalog.write_to_parquet(&bars, None, None, None).unwrap();
+
+    let bar_type = bars[0].bar_type.to_string();
+    let before = snapshot_catalog_files(&temp_dir);
+
+    catalog
+        .extend_file_name(
+            "bars",
+            Some(bar_type.as_str()),
+            UnixNanos::from(10),
+            UnixNanos::from(20),
+        )
+        .unwrap();
+
+    assert_eq!(snapshot_catalog_files(&temp_dir), before);
+    assert_eq!(
+        catalog
+            .get_intervals("bars", Some(bar_type.as_str()))
+            .unwrap(),
+        vec![(1, 1)],
+    );
+}
+
+#[rstest]
+fn test_rust_record_empty_coverage_validates_before_extending() {
+    let (temp_dir, mut catalog) = create_temp_catalog();
+
+    let bars1 = vec![create_bar(1)];
+    catalog.write_to_parquet(&bars1, None, None, None).unwrap();
+
+    let bars2 = vec![create_bar(10)];
+    catalog.write_to_parquet(&bars2, None, None, None).unwrap();
+
+    let bar_type = bars1[0].bar_type.to_string();
+
+    CatalogWriter::record_empty_coverage(
+        &mut catalog,
+        NautilusDataType::Bar,
+        Some(bar_type.as_str()),
+        UnixNanos::from(2),
+        UnixNanos::from(5),
+    )
+    .unwrap();
+    assert_eq!(
+        catalog
+            .get_intervals("bars", Some(bar_type.as_str()))
+            .unwrap(),
+        vec![(1, 5), (10, 10)],
+    );
+
+    let before = snapshot_catalog_files(&temp_dir);
+    let result = CatalogWriter::record_empty_coverage(
+        &mut catalog,
+        NautilusDataType::Bar,
+        Some(bar_type.as_str()),
+        UnixNanos::from(6),
+        UnixNanos::from(15),
+    );
+    assert!(result.is_err());
+
+    assert_eq!(snapshot_catalog_files(&temp_dir), before);
+    assert_eq!(
+        catalog
+            .get_intervals("bars", Some(bar_type.as_str()))
+            .unwrap(),
+        vec![(1, 5), (10, 10)],
+    );
+}
+
+#[rstest]
+fn test_rust_extend_overlap_recovery_via_reset_file_names() {
+    let (temp_dir, catalog) = create_temp_catalog();
+
+    let bars1 = vec![create_bar(1)];
+    catalog.write_to_parquet(&bars1, None, None, None).unwrap();
+
+    let bars2 = vec![create_bar(10)];
+    catalog.write_to_parquet(&bars2, None, None, None).unwrap();
+
+    let bar_type = bars1[0].bar_type.to_string();
+    let before = snapshot_catalog_files(&temp_dir);
+    assert_eq!(before.len(), 2);
+
+    // Simulate filename-only damage: the first file claims (1, 15) while holding ts_init 1
+    let damaged_name = timestamps_to_filename(UnixNanos::from(1), UnixNanos::from(15));
+    let old_path = temp_dir.path().join(&before[0].0);
+    let damaged_path = old_path.parent().unwrap().join(damaged_name);
+    fs::rename(&old_path, &damaged_path).unwrap();
+    assert_eq!(
+        catalog
+            .get_intervals("bars", Some(bar_type.as_str()))
+            .unwrap(),
+        vec![(1, 15), (10, 10)],
+    );
+
+    // Overlapping names block later writes
+    let blocked = catalog.write_to_parquet(&[create_bar(20)], None, None, None);
+    assert!(blocked.is_err());
+
+    // Content ranges are disjoint, so resetting names repairs the directory
+    catalog
+        .reset_data_file_names("bars", Some(&bar_type))
+        .unwrap();
+    assert_eq!(
+        catalog
+            .get_intervals("bars", Some(bar_type.as_str()))
+            .unwrap(),
+        vec![(1, 1), (10, 10)],
+    );
+
+    catalog
+        .write_to_parquet(&[create_bar(20)], None, None, None)
+        .unwrap();
+    assert_eq!(
+        catalog
+            .get_intervals("bars", Some(bar_type.as_str()))
+            .unwrap(),
+        vec![(1, 1), (10, 10), (20, 20)],
+    );
 }
 
 #[rstest]
@@ -1059,11 +1463,11 @@ fn test_rust_write_order_book_deltas() {
 fn test_rust_write_order_book_depths() {
     let (_temp_dir, mut catalog) = create_temp_catalog();
 
-    let depths = vec![create_order_book_depth10(1), create_order_book_depth10(2)];
+    let depths = vec![create_order_book_depth(1), create_order_book_depth(2)];
     catalog.write_to_parquet(&depths, None, None, None).unwrap();
 
     let loaded = catalog
-        .query_typed_data::<OrderBookDepth10>(
+        .query_typed_data::<OrderBookDepth>(
             Some(vec!["ETH/USDT.BINANCE".to_string()]),
             None,
             None,
@@ -1094,7 +1498,7 @@ fn test_rust_write_order_book_depths() {
             assert_eq!(actual_order.price, expected_order.price);
             assert_eq!(actual_order.size, expected_order.size);
             assert_ne!(expected_order.order_id, 0);
-            assert_eq!(actual_order.order_id, 0);
+            assert_eq!(actual_order.order_id, expected_order.order_id);
         }
     }
 }
@@ -1127,13 +1531,27 @@ fn test_rust_write_and_read_account_state() {
         )
         .with_info(Some(info)),
     ];
+    let batch =
+        AccountState::encode_batch(&AccountState::metadata(&account_states[0]), &account_states)
+            .unwrap();
     catalog
-        .write_to_parquet(&account_states, None, None, None)
+        .write_record_batches(
+            &NautilusRecordType::AccountState,
+            None,
+            &[batch],
+            &Default::default(),
+        )
         .unwrap();
-
-    let loaded = catalog
-        .query_typed::<AccountState>(None, None, None, None, None, true)
+    let batches = catalog
+        .query_record_batches("account_state", None, None, None, None, true)
         .unwrap();
+    let loaded = batches
+        .into_iter()
+        .flat_map(|batch| {
+            let schema = batch.schema();
+            AccountState::decode_typed_batch(schema.metadata(), batch).unwrap()
+        })
+        .collect::<Vec<_>>();
 
     assert_eq!(
         serde_json::to_value(loaded).unwrap(),
@@ -1793,7 +2211,7 @@ fn test_generic_query_typed_data_with_where_clause() {
             Some(vec!["ETH/USDT.BINANCE".to_string()]),
             Some(UnixNanos::from(500)),
             Some(UnixNanos::from(2500)),
-            Some("ts_init >= 1500"),
+            Some("ts_init >= arrow_cast(1500, 'Timestamp(Nanosecond, Some(\"UTC\"))')"),
             None,
             true, // optimize_file_loading=true (default)
         )
@@ -1974,7 +2392,7 @@ fn test_generic_consolidate_data_by_period_with_time_range() {
 
 #[rstest]
 fn test_consolidation_workflow_end_to_end() {
-    let (_temp_dir, catalog) = create_temp_catalog();
+    let (_temp_dir, mut catalog) = create_temp_catalog();
 
     // Create multiple small files
     let mut bars_list = Vec::new();
@@ -2934,8 +3352,10 @@ fn test_prepare_delete_operations_basic() {
     // Verify operation types are valid
     for operation in &operations {
         assert!(matches!(
-            operation.operation_type.as_str(),
-            "remove" | "split_before" | "split_after"
+            operation.kind,
+            DeleteOperationKind::Remove
+                | DeleteOperationKind::SplitBefore
+                | DeleteOperationKind::SplitAfter
         ));
     }
 }
@@ -3105,23 +3525,23 @@ fn test_make_object_store_path() {
     use nautilus_persistence::backend::catalog::make_object_store_path;
 
     // Test basic path construction
-    let path = make_object_store_path("base", &["data", "quotes", "EURUSD"]);
+    let path = make_object_store_path("base", ["data", "quotes", "EURUSD"]);
     assert_eq!(path, "base/data/quotes/EURUSD");
 
     // Test empty base path
-    let path = make_object_store_path("", &["data", "quotes"]);
+    let path = make_object_store_path("", ["data", "quotes"]);
     assert_eq!(path, "data/quotes");
 
     // Test with trailing slashes in base
-    let path = make_object_store_path("base/", &["data", "quotes"]);
+    let path = make_object_store_path("base/", ["data", "quotes"]);
     assert_eq!(path, "base/data/quotes");
 
     // Test with leading slashes in components
-    let path = make_object_store_path("base", &["/data", "/quotes"]);
+    let path = make_object_store_path("base", ["/data", "/quotes"]);
     assert_eq!(path, "base/data/quotes");
 
     // Test with backslashes (Windows-style)
-    let path = make_object_store_path("base\\", &["data\\", "quotes"]);
+    let path = make_object_store_path("base\\", ["data\\", "quotes"]);
     assert_eq!(path, "base/data/quotes");
 }
 
@@ -3284,6 +3704,15 @@ fn test_extract_sql_safe_filename() {
     // Test empty path
     let filename = extract_sql_safe_filename("");
     assert_eq!(filename, "unknown_file");
+
+    // Test Windows-style path with backslashes
+    let filename = extract_sql_safe_filename(
+        r"data\quote_tick\EURUSD\2021-01-01T00-00-00-000000000Z_2021-01-02T00-00-00-000000000Z.parquet",
+    );
+    assert_eq!(
+        filename,
+        "2021_01_01t00_00_00_000000000z_2021_01_02t00_00_00_000000000z"
+    );
 }
 
 #[rstest]
@@ -3623,7 +4052,7 @@ fn test_rust_custom_data_binary_roundtrip() {
             ts_init: UnixNanos::from(2),
         },
     ];
-    let custom_data = original_data
+    let custom_data: Vec<CustomData> = original_data
         .iter()
         .cloned()
         .map(|item| CustomData::new(Arc::new(item), data_type.clone()))
@@ -4294,16 +4723,16 @@ fn test_query_directory_based_registration_with_cloud_uri() {
 fn test_duplicate_table_registration() {
     // Test that registering the same table twice doesn't cause duplicate data
     let mut session = DataBackendSession::new(1000);
-    let file_path = get_nautilus_test_data_file_path("quotes.parquet");
+    let file_path = get_test_data_file_path("nautilus/arrow/quotes.parquet");
 
     // First registration
     session
-        .add_file::<QuoteTick>("test_table", file_path.as_str(), None, None)
+        .add_file::<QuoteTick>("test_table", &file_path, None, None)
         .unwrap();
 
     // Second registration of the same table (should not add duplicate data)
     session
-        .add_file::<QuoteTick>("test_table", file_path.as_str(), None, None)
+        .add_file::<QuoteTick>("test_table", &file_path, None, None)
         .unwrap();
 
     let query_result: QueryResult = session.get_query_result();

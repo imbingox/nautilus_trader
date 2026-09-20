@@ -1795,7 +1795,7 @@ mod tests {
     use futures_util::StreamExt;
     use nautilus_common::{
         cache::Cache,
-        clock::TestClock,
+        clock::VirtualClock,
         factories::ExecutionClientFactory,
         live::runner::replace_exec_event_sender,
         messages::{
@@ -1847,7 +1847,7 @@ mod tests {
                 "BINANCE_PAPI",
                 &BinancePapiExecutionClientConfig::default(),
                 Rc::new(RefCell::new(Cache::default())).into(),
-                Rc::new(RefCell::new(TestClock::new())),
+                Rc::new(RefCell::new(VirtualClock::new())),
             )
             .unwrap()
     }
@@ -1883,7 +1883,7 @@ mod tests {
                 "PAPI-READ-007",
                 &config,
                 cache.into(),
-                Rc::new(RefCell::new(TestClock::new())),
+                Rc::new(RefCell::new(VirtualClock::new())),
             )
             .unwrap()
     }
@@ -2005,7 +2005,7 @@ mod tests {
                 "PAPI-TRADING-001",
                 &config,
                 cache.into(),
-                Rc::new(RefCell::new(TestClock::new())),
+                Rc::new(RefCell::new(VirtualClock::new())),
             )
             .unwrap()
     }
@@ -2365,7 +2365,7 @@ mod tests {
             .borrow_mut()
             .add_instrument(testing::instrument("BTCUSDT"))
             .unwrap();
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let _portfolio = Portfolio::new(clock.clone(), cache.clone(), None);
         let mut read_only = testing::config(&server.url);
         read_only.websocket_url = SecretString::from(websocket_url);
@@ -2447,7 +2447,7 @@ mod tests {
             .borrow_mut()
             .add_instrument(testing::instrument("BTCUSDT"))
             .unwrap();
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let portfolio = Portfolio::new(clock.clone(), cache.clone(), None);
         let engine = Rc::new(RefCell::new(ExecutionEngine::new(
             clock.clone(),

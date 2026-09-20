@@ -54,11 +54,11 @@ use nautilus_common::{
             RequestBars, RequestBookDeltas, RequestBookDepth, RequestBookSnapshot,
             RequestCustomData, RequestFundingRates, RequestInstrument, RequestInstruments,
             RequestOptionChainReferencePrice, RequestQuotes, RequestTrades, SubscribeBars,
-            SubscribeBookDeltas, SubscribeBookDepth10, SubscribeCustomData, SubscribeFundingRates,
+            SubscribeBookDeltas, SubscribeBookDepth, SubscribeCustomData, SubscribeFundingRates,
             SubscribeIndexPrices, SubscribeInstrument, SubscribeInstrumentClose,
             SubscribeInstrumentStatus, SubscribeInstruments, SubscribeMarkPrices,
             SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades, UnsubscribeBars,
-            UnsubscribeBookDeltas, UnsubscribeBookDepth10, UnsubscribeCustomData,
+            UnsubscribeBookDeltas, UnsubscribeBookDepth, UnsubscribeCustomData,
             UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeInstrument,
             UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus, UnsubscribeInstruments,
             UnsubscribeMarkPrices, UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
@@ -81,7 +81,7 @@ use nautilus_model::{
     data::{
         Bar, CustomData, Data, FundingRateUpdate, IndexPriceUpdate, InstrumentClose,
         InstrumentStatus, MarkPriceUpdate, OptionGreeks, OrderBookDelta, OrderBookDeltas,
-        OrderBookDepth10, QuoteTick, TradeTick,
+        OrderBookDepth, QuoteTick, TradeTick,
     },
     enums::{AccountType, LiquiditySide, OmsType, OrderSide, PositionSide},
     events::{
@@ -1362,10 +1362,10 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
-    fn subscribe_book_depth10(&mut self, command: SubscribeBookDepth10) -> anyhow::Result<()> {
+    fn subscribe_book_depth(&mut self, command: SubscribeBookDepth) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime
-                .call_method1(py, "admit", ("_subscribe_book_depth10", (command,)))
+                .call_method1(py, "admit", ("_subscribe_book_depth", (command,)))
         })?;
 
         Ok(())
@@ -1486,13 +1486,10 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
-    fn unsubscribe_book_depth10(&mut self, command: &UnsubscribeBookDepth10) -> anyhow::Result<()> {
+    fn unsubscribe_book_depth(&mut self, command: &UnsubscribeBookDepth) -> anyhow::Result<()> {
         Python::attach(|py| {
-            self.runtime.call_method1(
-                py,
-                "admit",
-                ("_unsubscribe_book_depth10", (command.clone(),)),
-            )
+            self.runtime
+                .call_method1(py, "admit", ("_unsubscribe_book_depth", (command.clone(),)))
         })?;
 
         Ok(())
@@ -1768,7 +1765,7 @@ fn extract_data(data: &Bound<'_, PyAny>) -> PyResult<Data> {
         Bar,
         OrderBookDelta,
         OrderBookDeltas,
-        OrderBookDepth10,
+        OrderBookDepth,
         MarkPriceUpdate,
         IndexPriceUpdate,
         FundingRateUpdate,
@@ -2203,7 +2200,7 @@ fn mass_status_matches(
 
 #[cfg(test)]
 mod tests {
-    use nautilus_common::{clock::TestClock, enums::LogLevel};
+    use nautilus_common::{clock::VirtualClock, enums::LogLevel};
     use nautilus_core::python::to_pyvalue_err;
     use nautilus_model::{
         enums::{OrderStatus, OrderType, TimeInForce},
@@ -2298,7 +2295,7 @@ class Runtime:
                     runtime,
                     output: ClientOutput::py_new(),
                     execution: None,
-                    clock: Rc::new(RefCell::new(TestClock::default())),
+                    clock: Rc::new(RefCell::new(VirtualClock::default())),
                 },
                 identity: ExecutionIdentity {
                     tolerance: Decimal::ZERO,

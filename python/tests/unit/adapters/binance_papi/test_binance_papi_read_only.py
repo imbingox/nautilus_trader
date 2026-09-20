@@ -247,7 +247,7 @@ def test_python_queries_return_shared_domain_types_and_exact_fees() -> None:
         assert all(request["api_key"] == API_KEY for request in requests)
         assert API_KEY not in repr(config) + repr(client) + snapshot.to_json()
         assert API_SECRET not in repr(config) + repr(client) + snapshot.to_json()
-        for name in ("api_key", "api_secret", "base_url"):
+        for name in ("api_key", "api_secret", "base_url", "websocket_url"):
             assert not hasattr(config, name)
 
 

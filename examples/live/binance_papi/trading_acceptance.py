@@ -33,39 +33,35 @@ import threading
 from decimal import Decimal
 from pathlib import Path
 from time import time_ns
-from typing import Any, cast
+from typing import Any
+from typing import cast
 
-from nautilus_trader.adapters.binance import (
-    BinanceDataClientConfig,
-    BinanceDataClientFactory,
-    BinanceEnvironment,
-    BinanceInstrumentProviderConfig,
-    BinanceProductType,
-    load_binance_instruments,
-)
-from nautilus_trader.adapters.binance_papi import (
-    BINANCE_PAPI_CLIENT_ID,
-    BinancePapiExecutionClientConfig,
-    BinancePapiExecutionClientFactory,
-    BinancePapiInstrumentTradingConfig,
-    BinancePapiReadOnlyClient,
-    BinancePapiReadOnlyConfig,
-    BinancePapiTradingConfig,
-)
+from nautilus_trader.adapters.binance import BinanceDataClientConfig
+from nautilus_trader.adapters.binance import BinanceDataClientFactory
+from nautilus_trader.adapters.binance import BinanceEnvironment
+from nautilus_trader.adapters.binance import BinanceInstrumentProviderConfig
+from nautilus_trader.adapters.binance import BinanceProductType
+from nautilus_trader.adapters.binance import load_binance_instruments
+from nautilus_trader.adapters.binance_papi import BINANCE_PAPI_CLIENT_ID
+from nautilus_trader.adapters.binance_papi import BinancePapiExecutionClientConfig
+from nautilus_trader.adapters.binance_papi import BinancePapiExecutionClientFactory
+from nautilus_trader.adapters.binance_papi import BinancePapiInstrumentTradingConfig
+from nautilus_trader.adapters.binance_papi import BinancePapiReadOnlyClient
+from nautilus_trader.adapters.binance_papi import BinancePapiReadOnlyConfig
+from nautilus_trader.adapters.binance_papi import BinancePapiTradingConfig
 from nautilus_trader.common import Environment
 from nautilus_trader.config import LiveRiskEngineConfig
 from nautilus_trader.live import LiveNode
-from nautilus_trader.model import (
-    AccountId,
-    CryptoPerpetual,
-    Currency,
-    InstrumentId,
-    OrderSide,
-    Quantity,
-    TimeInForce,
-    TraderId,
-)
+from nautilus_trader.model import AccountId
+from nautilus_trader.model import CryptoPerpetual
+from nautilus_trader.model import Currency
+from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import OrderSide
+from nautilus_trader.model import Quantity
+from nautilus_trader.model import TimeInForce
+from nautilus_trader.model import TraderId
 from nautilus_trader.trading import Strategy
+
 
 INSTRUMENT_ID = InstrumentId.from_str("BTCUSDT-PERP.BINANCE")
 OBSERVATION_INSTRUMENT_IDS = (
@@ -107,7 +103,7 @@ def _load_credentials(path: Path) -> tuple[BinancePapiReadOnlyConfig, str | None
 
 async def _load_instruments(proxy_url: str | None) -> list[CryptoPerpetual]:
     instruments = cast(
-        list[CryptoPerpetual],
+        "list[CryptoPerpetual]",
         await load_binance_instruments(
             BinanceDataClientConfig(
                 product_type=BinanceProductType.USD_M,
@@ -264,9 +260,14 @@ def _evaluate_postflight(action: str, evidence: dict[str, Any]) -> None:
 
 
 class AcceptanceStrategy(Strategy):
-    """Submit one acceptance order and stop after its expected terminal event."""
+    """
+    Submit one acceptance order and stop after its expected terminal event.
+    """
 
     def __init__(self) -> None:
+        """
+        Initialize the acceptance strategy state.
+        """
         super().__init__()
         self.action = ""
         self.evidence: dict[str, Any] = {}
@@ -277,10 +278,16 @@ class AcceptanceStrategy(Strategy):
         self.filled_quantity = Decimal(0)
 
     def configure(self, action: str, evidence: dict[str, Any]) -> None:
+        """
+        Configure the acceptance action and evidence sink.
+        """
         self.action = action
         self.evidence = evidence
 
     def on_start(self) -> None:
+        """
+        Load the instrument and subscribe to its quotes.
+        """
         self.instrument = self.cache.instrument(INSTRUMENT_ID)
         if self.instrument is None:
             self.evidence["strategy_error"] = "BTCUSDT instrument is unavailable"
@@ -289,6 +296,9 @@ class AcceptanceStrategy(Strategy):
         self.subscribe_quotes(INSTRUMENT_ID)
 
     def on_quote(self, quote: Any) -> None:
+        """
+        Submit the configured acceptance order on the first quote.
+        """
         if self.submitted:
             return
         self.submitted = True
@@ -348,9 +358,15 @@ class AcceptanceStrategy(Strategy):
         self.shutdown_system(reason)
 
     def on_order_submitted(self, event: Any) -> None:
+        """
+        Record an order submission event.
+        """
         self._record(event)
 
     def on_order_accepted(self, event: Any) -> None:
+        """
+        Record acceptance and cancel resting acceptance orders.
+        """
         self._record(event)
         if self.action in {"limit-gtc", "limit-gtx"} and not self.cancel_requested:
             self.cancel_requested = True
@@ -363,6 +379,9 @@ class AcceptanceStrategy(Strategy):
             self.cancel_order(order.client_order_id, client_id=BINANCE_PAPI_CLIENT_ID)
 
     def on_order_filled(self, event: Any) -> None:
+        """
+        Record fills and finish after the complete expected quantity.
+        """
         self._record(event)
         self.filled_quantity += event.last_qty.as_decimal()
         if self.filled_quantity > QUANTITY.as_decimal():
@@ -375,6 +394,9 @@ class AcceptanceStrategy(Strategy):
             )
 
     def on_order_canceled(self, event: Any) -> None:
+        """
+        Record cancellation and finish the strategy.
+        """
         self._record(event)
         self._finish(
             "PAPI acceptance order canceled",
@@ -382,6 +404,9 @@ class AcceptanceStrategy(Strategy):
         )
 
     def on_order_expired(self, event: Any) -> None:
+        """
+        Record expiration and finish the strategy.
+        """
         self._record(event)
         self._finish(
             "PAPI acceptance order expired",
@@ -389,14 +414,23 @@ class AcceptanceStrategy(Strategy):
         )
 
     def on_order_denied(self, event: Any) -> None:
+        """
+        Record a local denial and fail the acceptance action.
+        """
         self._record(event)
         self._finish("PAPI acceptance order denied", accepted_outcome=False)
 
     def on_order_rejected(self, event: Any) -> None:
+        """
+        Record a venue rejection and fail the acceptance action.
+        """
         self._record(event)
         self._finish("PAPI acceptance order rejected", accepted_outcome=False)
 
     def on_order_cancel_rejected(self, event: Any) -> None:
+        """
+        Record a cancellation rejection and fail the acceptance action.
+        """
         self._record(event)
         self._finish("PAPI acceptance cancel rejected", accepted_outcome=False)
 
@@ -430,7 +464,9 @@ def _build_node(
     )
     node = (
         LiveNode.builder(
-            "BINANCE-PAPI-ACCEPTANCE", TraderId("PAPI-ACCEPTANCE-001"), Environment.LIVE
+            "BINANCE-PAPI-ACCEPTANCE",
+            TraderId("PAPI-ACCEPTANCE-001"),
+            Environment.LIVE,
         )
         .with_risk_engine_config(LiveRiskEngineConfig(bypass=True))
         .with_timeout_connection(90)
@@ -473,7 +509,7 @@ def _write_new_private(path: Path, value: dict[str, Any]) -> None:
         stream.write("\n")
 
 
-def main(argv: list[str] | None = None) -> int:
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=ACTIONS)
     parser.add_argument("--credentials", type=Path, required=True)
@@ -487,6 +523,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("journal and output paths must not already exist")
     if not 30 <= args.timeout_secs <= 300:
         parser.error("timeout-secs must be between 30 and 300")
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    """
+    Run one live acceptance action and write its private evidence.
+    """
+    args = _parse_args(argv)
 
     evidence: dict[str, Any] = {
         "schema_version": 1,

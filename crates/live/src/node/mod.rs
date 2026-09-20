@@ -85,7 +85,7 @@ use std::{any::Any, fmt::Debug, time::Duration};
 
 use anyhow::Context;
 use nautilus_common::{
-    actor::{Actor, DataActor, DataActorNative},
+    actor::{self, Actor, DataActor, DataActorNative},
     cache::database::{CacheDatabaseAdapter, CacheDatabaseFactory},
     clients::ExecutionClient,
     component::Component,
@@ -123,9 +123,12 @@ use nautilus_trading::{
 use tabled::{builder::Builder, settings::Style};
 
 use crate::{
+    dispatch::drain_callbacks,
     execution::{
         client::LiveExecutionClient,
-        manager::{ExecutionManager, ExecutionManagerConfig, TargetedOrderReportResult},
+        manager::{
+            ExecutionManager, ExecutionManagerConfig, TargetedOrderQuery, TargetedOrderReportResult,
+        },
     },
     runner::{AsyncRunner, AsyncRunnerChannels, PendingRunnerEvent},
     socket::{SocketReconnectLookup, SocketReconnectRegistry},
@@ -564,10 +567,22 @@ impl LiveNode {
     }
 
     /// Disposes the live node kernel and releases resources.
+    ///
+    /// Discards any retained runner messages and attempts callback cleanup. Logs latched callback
+    /// failures and cleanup rejection; externally retained work can prevent clearing.
     pub fn dispose(&mut self) {
         self.close_external_ingress();
         self.handle.set_stopped();
         self.kernel.dispose();
+        drop(self.runner.take());
+
+        if let Some(e) = actor::callback_failure() {
+            log::error!("Callback dispatch failed before disposal cleanup: {e}");
+        }
+
+        if let Err(e) = actor::clear_callbacks() {
+            log::error!("Failed to clear callback dispatch during disposal: {e}");
+        }
     }
 
     async fn process_runner_for(&mut self, duration: Duration) -> usize {
@@ -616,8 +631,12 @@ impl LiveNode {
             PendingRunnerEvent::TimeEvent(message) => {
                 let _ = AsyncRunner::handle_time_event(message);
             }
-            PendingRunnerEvent::SystemEvent(event) => self.process_system_event(event),
-            PendingRunnerEvent::SystemCommand(command) => self.process_system_command(command),
+            PendingRunnerEvent::SystemEvent(event) => {
+                event.dispatch(|event| self.process_system_event(event));
+            }
+            PendingRunnerEvent::SystemCommand(command) => {
+                command.dispatch(|command| self.process_system_command(command));
+            }
             PendingRunnerEvent::ExecEvent(event) => {
                 event.dispatch(|event| self.process_exec_event(event));
             }
@@ -627,15 +646,15 @@ impl LiveNode {
         }
     }
 
-    fn process_system_events(&self, events: Vec<SystemEvent>) {
+    fn process_system_events(&self, events: Vec<DispatchMessage<SystemEvent>>) {
         for event in events {
-            self.process_system_event(event);
+            event.dispatch(|event| self.process_system_event(event));
         }
     }
 
-    fn process_system_commands(&self, commands: Vec<SystemCommand>) {
+    fn process_system_commands(&self, commands: Vec<DispatchMessage<SystemCommand>>) {
         for command in commands {
-            self.process_system_command(command);
+            command.dispatch(|command| self.process_system_command(command));
         }
     }
 
@@ -1509,7 +1528,22 @@ impl LiveNode {
             .map(|config| QueueMonitor::new(config, metrics.snapshot()));
         let mut dispatches_since_yield = 0usize;
 
-        loop {
+        let dispatch_result = loop {
+            let callbacks_pending = match drain_callbacks().await {
+                Ok(pending) => pending,
+                Err(e) => {
+                    if self.state() == NodeState::Running {
+                        self.initiate_shutdown();
+                    }
+
+                    log::warn!(
+                        "Skipping residual events and final buffered dispatch after callback failure"
+                    );
+
+                    break Err(e);
+                }
+            };
+
             let shutdown_deadline = self.shutdown_deadline;
             let is_shutting_down = self.state() == NodeState::ShuttingDown;
             let is_running = self.state() == NodeState::Running;
@@ -1547,8 +1581,9 @@ impl LiveNode {
                         None => std::future::pending::<()>().await,
                     }
                 }, if self.state() == NodeState::ShuttingDown => {
-                    break;
+                    break Ok(());
                 }
+                () = std::future::ready(()), if callbacks_pending => {},
                 result = async {
                     match open_order_report_task.as_mut() {
                         Some(task) => task.future.as_mut().await,
@@ -1575,11 +1610,22 @@ impl LiveNode {
                             );
                             self.process_reconciliation_events(&reconciliation.events);
                             if !reconciliation.targeted_queries.is_empty() {
-                                targeted_order_report_task = Some(
-                                    self.start_targeted_order_report_check(
-                                        reconciliation.targeted_queries,
-                                    ),
-                                );
+                                if is_shutting_down {
+                                    let planned_client_order_ids = reconciliation
+                                        .targeted_queries
+                                        .iter()
+                                        .map(TargetedOrderQuery::client_order_id)
+                                        .collect::<Vec<_>>();
+                                    self.cleanup_cancelled_report_tasks(
+                                        &planned_client_order_ids,
+                                    );
+                                } else {
+                                    targeted_order_report_task = Some(
+                                        self.start_targeted_order_report_check(
+                                            reconciliation.targeted_queries,
+                                        ),
+                                    );
+                                }
                             }
                         }
                         ReportTaskOutcome::TimedOut => {
@@ -1640,7 +1686,11 @@ impl LiveNode {
 
                     match result {
                         ReportTaskOutcome::Completed(PositionReportTaskResult::Positions(result)) => {
-                            position_report_task = self.handle_position_report_result(result);
+                            if is_shutting_down {
+                                self.cleanup_cancelled_report_tasks(&[]);
+                            } else {
+                                position_report_task = self.handle_position_report_result(result);
+                            }
                         }
                         ReportTaskOutcome::Completed(PositionReportTaskResult::Fills(result)) => {
                             self.handle_position_fill_report_result(result);
@@ -1760,14 +1810,14 @@ impl LiveNode {
                         log::debug!("Residual system event: {event}");
                         residual_events += 1;
                     }
-                    self.process_system_event(event);
+                    event.dispatch(|event| self.process_system_event(event));
                 }
                 Some(command) = system_cmd_rx.recv() => {
                     if is_shutting_down {
                         log::debug!("Residual system command: {command}");
                         residual_events += 1;
                     }
-                    self.process_system_command(command);
+                    command.dispatch(|command| self.process_system_command(command));
                 }
                 Some(evt) = exec_evt_rx.recv() => {
                     let dispatch_start = dst::time::Instant::now();
@@ -1862,7 +1912,7 @@ impl LiveNode {
                 dispatches_since_yield = 0;
                 tokio::task::yield_now().await;
             }
-        }
+        };
 
         if residual_events > 0 {
             log::debug!("Processed {residual_events} residual events during shutdown");
@@ -1877,6 +1927,14 @@ impl LiveNode {
         let _ = self.kernel.cache().borrow().check_residuals();
 
         let stop_result = self.finalize_stop().await;
+
+        if let Err(e) = dispatch_result {
+            if let Err(stop_err) = stop_result {
+                log::error!("Failed to finalize node after callback failure: {stop_err}");
+            }
+
+            return Err(e.into());
+        }
 
         // Handle events that arrived during finalize_stop
         Self::drain_channels(
@@ -2301,11 +2359,11 @@ impl LiveNode {
                     processed += 1;
                 }
                 Some(event) = receivers.system_evt.recv() => {
-                    self.process_system_event(event);
+                    event.dispatch(|event| self.process_system_event(event));
                     processed += 1;
                 }
                 Some(command) = receivers.system_cmd.recv() => {
-                    self.process_system_command(command);
+                    command.dispatch(|command| self.process_system_command(command));
                     processed += 1;
                 }
                 Some(event) = receivers.exec_evt.recv() => {
@@ -2414,9 +2472,9 @@ impl LiveNode {
     }
 
     fn drain_channels(
-        time_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
-        system_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SystemEvent>,
-        system_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SystemCommand>,
+        time_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<TimeEventMessage>>,
+        system_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<SystemEvent>>,
+        system_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<SystemCommand>>,
         exec_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<ExecutionEvent>>,
         exec_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<
             DispatchMessage<TradingCommandMessage>,
@@ -2941,9 +2999,9 @@ async fn recv_external_msgbus_message(
 }
 
 struct RunnerReceivers<'a> {
-    time_evt: &'a mut tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
-    system_evt: &'a mut tokio::sync::mpsc::UnboundedReceiver<SystemEvent>,
-    system_cmd: &'a mut tokio::sync::mpsc::UnboundedReceiver<SystemCommand>,
+    time_evt: &'a mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<TimeEventMessage>>,
+    system_evt: &'a mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<SystemEvent>>,
+    system_cmd: &'a mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<SystemCommand>>,
     exec_evt: &'a mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<ExecutionEvent>>,
     exec_cmd: &'a mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<TradingCommandMessage>>,
     data_evt: &'a mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<DataEvent>>,
@@ -2991,9 +3049,9 @@ fn flush_pending_data(
 )]
 fn flush_all_pending(
     pending: &mut PendingEvents,
-    time_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
-    system_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SystemEvent>,
-    system_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SystemCommand>,
+    time_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<TimeEventMessage>>,
+    system_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<SystemEvent>>,
+    system_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<SystemCommand>>,
     exec_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<ExecutionEvent>>,
     exec_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<TradingCommandMessage>>,
     data_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<DataEvent>>,
@@ -3042,9 +3100,9 @@ fn flush_all_pending(
 async fn drive_with_event_buffering<F: std::future::Future>(
     future: F,
     pending: &mut PendingEvents,
-    time_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
-    system_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SystemEvent>,
-    system_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SystemCommand>,
+    time_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<TimeEventMessage>>,
+    system_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<SystemEvent>>,
+    system_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<SystemCommand>>,
     exec_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<ExecutionEvent>>,
     exec_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<TradingCommandMessage>>,
     data_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<DataEvent>>,
@@ -3086,8 +3144,8 @@ async fn drive_with_event_buffering<F: std::future::Future>(
 
 #[derive(Default)]
 struct PendingEvents {
-    system_events: Vec<SystemEvent>,
-    system_commands: Vec<SystemCommand>,
+    system_events: Vec<DispatchMessage<SystemEvent>>,
+    system_commands: Vec<DispatchMessage<SystemCommand>>,
     data_evts: Vec<DispatchMessage<DataEvent>>,
     data_cmds: Vec<DispatchMessage<DataCommand>>,
     exec_reports: Vec<DispatchMessage<ExecutionReport>>,
@@ -3216,11 +3274,11 @@ impl PendingEvents {
         });
     }
 
-    fn take_system_events(&mut self) -> Vec<SystemEvent> {
+    fn take_system_events(&mut self) -> Vec<DispatchMessage<SystemEvent>> {
         std::mem::take(&mut self.system_events)
     }
 
-    fn take_system_commands(&mut self) -> Vec<SystemCommand> {
+    fn take_system_commands(&mut self) -> Vec<DispatchMessage<SystemCommand>> {
         std::mem::take(&mut self.system_commands)
     }
 }
@@ -3266,11 +3324,17 @@ mod tests {
         SyncDataCommandSender, replace_data_cmd_sender, replace_exec_cmd_sender,
     };
     use nautilus_common::{
-        actor::{DataActor, DataActorCore, data_actor::DataActorConfig},
+        actor::{
+            self, CallbackDispatchError, DataActor, DataActorCore, data_actor::DataActorConfig,
+        },
         cache::Cache,
-        clock::{Clock, TestClock},
+        clock::{Clock, VirtualClock},
         enums::SerializationEncoding,
-        live::runner::{get_data_event_sender, get_exec_event_sender, get_system_event_sender},
+        live::{
+            runner::{get_data_event_sender, get_exec_event_sender, get_system_event_sender},
+            sender::DispatchSender,
+        },
+        logging::{logger::LoggerConfig, logging_sync_to_disk, writer::FileWriterConfig},
         messages::{
             data::{SubscribeCommand, SubscribeQuotes},
             execution::{GenerateFillReports, QueryAccount, SubmitOrder, TradingCommand},
@@ -3286,6 +3350,7 @@ mod tests {
         nautilus_actor,
         runner::{SyncTradingCommandSender, TradingCommandSender},
         testing::wait_until_async,
+        timer::{TimeEvent, TimeEventCallback},
     };
     use nautilus_core::{Params, UUID4, UnixNanos};
     use nautilus_execution::{
@@ -3463,6 +3528,91 @@ mod tests {
         }
 
         fn flush(&self) {}
+    }
+
+    #[derive(Debug)]
+    struct FailingTimerActor {
+        core: DataActorCore,
+        received: Rc<RefCell<Vec<u64>>>,
+    }
+
+    nautilus_actor!(FailingTimerActor);
+
+    impl DataActor for FailingTimerActor {
+        fn on_start(&mut self) -> anyhow::Result<()> {
+            for timestamp in [17, 23] {
+                let received = self.received.clone();
+
+                let callback = TimeEventCallback::RustLocal(Rc::new(move |_| {
+                    received.borrow_mut().push(timestamp);
+
+                    if timestamp == 17 {
+                        crate::dispatch::tests::latch_callback_failure();
+                    }
+                }));
+
+                nautilus_common::runner::get_time_event_sender().send(TimeEventMessage::new(
+                    TimeEvent::new(
+                        "callback-failure".into(),
+                        UUID4::new(),
+                        timestamp.into(),
+                        timestamp.into(),
+                    ),
+                    callback,
+                ));
+            }
+
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_callback_failure_stops_later_live_events() {
+        actor::clear_callbacks().unwrap();
+
+        let config = LiveNodeConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
+                reconciliation: false,
+                ..Default::default()
+            },
+            timeout_connection: Duration::ZERO,
+            timeout_reconciliation: Duration::ZERO,
+            timeout_portfolio: Duration::ZERO,
+            timeout_disconnection: Duration::ZERO,
+            delay_post_stop: Duration::ZERO,
+            timeout_shutdown: Duration::ZERO,
+            ..Default::default()
+        };
+
+        let mut node = LiveNode::build("CallbackFailureNode".to_string(), Some(config)).unwrap();
+        let received = Rc::new(RefCell::new(Vec::new()));
+        node.add_actor(FailingTimerActor {
+            core: DataActorCore::new(DataActorConfig {
+                actor_id: Some(ActorId::from("CALLBACK-FAILURE")),
+                ..Default::default()
+            }),
+            received: received.clone(),
+        })
+        .unwrap();
+
+        let result = node.run_with_mode(NodeRunMode::Hosted).await;
+
+        let error = result.unwrap_err();
+        let state = node.state();
+        let trader_stopped = node.kernel.trader.borrow().is_stopped();
+        let failure = actor::callback_failure();
+        node.dispose();
+
+        assert_eq!(
+            error.downcast_ref::<CallbackDispatchError>(),
+            Some(&CallbackDispatchError::DeliveryUnwound)
+        );
+        assert_eq!(*received.borrow(), [17]);
+        assert_eq!(state, NodeState::Stopped);
+        assert!(trader_stopped);
+        assert_eq!(failure, Some(CallbackDispatchError::DeliveryUnwound));
+        assert_eq!(actor::callback_failure(), None);
+        assert_eq!(actor::clear_callbacks(), Ok(()));
     }
 
     #[rstest]
@@ -3712,6 +3862,75 @@ mod tests {
         #[case] expected: SocketReconnectDispatchOutcome,
     ) {
         assert_eq!(LiveNode::request_socket_reconnect(lookup), expected);
+    }
+
+    #[rstest]
+    fn test_system_dispatch_restores_context(#[values(false, true)] startup: bool) {
+        let trader_id = TraderId::from("SOCKET-001");
+
+        let config = LiveNodeConfig {
+            trader_id,
+            ..Default::default()
+        };
+
+        let mut node = LiveNode::build("SystemDispatchNode".to_string(), Some(config)).unwrap();
+        let client_id = ClientId::from("TEST");
+        let endpoint = Ustr::from("test-streams");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sender = DispatchSender::new(tx);
+        let events = sender.clone();
+        msgbus::subscribe_any(
+            MessagingSwitchboard::socket_state_changed_pattern(
+                Some(client_id),
+                Some(endpoint.as_str()),
+            ),
+            ShareableMessageHandler::from_typed(move |_: &SocketStateChanged| {
+                events.send(17u32).unwrap();
+            }),
+            None,
+        );
+
+        let control =
+            SocketControl::with_registry(client_id, None, endpoint, &node.socket_registry);
+        let _sink = control.sink();
+        control.register(move || {
+            sender.send(23u32).unwrap();
+            ReconnectRequestOutcome::Accepted
+        });
+
+        let event = SystemEvent::SocketState(SocketStateChange::new(
+            client_id,
+            None,
+            endpoint,
+            SocketState::Connected,
+        ));
+        let command = SystemCommand::ReconnectSocket(ReconnectSocket::new(
+            trader_id,
+            client_id,
+            endpoint,
+            31.into(),
+        ));
+
+        if startup {
+            let mut pending = PendingEvents::default();
+            pending.system_events.push(event.into());
+            pending.system_commands.push(command.into());
+            node.process_system_events(pending.take_system_events());
+            node.process_system_commands(pending.take_system_commands());
+            assert!(pending.is_empty());
+        } else {
+            node.process_runner_event(PendingRunnerEvent::SystemEvent(event.into()));
+            node.process_runner_event(PendingRunnerEvent::SystemCommand(command.into()));
+        }
+
+        let event_child = rx.try_recv().unwrap();
+        let command_child = rx.try_recv().unwrap();
+        assert!(event_child.is_rooted());
+        assert!(command_child.is_rooted());
+        assert_eq!(event_child.dispatch(|value| value), 17);
+        assert_eq!(command_child.dispatch(|value| value), 23);
+        assert!(rx.is_empty());
+        msgbus::get_message_bus().borrow_mut().dispose();
     }
 
     #[rstest]
@@ -5254,7 +5473,7 @@ mod tests {
             .with_reconciliation(false)
             .with_clock_factory(move || {
                 calls_in_factory.set(calls_in_factory.get() + 1);
-                let mut clock = TestClock::new();
+                let mut clock = VirtualClock::new();
                 clock.advance_time(sentinel, true);
                 Rc::new(RefCell::new(clock)) as Rc<RefCell<dyn Clock>>
             })
@@ -6667,6 +6886,181 @@ mod tests {
     }
 
     #[rstest]
+    fn test_dispose_releases_retained_callback_roots(
+        #[values(false, true)] fatal: bool,
+        #[values(false, true)] external: bool,
+    ) {
+        actor::clear_callbacks().unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("nautilus-callback-disposal-{}", UUID4::new()));
+
+        let config = LiveNodeConfig {
+            logging: LoggerConfig {
+                fileout_level: LevelFilter::Info,
+                file_config: Some(FileWriterConfig {
+                    directory: Some(directory.to_str().unwrap().to_string()),
+                    file_name: Some("disposal".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut node = LiveNode::build("CallbackDisposalNode".to_string(), Some(config)).unwrap();
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let observed = received.clone();
+
+        let retained = DispatchMessage::from(()).dispatch(|()| {
+            nautilus_common::runner::get_time_event_sender().send(TimeEventMessage::new(
+                TimeEvent::new("disposal".into(), UUID4::new(), 17.into(), 23.into()),
+                TimeEventCallback::RustLocal(Rc::new(move |_| {
+                    observed.borrow_mut().push("delivered");
+                })),
+            ));
+
+            external.then(|| DispatchMessage::new((), std::thread::current().id()))
+        });
+
+        if let Some(retained) = &retained {
+            assert!(retained.is_rooted());
+        }
+
+        assert_eq!(actor::clear_callbacks(), Err(CallbackDispatchError::Active));
+
+        if fatal {
+            crate::dispatch::tests::latch_callback_failure();
+        }
+
+        node.dispose();
+
+        assert!(node.runner.is_none());
+        assert!(received.borrow().is_empty());
+        assert_eq!(Rc::strong_count(&received), 1);
+        assert_eq!(
+            actor::callback_failure(),
+            (fatal && external).then_some(CallbackDispatchError::DeliveryUnwound)
+        );
+        assert_eq!(
+            actor::clear_callbacks(),
+            if external {
+                Err(CallbackDispatchError::Active)
+            } else {
+                Ok(())
+            }
+        );
+
+        logging_sync_to_disk().unwrap();
+        let output = std::fs::read_to_string(directory.join("disposal.log")).unwrap();
+        drop(retained);
+        node.dispose();
+
+        assert_eq!(actor::callback_failure(), None);
+        assert_eq!(actor::clear_callbacks(), Ok(()));
+        drop(node);
+        std::fs::remove_dir_all(directory).unwrap();
+
+        let errors: Vec<_> = output
+            .lines()
+            .filter(|line| line.contains("[ERROR]"))
+            .filter_map(|line| {
+                line.split_once(".nautilus_live::node: ")
+                    .map(|(_, text)| text)
+            })
+            .collect();
+
+        let mut expected = Vec::new();
+
+        if fatal {
+            expected.push(
+                "Callback dispatch failed before disposal cleanup: Callback delivery unwound",
+            );
+        }
+
+        if external {
+            expected.push(
+                "Failed to clear callback dispatch during disposal: Callback work or access is still active",
+            );
+        }
+
+        assert_eq!(errors, expected);
+    }
+
+    #[tokio::test]
+    async fn test_dispose_releases_stop_generated_callback_roots() {
+        actor::clear_callbacks().unwrap();
+
+        let config = LiveNodeConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
+                reconciliation: false,
+                ..Default::default()
+            },
+            timeout_connection: Duration::ZERO,
+            timeout_reconciliation: Duration::ZERO,
+            timeout_portfolio: Duration::ZERO,
+            timeout_shutdown: Duration::ZERO,
+            ..Default::default()
+        };
+
+        let mut node =
+            LiveNode::build("StopCallbackDisposalNode".to_string(), Some(config)).unwrap();
+        let received = Rc::new(RefCell::new(Vec::new()));
+        node.add_actor(StopCallbackActor {
+            core: DataActorCore::new(DataActorConfig {
+                actor_id: Some(ActorId::from("STOP-CALLBACK")),
+                ..Default::default()
+            }),
+            received: received.clone(),
+        })
+        .unwrap();
+
+        node.start().await.unwrap();
+
+        assert!(node.kernel.trader().borrow().is_running());
+        assert_eq!(actor::clear_callbacks(), Ok(()));
+
+        node.dispose();
+
+        assert_eq!(*received.borrow(), ["stop", "queued"]);
+        assert_eq!(Rc::strong_count(&received), 1);
+        assert!(node.runner.is_none());
+        assert!(node.kernel.trader().borrow().is_disposed());
+        assert_eq!(node.state(), NodeState::Stopped);
+        assert_eq!(actor::clear_callbacks(), Ok(()));
+    }
+
+    #[derive(Debug)]
+    struct StopCallbackActor {
+        core: DataActorCore,
+        received: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    nautilus_actor!(StopCallbackActor);
+
+    impl DataActor for StopCallbackActor {
+        fn on_stop(&mut self) -> anyhow::Result<()> {
+            self.received.borrow_mut().push("stop");
+            let received = self.received.clone();
+            DispatchMessage::from(()).dispatch(|()| {
+                nautilus_common::runner::get_time_event_sender().send(TimeEventMessage::new(
+                    TimeEvent::new("stop-disposal".into(), UUID4::new(), 31.into(), 37.into()),
+                    TimeEventCallback::RustLocal(Rc::new(move |_| {
+                        received.borrow_mut().push("delivered");
+                    })),
+                ));
+            });
+
+            let clear_result = actor::clear_callbacks();
+            anyhow::ensure!(
+                clear_result == Err(CallbackDispatchError::Active),
+                "Expected active callback roots during stop, received {clear_result:?}"
+            );
+            self.received.borrow_mut().push("queued");
+            Ok(())
+        }
+    }
+
+    #[rstest]
     fn test_handle_initial_state() {
         let handle = LiveNodeHandle::new();
 
@@ -7527,8 +7921,14 @@ mod tests {
             SocketState::Connected,
         );
 
-        pending.system_events.push(SystemEvent::SocketState(change));
-        let system_events = pending.take_system_events();
+        pending
+            .system_events
+            .push(SystemEvent::SocketState(change).into());
+        let system_events = pending
+            .take_system_events()
+            .into_iter()
+            .map(|message| message.dispatch(|value| value))
+            .collect::<Vec<_>>();
 
         assert_eq!(system_events, vec![SystemEvent::SocketState(change)]);
         assert!(pending.is_empty());
@@ -7539,8 +7939,12 @@ mod tests {
         let mut pending = PendingEvents::default();
         let command = stub_system_command();
 
-        pending.system_commands.push(command);
-        let system_commands = pending.take_system_commands();
+        pending.system_commands.push(command.into());
+        let system_commands = pending
+            .take_system_commands()
+            .into_iter()
+            .map(|message| message.dispatch(|value| value))
+            .collect::<Vec<_>>();
 
         assert_eq!(system_commands, vec![command]);
         assert!(pending.is_empty());
@@ -7614,11 +8018,12 @@ mod tests {
 
     #[rstest]
     fn test_flush_all_pending_drains_buffered_channels() {
-        let (time_tx, mut time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
+        let (time_tx, mut time_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
         let (system_evt_tx, mut system_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<SystemEvent>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<SystemEvent>>();
         let (system_cmd_tx, mut system_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<SystemCommand>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<SystemCommand>>();
         let (data_evt_tx, mut data_evt_rx) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
         let (data_cmd_tx, mut data_cmd_rx) =
@@ -7635,7 +8040,7 @@ mod tests {
         pending.data_cmds.push(stub_data_command().into());
 
         // Pre-load all channel types
-        time_tx.send(stub_time_event_handler()).unwrap();
+        time_tx.send((stub_time_event_handler()).into()).unwrap();
 
         let change = SocketStateChange::new(
             ClientId::from("BINANCE"),
@@ -7644,9 +8049,9 @@ mod tests {
             SocketState::Connected,
         );
         system_evt_tx
-            .send(SystemEvent::SocketState(change))
+            .send((SystemEvent::SocketState(change)).into())
             .unwrap();
-        system_cmd_tx.send(stub_system_command()).unwrap();
+        system_cmd_tx.send((stub_system_command()).into()).unwrap();
         data_evt_tx.send((stub_data_event()).into()).unwrap();
         data_cmd_tx.send(stub_data_command().into()).unwrap();
         exec_evt_tx.send((stub_exec_event()).into()).unwrap();
@@ -7665,8 +8070,16 @@ mod tests {
             &mut data_cmd_rx,
         );
 
-        let system_events = pending.take_system_events();
-        let system_commands = pending.take_system_commands();
+        let system_events = pending
+            .take_system_events()
+            .into_iter()
+            .map(|message| message.dispatch(|value| value))
+            .collect::<Vec<_>>();
+        let system_commands = pending
+            .take_system_commands()
+            .into_iter()
+            .map(|message| message.dispatch(|value| value))
+            .collect::<Vec<_>>();
         assert_eq!(system_events, vec![SystemEvent::SocketState(change)]);
         assert_eq!(system_commands, vec![stub_system_command()]);
         assert!(pending.data_evts.is_empty());
@@ -7712,11 +8125,12 @@ mod tests {
 
     #[rstest]
     fn test_flush_all_pending_routes_order_event_to_order_evts() {
-        let (_time_tx, mut time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
+        let (_time_tx, mut time_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
         let (_system_evt_tx, mut system_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<SystemEvent>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<SystemEvent>>();
         let (_system_cmd_tx, mut system_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<SystemCommand>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<SystemCommand>>();
         let (_data_evt_tx, mut data_evt_rx) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
         let (_data_cmd_tx, mut data_cmd_rx) =
@@ -7750,11 +8164,12 @@ mod tests {
 
     #[rstest]
     fn test_flush_all_pending_routes_account_event_immediately() {
-        let (_time_tx, mut time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
+        let (_time_tx, mut time_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
         let (_system_evt_tx, mut system_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<SystemEvent>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<SystemEvent>>();
         let (_system_cmd_tx, mut system_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<SystemCommand>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<SystemCommand>>();
         let (_data_evt_tx, mut data_evt_rx) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
         let (_data_cmd_tx, mut data_cmd_rx) =
@@ -7933,11 +8348,12 @@ mod tests {
 
     #[rstest]
     fn test_flush_all_pending_buffers_submitted_batch_as_individual_events() {
-        let (_time_tx, mut time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
+        let (_time_tx, mut time_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
         let (_system_evt_tx, mut system_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<SystemEvent>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<SystemEvent>>();
         let (_system_cmd_tx, mut system_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<SystemCommand>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<SystemCommand>>();
         let (_data_evt_tx, mut data_evt_rx) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
         let (_data_cmd_tx, mut data_cmd_rx) =
@@ -7971,11 +8387,12 @@ mod tests {
 
     #[rstest]
     fn test_flush_all_pending_buffers_canceled_batch_as_individual_events() {
-        let (_time_tx, mut time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
+        let (_time_tx, mut time_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
         let (_system_evt_tx, mut system_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<SystemEvent>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<SystemEvent>>();
         let (_system_cmd_tx, mut system_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<SystemCommand>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<SystemCommand>>();
         let (_data_evt_tx, mut data_evt_rx) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
         let (_data_cmd_tx, mut data_cmd_rx) =

@@ -20,7 +20,7 @@ use nautilus_model::events::AccountState;
 
 use super::{
     ArrowSchemaProvider, DecodeTypedFromRecordBatch, EncodeToRecordBatch, EncodingError,
-    json::{self, JsonFieldSpec},
+    json::{JsonFieldSpec, decode_batch, encode_batch, metadata_for_type, schema_for_type},
 };
 
 const ACCOUNT_STATE_FIELDS: &[JsonFieldSpec] = &[
@@ -31,28 +31,36 @@ const ACCOUNT_STATE_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::utf8_json("margins", false),
     JsonFieldSpec::boolean("is_reported", false),
     JsonFieldSpec::utf8("event_id", false),
-    JsonFieldSpec::u64("ts_event", false),
-    JsonFieldSpec::u64("ts_init", false),
+    JsonFieldSpec::timestamp("ts_event", false),
+    JsonFieldSpec::timestamp("ts_init", false),
     JsonFieldSpec::utf8_json("info", true),
     JsonFieldSpec::utf8_json("total_only_balances", false),
 ];
 
 impl ArrowSchemaProvider for AccountState {
     fn get_schema(metadata: Option<HashMap<String, String>>) -> Schema {
-        json::schema_for_type("AccountState", metadata, ACCOUNT_STATE_FIELDS)
+        schema_for_type("AccountState", metadata, ACCOUNT_STATE_FIELDS)
     }
 }
 
 impl EncodeToRecordBatch for AccountState {
-    fn encode_batch(
+    fn encode_batch<T>(
         metadata: &HashMap<String, String>,
-        data: &[Self],
-    ) -> Result<RecordBatch, ArrowError> {
-        json::encode_batch("AccountState", metadata, data, ACCOUNT_STATE_FIELDS)
+        data: &[T],
+    ) -> Result<RecordBatch, ArrowError>
+    where
+        T: std::borrow::Borrow<Self>,
+    {
+        encode_batch(
+            "AccountState",
+            metadata,
+            data.iter().map(std::borrow::Borrow::borrow),
+            ACCOUNT_STATE_FIELDS,
+        )
     }
 
     fn metadata(&self) -> HashMap<String, String> {
-        json::metadata_for_type("AccountState")
+        metadata_for_type("AccountState")
     }
 }
 
@@ -62,13 +70,16 @@ impl DecodeTypedFromRecordBatch for AccountState {
         record_batch: RecordBatch,
     ) -> Result<Vec<Self>, EncodingError> {
         // These columns were introduced separately, so each has its own legacy default
-        let fields = json::fields_for_schema(
-            &record_batch,
-            ACCOUNT_STATE_FIELDS,
-            &["total_only_balances"],
-        )?;
-        let fields = json::fields_for_schema(&record_batch, &fields, &["info"])?;
-        json::decode_batch(metadata, &record_batch, &fields, Some("AccountState"))
+        let schema = record_batch.schema();
+        let fields = ACCOUNT_STATE_FIELDS
+            .iter()
+            .copied()
+            .filter(|field| {
+                !matches!(field.name, "info" | "total_only_balances")
+                    || schema.index_of(field.name).is_ok()
+            })
+            .collect::<Vec<_>>();
+        decode_batch(metadata, &record_batch, &fields, Some("AccountState"))
     }
 }
 
@@ -83,7 +94,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::arrow::{DecodeTypedFromRecordBatch, EncodeToRecordBatch, json::encode_batch};
 
     #[rstest]
     fn test_account_state_round_trip(cash_account_state: AccountState) {

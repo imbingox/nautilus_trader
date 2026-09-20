@@ -123,7 +123,10 @@ use crate::{
     },
     ratelimiter::{RateLimiter, clock::MonotonicClock, quota::Quota},
     retry::{RetryConfig, RetryError, RetryManager},
-    transport::{BoxedWsTransport, Message, TransportError, tungstenite::TungsteniteTransport},
+    transport::{
+        BoxedWsTransport, Message, TransportError, error::retryable_status,
+        tungstenite::TungsteniteTransport,
+    },
 };
 
 const WRITE_TIMEOUT_SECS: u64 = 5;
@@ -939,10 +942,6 @@ fn is_retryable_initial_connect_error(err: &TransportError) -> bool {
         | TransportError::InvalidUtf8
         | TransportError::Other(_) => false,
     }
-}
-
-const fn retryable_status(status: u16) -> bool {
-    matches!(status, 408 | 425 | 429 | 500..=599)
 }
 
 fn initial_connect_retry_config(
@@ -2117,7 +2116,7 @@ impl WebSocketClientInner {
                         match writer_tx.send(msg) {
                             Ok(()) => log::trace!("Sent heartbeat to writer task"),
                             Err(e) => {
-                                log::error!("Failed to send heartbeat to writer task: {e}");
+                                log::warn!("Failed to send heartbeat to writer task: {e}");
                             }
                         }
                     }
@@ -4847,6 +4846,8 @@ mod rust_tests {
     };
 
     use futures_util::{SinkExt, StreamExt};
+    #[cfg(target_os = "linux")]
+    use log::Level;
     use nautilus_common::testing::wait_until_async;
     use parking_lot::{Condvar, Mutex};
     use rstest::rstest;
@@ -4872,12 +4873,22 @@ mod rust_tests {
     };
 
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::logging::tests::capture_logs_for;
     use crate::{
         SocketState,
         websocket::types::{channel_epoch_message_handler, channel_message_handler},
     };
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    // A retryable upgrade rejection must stay below ERROR on both the transport that reports it
+    // and the client that retries it.
+    #[cfg(all(feature = "transport-sockudo", target_os = "linux"))]
+    const RECONNECT_LOG_TARGETS: &[&str] = &[
+        "nautilus_network::transport::sockudo",
+        "nautilus_network::websocket::client",
+    ];
 
     struct CondvarReleaseGuard<'a> {
         release: &'a (Mutex<bool>, Condvar),
@@ -8284,6 +8295,46 @@ mod rust_tests {
         task.await.unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[rstest]
+    #[tokio::test]
+    async fn test_heartbeat_task_warns_when_writer_channel_closed() {
+        let capture = capture_logs_for(&["nautilus_network::websocket::client"]).await;
+        let connection_state = Arc::new(AtomicU8::new(ConnectionMode::Active.as_u8()));
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = WebSocketClientInner::spawn_heartbeat_task(
+            Arc::clone(&connection_state),
+            1,
+            None,
+            writer_tx,
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), writer_rx.recv())
+            .await
+            .expect("timed out waiting for the first heartbeat")
+            .expect("heartbeat channel closed before the first heartbeat");
+        drop(writer_rx);
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+        let messages = capture.messages();
+        assert!(
+            messages.iter().any(|(level, message)| {
+                *level == Level::Warn && message.contains("Failed to send heartbeat to writer task")
+            }),
+            "expected WARN when the writer channel is closed, was {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|(level, _)| *level == Level::Error),
+            "a closed writer channel must not log ERROR, was {messages:?}"
+        );
+
+        connection_state.store(ConnectionMode::Closed.as_u8(), Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("heartbeat task should stop after close")
+            .unwrap();
+    }
+
     #[rstest]
     #[tokio::test(start_paused = true)]
     async fn test_stalled_ownership_bound_send_times_out_without_replay() {
@@ -9310,6 +9361,124 @@ mod rust_tests {
                 .contains("reserved upgrade header not allowed in extra_headers"),
             "expected reserved-header failure, was: {err}"
         );
+    }
+
+    // The log-capture harness is Linux-only for CI stability.
+    #[cfg(all(feature = "transport-sockudo", target_os = "linux"))]
+    #[rstest]
+    #[tokio::test]
+    async fn test_sockudo_reconnect_recovers_from_retryable_upgrade_rejection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = task::spawn(async move {
+            // First connection: accept the upgrade, then drop it to force a reconnect.
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(accept_async(stream).await.unwrap());
+
+            // Second connection: reject the reconnect handshake with a retryable status.
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            sleep(Duration::from_millis(50)).await;
+            drop(stream);
+
+            // Third connection: accept the upgrade so the reconnect loop completes recovery.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            ws.send(WsMessage::Text("recovered".to_string().into()))
+                .await
+                .unwrap();
+            sleep(Duration::from_secs(1)).await;
+        });
+
+        let (handler, mut rx) = channel_message_handler();
+
+        let config = WebSocketConfig {
+            url: format!(
+                "ws://user-secret:password-secret@127.0.0.1:{port}/path-secret?token=query-secret"
+            ),
+            headers: vec![],
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(2_000),
+            reconnect_delay_initial_ms: Some(50),
+            reconnect_delay_max_ms: Some(100),
+            reconnect_backoff_factor: Some(1.0),
+            reconnect_jitter_ms: Some(0),
+            reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
+            idle_timeout_ms: None,
+            backend: TransportBackend::Sockudo,
+            proxy_url: None,
+        };
+
+        // Capture before connecting so the whole reconnect cycle is observed. The harness owns
+        // the global logger, so the Nautilus logger that arms `shutdown_on_error` on an ERROR
+        // record cannot run here; the absence of ERROR records is what rules the trigger out.
+        let capture = capture_logs_for(RECONNECT_LOG_TARGETS).await;
+
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connect()
+            .await
+            .expect("sockudo connect should succeed");
+
+        let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(WsMessage::Text(text)) = rx.try_recv()
+                    && text.as_str() == "recovered"
+                {
+                    return;
+                }
+
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        let messages = capture.messages();
+        client.disconnect().await;
+        server.abort();
+
+        recovered.expect("client should recover after the retryable upgrade rejection");
+
+        let errors: Vec<_> = messages
+            .iter()
+            .filter(|(level, _)| *level == Level::Error)
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "a retryable rejection must not log at ERROR, was: {errors:?}"
+        );
+
+        // Asserted positively so the ERROR assertion above cannot pass by capturing nothing.
+        assert!(
+            messages.iter().any(|(level, message)| *level == Level::Warn
+                && message.contains(&format!(
+                    "Sockudo handshake rejected by 127.0.0.1:{port} with retryable status 502"
+                ))),
+            "expected a warning naming the retryable rejection, was: {messages:?}"
+        );
+
+        for secret in [
+            "user-secret",
+            "password-secret",
+            "path-secret",
+            "query-secret",
+        ] {
+            assert!(
+                messages
+                    .iter()
+                    .all(|(_, message)| !message.contains(secret)),
+                "logs must not contain {secret}, was: {messages:?}"
+            );
+        }
     }
 
     #[cfg(all(feature = "transport-sockudo", not(feature = "turmoil")))]

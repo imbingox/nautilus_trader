@@ -15,7 +15,7 @@
 
 use std::{cell::RefCell, rc::Rc};
 
-use nautilus_common::{cache::Cache, clock::TestClock};
+use nautilus_common::{cache::Cache, clock::VirtualClock};
 use nautilus_model::{
     identifiers::{AccountId, ClientId, InstrumentId, TraderId},
     python::instruments::instrument_any_to_pyobject,
@@ -126,6 +126,7 @@ fn test_python_read_only_constructors_registry_and_secret_boundaries() {
         assert!(read_only.getattr("api_key").is_err());
         assert!(read_only.getattr("api_secret").is_err());
         assert!(read_only.getattr("base_url").is_err());
+        assert!(read_only.getattr("websocket_url").is_err());
         assert!(read_only.getattr("proxy_url").is_err());
         assert!(
             read_only
@@ -238,7 +239,7 @@ fn test_python_read_only_constructors_registry_and_secret_boundaries() {
                 "PAPI-PYTHON-009",
                 config,
                 Rc::new(RefCell::new(Cache::default())).into(),
-                Rc::new(RefCell::new(TestClock::new())),
+                Rc::new(RefCell::new(VirtualClock::new())),
             )
             .unwrap();
 
