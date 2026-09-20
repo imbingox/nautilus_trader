@@ -50,9 +50,8 @@ use anyhow::Context;
 use jiff::{Timestamp, fmt::rfc2822::DateTimeParser};
 use nautilus_common::{cache::InstrumentLookupError, live::dst::time};
 use nautilus_core::{
-    AtomicMap, AtomicTime, UnixNanos, consts::NAUTILUS_USER_AGENT,
-    datetime::NANOSECONDS_IN_MILLISECOND, env::get_or_env_var, string::secret::REDACTED,
-    time::get_atomic_clock_realtime,
+    AtomicMap, AtomicTime, UnixNanos, datetime::NANOSECONDS_IN_MILLISECOND, env::get_or_env_var,
+    string::secret::REDACTED, time::get_atomic_clock_realtime,
 };
 use nautilus_model::{
     data::{
@@ -60,8 +59,8 @@ use nautilus_model::{
         OrderBookDelta, OrderBookDeltas, TradeTick,
     },
     enums::{
-        AggregationSource, BarAggregation, BookAction, BookType, OrderSide, OrderStatus, OrderType,
-        PositionSide, RecordFlag, TimeInForce, TriggerType,
+        AccountType, AggregationSource, BarAggregation, BookAction, BookType, OrderSide,
+        OrderStatus, OrderType, PositionSide, RecordFlag, TimeInForce, TriggerType,
     },
     events::AccountState,
     identifiers::{AccountId, ClientOrderId, InstrumentId, VenueOrderId},
@@ -71,7 +70,7 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 use nautilus_network::{
-    http::{HttpClient, Method, StatusCode, USER_AGENT},
+    http::{HttpClient, Method, StatusCode, create_standard_nautilus_headers},
     ratelimiter::quota::Quota,
     retry::{RetryConfig, RetryError, RetryManager},
 };
@@ -536,7 +535,7 @@ struct PageSweep<T> {
 impl<T> PageSweep<T> {
     fn from_pages(items: Vec<T>, exhausted: bool) -> Self {
         Self {
-            complete: !(exhausted && !items.is_empty()),
+            complete: !exhausted || items.is_empty(),
             items,
         }
     }
@@ -906,8 +905,8 @@ impl OKXRawHttpClient {
 
     /// Builds the default headers to include with each request (e.g., `User-Agent`).
     fn default_headers(environment: OKXEnvironment) -> HashMap<String, String> {
-        let mut headers =
-            HashMap::from([(USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string())]);
+        let mut headers: HashMap<String, String> =
+            create_standard_nautilus_headers().into_iter().collect();
 
         if environment == OKXEnvironment::Demo {
             headers.insert("x-simulated-trading".to_string(), "1".to_string());
@@ -2295,13 +2294,16 @@ impl OKXHttpClient {
 
     /// Returns the public API key being used by the client.
     pub fn api_key(&self) -> Option<&str> {
-        self.inner.credential.as_ref().map(|c| c.api_key())
+        self.inner.credential.as_ref().map(Credential::api_key)
     }
 
     /// Returns a masked version of the API key for logging purposes.
     #[must_use]
     pub fn api_key_masked(&self) -> Option<String> {
-        self.inner.credential.as_ref().map(|c| c.api_key_masked())
+        self.inner
+            .credential
+            .as_ref()
+            .map(Credential::api_key_masked)
     }
 
     /// Returns whether the client is configured for demo trading.
@@ -2336,7 +2338,7 @@ impl OKXHttpClient {
         self.instruments_cache
             .load()
             .keys()
-            .map(|k| k.to_string())
+            .map(ToString::to_string)
             .collect()
     }
 
@@ -2430,12 +2432,16 @@ impl OKXHttpClient {
 
     /// Requests the account state for the `account_id` from OKX.
     ///
+    /// Pass the execution client's configured account type; the OKX balance payload carries
+    /// no account-mode field.
+    ///
     /// # Errors
     ///
     /// Returns an error if the HTTP request fails or no account state is returned.
     pub async fn request_account_state(
         &self,
         account_id: AccountId,
+        account_type: AccountType,
     ) -> anyhow::Result<AccountState> {
         let resp = self
             .inner
@@ -2447,14 +2453,14 @@ impl OKXHttpClient {
         let raw = resp
             .first()
             .ok_or_else(|| anyhow::anyhow!("No account state returned from OKX"))?;
-        let account_state = parse_account_state(raw, account_id, ts_init)?;
+        let account_state = parse_account_state(raw, account_id, account_type, ts_init)?;
 
         Ok(account_state)
     }
 
     /// Sets the position mode for the account.
     ///
-    /// Defaults to NetMode if no position mode is provided.
+    /// Defaults to `NetMode` if no position mode is provided.
     ///
     /// # Errors
     ///
@@ -2558,7 +2564,7 @@ impl OKXHttpClient {
     ///
     /// A tuple containing:
     /// - `Vec<InstrumentAny>`: The parsed instruments
-    /// - `Vec<(Ustr, u64)>`: Mappings of inst_id to inst_id_code for WebSocket order operations
+    /// - `Vec<(Ustr, u64)>`: Mappings of `inst_id` to `inst_id_code` for WebSocket order operations
     pub async fn request_instruments(
         &self,
         instrument_type: OKXInstrumentType,
@@ -3398,8 +3404,8 @@ impl OKXHttpClient {
             (Some(_), Some(_)) => Mode::Range,
         };
 
-        let start_ms = start.map(|s| s.as_millisecond());
-        let end_ms = end.map(|e| e.as_millisecond());
+        let start_ms = start.map(jiff::Timestamp::as_millisecond);
+        let end_ms = end.map(jiff::Timestamp::as_millisecond);
 
         let ts_init = self.generate_ts_init();
         let inst = self.instrument_from_cache_by_id(instrument_id)?;
@@ -6880,20 +6886,18 @@ impl OKXHttpClient {
                 orders.retain(|order| order.state == state);
             }
 
-            complete &= self
-                .collect_algo_reports(
-                    account_id,
-                    &orders,
-                    false,
-                    &mut instruments_cache,
-                    ts_init,
-                    start_ns,
-                    end_ns,
-                    &mut seen,
-                    &mut reports,
-                    &mut ambiguous_triggered_child_ids,
-                )
-                .await?;
+            complete &= self.collect_algo_reports(
+                account_id,
+                &orders,
+                false,
+                &mut instruments_cache,
+                ts_init,
+                start_ns,
+                end_ns,
+                &mut seen,
+                &mut reports,
+                &mut ambiguous_triggered_child_ids,
+            )?;
 
             if let Some(limit) = limit {
                 reports.truncate(limit as usize);
@@ -6976,21 +6980,18 @@ impl OKXHttpClient {
                     pending.retain(|order| order.state == state);
                 }
 
-                let pending_reports_complete = match self
-                    .collect_algo_reports(
-                        account_id,
-                        &pending,
-                        require_complete_active_coverage,
-                        &mut instruments_cache,
-                        ts_init,
-                        start_ns,
-                        end_ns,
-                        &mut seen,
-                        &mut reports,
-                        &mut ambiguous_triggered_child_ids,
-                    )
-                    .await
-                {
+                let pending_reports_complete = match self.collect_algo_reports(
+                    account_id,
+                    &pending,
+                    require_complete_active_coverage,
+                    &mut instruments_cache,
+                    ts_init,
+                    start_ns,
+                    end_ns,
+                    &mut seen,
+                    &mut reports,
+                    &mut ambiguous_triggered_child_ids,
+                ) {
                     Ok(complete) => complete,
                     Err(e) if require_complete_active_coverage => {
                         return Err(OKXPendingAlgoOrderReportsError::new(e).into());
@@ -7042,20 +7043,18 @@ impl OKXHttpClient {
                     history.retain(|order| order.state == state);
                 }
 
-                complete &= self
-                    .collect_algo_reports(
-                        account_id,
-                        &history,
-                        false,
-                        &mut instruments_cache,
-                        ts_init,
-                        start_ns,
-                        end_ns,
-                        &mut seen,
-                        &mut reports,
-                        &mut ambiguous_triggered_child_ids,
-                    )
-                    .await?;
+                complete &= self.collect_algo_reports(
+                    account_id,
+                    &history,
+                    false,
+                    &mut instruments_cache,
+                    ts_init,
+                    start_ns,
+                    end_ns,
+                    &mut seen,
+                    &mut reports,
+                    &mut ambiguous_triggered_child_ids,
+                )?;
 
                 if let Some(lim) = limit
                     && reports.len() >= lim as usize
@@ -7109,7 +7108,7 @@ impl OKXHttpClient {
     }
 
     #[expect(clippy::too_many_arguments)]
-    async fn collect_algo_reports(
+    fn collect_algo_reports(
         &self,
         account_id: AccountId,
         orders: &[OKXOrderAlgo],

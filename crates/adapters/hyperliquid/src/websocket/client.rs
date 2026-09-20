@@ -48,6 +48,7 @@ use nautilus_model::{
 };
 use nautilus_network::{
     SocketStateSink,
+    http::create_standard_nautilus_headers,
     mode::ConnectionMode,
     websocket::{
         AuthTracker, SubscriptionState, TransportBackend, WebSocketClient, WebSocketConfig,
@@ -294,9 +295,11 @@ impl HyperliquidWebSocketClient {
         self.book_streams.clear();
 
         let (message_handler, raw_rx) = channel_message_handler();
+        let headers = create_standard_nautilus_headers();
+
         let cfg = WebSocketConfig {
             url: self.url.clone(),
-            headers: vec![],
+            headers,
             heartbeat_interval_secs: None,
             heartbeat_payload: None,
             connect_timeout_ms: Some(15_000),
@@ -832,6 +835,12 @@ impl HyperliquidWebSocketClient {
     /// order. Deferred trigger children of a `normalTpsl` bracket are absent
     /// from the result; they stay `SUBMITTED` until the user-events stream
     /// delivers an `OrderAccepted` with the real oid.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for any quote-denominated quantity: this raw path has
+    /// no cached market data for a quote-to-base conversion, so such orders
+    /// must be submitted through the execution client instead.
     pub async fn submit_orders(
         &self,
         signer: &HyperliquidHttpClient,
@@ -841,6 +850,14 @@ impl HyperliquidWebSocketClient {
         let mut client_order_ids = Vec::with_capacity(orders.len());
 
         for order in orders {
+            if order.is_quote_quantity() {
+                return Err(HyperliquidError::bad_request(format!(
+                    "Quote-denominated quantity order {} must submit through the execution \
+                     client for quote-to-base conversion",
+                    order.client_order_id()
+                )));
+            }
+
             let instrument_id = order.instrument_id();
             let symbol = instrument_id.symbol.inner();
             let asset = signer.get_asset_index_for_symbol(symbol).ok_or_else(|| {
@@ -1393,7 +1410,7 @@ impl HyperliquidWebSocketClient {
     /// Subscribe to L2 order book with optional `nSigFigs` / `mantissa`
     /// precision controls passed through to the venue's `l2Book` stream.
     ///
-    /// One venue `l2Book` stream per coin is shared with depth10 snapshots;
+    /// One venue `l2Book` stream per coin is shared with depth snapshots;
     /// the first logical use opens the stream and its options win. Requesting
     /// different options while the stream is active logs a warning.
     pub async fn subscribe_book_with_options(
@@ -1421,9 +1438,9 @@ impl HyperliquidWebSocketClient {
     ///
     /// Reuses the same `l2Book` WebSocket subscription as
     /// [`Self::subscribe_book`] and flags the handler to additionally emit
-    /// `NautilusWsMessage::Depth10` for this coin.
-    pub async fn subscribe_book_depth10(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
-        self.subscribe_book_depth10_with_options(instrument_id, None, None)
+    /// `NautilusWsMessage::Depth` for this coin.
+    pub async fn subscribe_book_depth(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
+        self.subscribe_book_depth_with_options(instrument_id, None, None)
             .await
     }
 
@@ -1433,7 +1450,7 @@ impl HyperliquidWebSocketClient {
     /// Shares the coin's `l2Book` stream with deltas subscribers; the first
     /// logical use opens the stream and its options win. Requesting different
     /// options while the stream is active logs a warning.
-    pub async fn subscribe_book_depth10_with_options(
+    pub async fn subscribe_book_depth_with_options(
         &self,
         instrument_id: InstrumentId,
         n_sig_figs: Option<u32>,
@@ -1451,23 +1468,20 @@ impl HyperliquidWebSocketClient {
             .map_err(|e| anyhow::anyhow!("Failed to send UpdateInstrument command: {e}"))?;
 
         cmd_tx
-            .send(HandlerCommand::SetDepth10Sub {
+            .send(HandlerCommand::SetDepthSub {
                 coin,
                 subscribed: true,
             })
-            .map_err(|e| anyhow::anyhow!("Failed to send SetDepth10Sub command: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("Failed to send SetDepthSub command: {e}"))?;
 
-        self.send_book_stream_subscribe(&cmd_tx, coin, BookStreamUse::Depth10, n_sig_figs, mantissa)
+        self.send_book_stream_subscribe(&cmd_tx, coin, BookStreamUse::Depth, n_sig_figs, mantissa)
     }
 
     /// Unsubscribe from order book depth-10 snapshots.
     ///
-    /// Clears the depth10 emission flag and tears down the underlying
+    /// Clears the depth emission flag and tears down the underlying
     /// `l2Book` stream unless active deltas subscribers still need it.
-    pub async fn unsubscribe_book_depth10(
-        &self,
-        instrument_id: InstrumentId,
-    ) -> anyhow::Result<()> {
+    pub async fn unsubscribe_book_depth(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
         let instrument = self
             .get_instrument(&instrument_id)
             .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
@@ -1476,13 +1490,13 @@ impl HyperliquidWebSocketClient {
         let cmd_tx = self.cmd_tx.read().await;
 
         cmd_tx
-            .send(HandlerCommand::SetDepth10Sub {
+            .send(HandlerCommand::SetDepthSub {
                 coin,
                 subscribed: false,
             })
-            .map_err(|e| anyhow::anyhow!("Failed to send SetDepth10Sub command: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("Failed to send SetDepthSub command: {e}"))?;
 
-        self.send_book_stream_unsubscribe(&cmd_tx, coin, BookStreamUse::Depth10)
+        self.send_book_stream_unsubscribe(&cmd_tx, coin, BookStreamUse::Depth)
     }
 
     /// Subscribe to best bid/offer (BBO) quotes for an instrument.
@@ -1760,7 +1774,7 @@ impl HyperliquidWebSocketClient {
 
     /// Unsubscribe from L2 order book for an instrument.
     ///
-    /// Tears down the venue `l2Book` stream unless active depth10 subscribers
+    /// Tears down the venue `l2Book` stream unless active depth subscribers
     /// still need it.
     pub async fn unsubscribe_book(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
         let instrument = self
@@ -1778,7 +1792,7 @@ impl HyperliquidWebSocketClient {
     /// Sends an unsubscribe immediately followed by a subscribe, both echoing
     /// the stream's original precision options (the venue matches unsubscribes
     /// by full payload). Registry state is left untouched so the logical
-    /// deltas/depth10 uses and first-wins options survive the cycle. Used by
+    /// deltas/depth uses and first-wins options survive the cycle. Used by
     /// stale-stream recovery, where a plain subscribe would be gated off by
     /// the existing registry entry.
     pub async fn resubscribe_book(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
@@ -1862,8 +1876,8 @@ impl HyperliquidWebSocketClient {
             }
             BookStreamRelease::Retained => {
                 let remaining_use = match stream_use {
-                    BookStreamUse::Deltas => "depth10",
-                    BookStreamUse::Depth10 => "deltas",
+                    BookStreamUse::Deltas => "depth",
+                    BookStreamUse::Depth => "deltas",
                 };
                 log::debug!("Keeping shared l2Book stream for {coin}: {remaining_use} use remains");
             }
@@ -2017,12 +2031,20 @@ impl HyperliquidWebSocketClient {
     }
 
     /// Cache the ordered instrument IDs required to normalize `allDexsAssetCtxs`.
+    ///
+    /// Entries merge by dex: each dex in `mapping` replaces its cached entry and
+    /// dexes absent from `mapping` keep theirs. A mapping built from the
+    /// standard `meta` fallback covers only the standard dex, and replacing the
+    /// whole cache with it would drop every HIP-3 context until a later complete
+    /// build. A stale entry for a dex the venue no longer lists is harmless
+    /// because no contexts arrive for it.
     pub fn cache_all_dex_asset_ctxs_instrument_ids(
         &self,
         mapping: AHashMap<Ustr, Vec<Option<InstrumentId>>>,
     ) {
-        self.all_dex_asset_ctxs_instrument_ids
-            .store(mapping.clone());
+        self.all_dex_asset_ctxs_instrument_ids.rcu(|cached| {
+            cached.extend(mapping.iter().map(|(dex, ids)| (*dex, ids.clone())));
+        });
 
         if let Ok(cmd_tx) = self.cmd_tx.try_read()
             && let Err(e) = cmd_tx.send(HandlerCommand::CacheAllDexAssetCtxsInstrumentIds(mapping))
@@ -2518,6 +2540,35 @@ mod tests {
 
         assert!(debug.contains(REDACTED));
         assert!(!debug.contains(proxy_url));
+    }
+
+    #[rstest]
+    fn test_cache_all_dex_asset_ctxs_instrument_ids_keeps_dexes_absent_from_update() {
+        let client = HyperliquidWebSocketClient::new(
+            Some("wss://test".to_string()),
+            HyperliquidEnvironment::Testnet,
+            None,
+            TransportBackend::default(),
+            None,
+        );
+        let btc = Some(InstrumentId::from("BTC-USD-PERP.HYPERLIQUID"));
+        let eth = Some(InstrumentId::from("ETH-USD-PERP.HYPERLIQUID"));
+        let tsla = Some(InstrumentId::from("xyz:TSLA-USD-PERP.HYPERLIQUID"));
+
+        client.cache_all_dex_asset_ctxs_instrument_ids(AHashMap::from_iter([
+            (Ustr::from(""), vec![btc]),
+            (Ustr::from("xyz"), vec![tsla]),
+        ]));
+        // a `meta` fallback build covers only the default dex
+        client.cache_all_dex_asset_ctxs_instrument_ids(AHashMap::from_iter([(
+            Ustr::from(""),
+            vec![btc, eth],
+        )]));
+
+        let cached = client.all_dex_asset_ctxs_instrument_ids.load();
+        assert_eq!(cached.len(), 2);
+        assert_eq!(cached.get(&Ustr::from("")), Some(&vec![btc, eth]));
+        assert_eq!(cached.get(&Ustr::from("xyz")), Some(&vec![tsla]));
     }
 
     #[tokio::test]

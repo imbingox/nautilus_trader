@@ -1334,7 +1334,7 @@ impl AccountsManager {
         // regenerated state events preserve the full margin picture.
         let mut margins: Vec<_> = margin_account.margins.values().copied().collect();
         margins.extend(margin_account.account_margins.values().copied());
-        AccountState::new(
+        let mut state = AccountState::new(
             margin_account.id,
             AccountType::Margin,
             margin_account.balances.clone().into_values().collect(),
@@ -1344,7 +1344,13 @@ impl AccountsManager {
             ts_event,
             self.clock.borrow().timestamp_ns(),
             margin_account.base_currency(),
-        )
+        );
+        state.total_only_balances = margin_account
+            .total_only_balances
+            .values()
+            .copied()
+            .collect();
+        state
     }
 
     fn generate_unleveraged_account_state(
@@ -1490,7 +1496,7 @@ fn base_account_mut(account: &mut AccountAny) -> &mut BaseAccount {
 mod tests {
     use std::{cell::RefCell, rc::Rc};
 
-    use nautilus_common::{cache::Cache, clock::TestClock};
+    use nautilus_common::{cache::Cache, clock::VirtualClock};
     use nautilus_model::{
         accounts::{BettingAccount, CashAccount, MarginAccount},
         data::QuoteTick,
@@ -1544,7 +1550,7 @@ mod tests {
 
         let account = CashAccount::new(account_state, true, false);
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         cache
             .borrow_mut()
@@ -1643,7 +1649,7 @@ mod tests {
             Some(usd),
         );
         let account = CashAccount::new(account_state, true, false);
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
         let instrument = audusd_sim();
@@ -1767,7 +1773,7 @@ mod tests {
                 VenueOrderId::new("1"),
             )))
             .unwrap();
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
         let mut account = AccountAny::Cash(cash);
@@ -1819,7 +1825,7 @@ mod tests {
                 VenueOrderId::new("1"),
             )))
             .unwrap();
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
         let mut account = AccountAny::Cash(cash);
@@ -1893,7 +1899,7 @@ mod tests {
                 AccountId::new("BETTING-001"),
             )))
             .unwrap();
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
         let mut account = AccountAny::Betting(betting_account);
@@ -1935,7 +1941,7 @@ mod tests {
 
         let account = BettingAccount::new(account_state, true);
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         cache
             .borrow_mut()
@@ -2065,7 +2071,7 @@ mod tests {
                 AccountId::new("BETTING-001"),
             )))
             .unwrap();
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
         let mut account = AccountAny::Betting(betting_account);
@@ -2107,7 +2113,7 @@ mod tests {
 
         let account = BettingAccount::new(account_state, true);
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         cache
             .borrow_mut()
@@ -2214,7 +2220,7 @@ mod tests {
 
         let account = CashAccount::new(account_state, true, false);
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         cache
             .borrow_mut()
@@ -2336,7 +2342,7 @@ mod tests {
 
         let account = WalletAccount::new(account_state, true);
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         cache
             .borrow_mut()
@@ -2400,7 +2406,7 @@ mod tests {
             .update_balance_locked(instrument.id(), Money::from("2 ETH"))
             .unwrap();
         let mut account = AccountAny::Wallet(wallet);
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
         let mut order = OrderTestBuilder::new(OrderType::Market)
@@ -2448,7 +2454,7 @@ mod tests {
         let locks_before = wallet.balances_locked.clone();
         let events_before = wallet.events.clone();
         let mut account = AccountAny::Wallet(wallet);
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
         let mut order = OrderTestBuilder::new(OrderType::Market)
@@ -2481,7 +2487,7 @@ mod tests {
         let account = WalletAccount::new(wallet_account_state(), true);
         let account_id = account.id;
         let eth = Currency::ETH();
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         cache
             .borrow_mut()
@@ -2569,7 +2575,7 @@ mod tests {
         buy_quote
             .apply(OrderEventAny::Submitted(order_submitted_for(&buy_quote)))
             .unwrap();
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
 
@@ -2624,7 +2630,7 @@ mod tests {
         buy_quote
             .apply(OrderEventAny::Submitted(order_submitted_for(&buy_quote)))
             .unwrap();
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
         let scale = money_raw(10_i128.pow(u32::from(FIXED_PRECISION)));
@@ -2701,7 +2707,7 @@ mod tests {
         order
             .apply(OrderEventAny::Submitted(order_submitted_for(&order)))
             .unwrap();
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
 
@@ -2755,7 +2761,7 @@ mod tests {
         second
             .apply(OrderEventAny::Submitted(order_submitted_for(&second)))
             .unwrap();
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
 
@@ -2798,7 +2804,7 @@ mod tests {
         let prior_margin = Money::new(10.0, eur);
         account.update_initial_margin(instrument.id(), prior_margin);
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
 
@@ -2853,7 +2859,7 @@ mod tests {
         );
         let account = CashAccount::new(account_state, true, false);
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         add_usdeur_quote(&cache, "0.90000", "1.10000");
         let manager = AccountsManager::new(clock, cache);
@@ -2908,7 +2914,7 @@ mod tests {
             Some(eur),
         );
         let account = CashAccount::new(account_state, true, false);
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         add_usdeur_quote(&cache, "0.90000", "1.10000");
         let etheur = default_fx_ccy(Symbol::from("ETH/EUR"), Some(Venue::from("SIM")));
@@ -3019,7 +3025,7 @@ mod tests {
         let second = open_order(OrderSide::Buy, half_max, "2");
         let out_of_range = open_order(OrderSide::Sell, Quantity::new(MONEY_MAX + 1.0, 0), "3");
         let manager = AccountsManager::new(
-            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(VirtualClock::new())),
             Rc::new(RefCell::new(Cache::new(None, None))),
         );
 
@@ -3087,7 +3093,7 @@ mod tests {
         let second = open_order(half_max, "2");
         let out_of_range = open_order(Quantity::new(MONEY_MAX + 1.0, 0), "3");
         let manager = AccountsManager::new(
-            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(VirtualClock::new())),
             Rc::new(RefCell::new(Cache::new(None, None))),
         );
 
@@ -3140,7 +3146,7 @@ mod tests {
             base_currency,
         );
         let account = MarginAccount::new(account_state, true);
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         add_usdeur_quote(&cache, "0.90000", "1.10000");
         let manager = AccountsManager::new(clock, cache);
@@ -3214,7 +3220,7 @@ mod tests {
         );
         let mut account = MarginAccount::new(account_state, true);
         let manager = AccountsManager::new(
-            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(VirtualClock::new())),
             Rc::new(RefCell::new(Cache::new(None, None))),
         );
         let instrument_any = InstrumentAny::CryptoFuture(instrument.clone());
@@ -3277,7 +3283,7 @@ mod tests {
         );
         let account = MarginAccount::new(account_state, true);
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         add_usdeur_quote(&cache, "0.90000", "1.10000");
         let manager = AccountsManager::new(clock, cache);
@@ -3328,7 +3334,7 @@ mod tests {
             Some(instrument.id()),
         ));
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
 
@@ -3353,7 +3359,7 @@ mod tests {
             Some(instrument.id()),
         ));
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
 
@@ -3426,7 +3432,7 @@ mod tests {
         let account = CashAccount::new(account_state, true, false);
         let initial_balance = account.balance_total(Some(usd)).unwrap();
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         cache
             .borrow_mut()
@@ -3524,7 +3530,7 @@ mod tests {
 
         let account = CashAccount::new(account_state, true, false);
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         cache
             .borrow_mut()
@@ -3627,7 +3633,7 @@ mod tests {
             None,
         ));
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
 
@@ -3662,6 +3668,37 @@ mod tests {
     }
 
     #[rstest]
+    fn test_generate_account_state_preserves_totals_only_balances() {
+        let usd = Currency::USD();
+        let total = Money::from("-19.23 USD");
+        let event = AccountState::new(
+            AccountId::from("BINANCE-PAPI-001"),
+            AccountType::Margin,
+            vec![],
+            vec![],
+            true,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            None,
+        )
+        .with_total_only_balances(vec![total])
+        .unwrap();
+        let account = AccountAny::Margin(MarginAccount::new(event, false));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        let manager = AccountsManager::new(clock, cache);
+        let state = manager.generate_account_state(&account, UnixNanos::from(17));
+
+        assert!(state.balances.is_empty());
+        assert_eq!(state.total_only_balances, vec![total]);
+        assert_eq!(state.ts_event, UnixNanos::from(17));
+        let restored = AccountAny::try_from_state(state).unwrap();
+        assert_eq!(restored.balance_total(Some(usd)), Some(total));
+        assert_eq!(restored.balance_free(Some(usd)), None);
+    }
+
+    #[rstest]
     fn test_update_balances_returns_recalculated_balance_for_cash_account() {
         let usd = Currency::USD();
         let account_state = AccountState::new(
@@ -3682,7 +3719,7 @@ mod tests {
 
         let account = CashAccount::new(account_state, true, false);
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         cache
             .borrow_mut()
@@ -3772,7 +3809,7 @@ mod tests {
             None,
         );
         let account = CashAccount::new(account_state, true, false);
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache.clone());
         let mut instrument = currency_pair_btcusdt();
@@ -3851,7 +3888,7 @@ mod tests {
         let original_balances = account.balances.clone();
         let original_commissions = account.commissions.clone();
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache.clone());
         let instrument = audusd_sim();
@@ -3915,7 +3952,7 @@ mod tests {
             Some(usd),
         );
         let account = CashAccount::new(account_state, true, false);
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache.clone());
         let instrument = audusd_sim();
@@ -4152,7 +4189,7 @@ mod tests {
     fn test_update_balance_multi_currency_market_debit_keeps_locked_balance() {
         let usd = Currency::USD();
         let account = multi_currency_cash_account_with_usd_locked(1_000.0, 200.0);
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache.clone());
         let instrument = audusd_sim();
@@ -4186,7 +4223,7 @@ mod tests {
     fn test_update_balance_multi_currency_limit_debit_reduces_locked_balance() {
         let usd = Currency::USD();
         let account = multi_currency_cash_account_with_usd_locked(1_000.0, 200.0);
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache.clone());
         let instrument = audusd_sim();
@@ -4220,7 +4257,7 @@ mod tests {
     fn test_update_balance_multi_currency_limit_debit_spills_from_locked_to_free() {
         let usd = Currency::USD();
         let account = multi_currency_cash_account_with_usd_locked(1_000.0, 50.0);
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache.clone());
         let instrument = audusd_sim();
@@ -4254,7 +4291,7 @@ mod tests {
     fn test_update_balance_multi_currency_limit_debit_floors_locked_on_negative_total() {
         let usd = Currency::USD();
         let account = multi_currency_cash_account_with_usd_locked_and_borrowing(100.0, 50.0, true);
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache.clone());
         let instrument = audusd_sim();
@@ -4288,7 +4325,7 @@ mod tests {
     fn test_update_balance_multi_currency_betting_limit_debit_keeps_locked_balance() {
         let gbp = Currency::GBP();
         let account = multi_currency_betting_account_with_gbp_locked(1_000.0, 200.0);
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache.clone());
         let instrument = betting();
@@ -4335,7 +4372,7 @@ mod tests {
         let aud = Currency::AUD();
         let usd = Currency::USD();
         let account = multi_currency_cash_account(true);
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         cache
             .borrow_mut()
@@ -4379,7 +4416,7 @@ mod tests {
         let aud = Currency::AUD();
         let usd = Currency::USD();
         let account = multi_currency_cash_account(false);
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         cache
             .borrow_mut()
@@ -4435,7 +4472,7 @@ mod tests {
             None,
         );
         let account = CashAccount::new(account_state, true, true);
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         cache
             .borrow_mut()
@@ -4510,7 +4547,7 @@ mod tests {
         // other, breaking `total == locked + free` and panicking `AccountBalance::new`.
         let usdt = Currency::USDT();
         let (mut account, total, locked) = large_locked_usdt_margin_account();
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
 
@@ -4538,7 +4575,7 @@ mod tests {
         // Regression for issue #4165: the commission branch had the same f64 round-trip drift.
         let usdt = Currency::USDT();
         let (mut account, total, locked) = large_locked_usdt_margin_account();
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
 
@@ -4582,7 +4619,7 @@ mod tests {
             None,
         );
         let mut account = AccountAny::Cash(CashAccount::new(account_state, true, false));
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
 
@@ -4684,7 +4721,7 @@ mod tests {
         account.set_leverage(instrument.id(), Decimal::ONE);
         let instrument_any = InstrumentAny::CurrencyPair(instrument.clone());
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
 
@@ -4735,7 +4772,7 @@ mod tests {
         account.set_leverage(instrument.id(), Decimal::ONE);
         let instrument_any = InstrumentAny::CurrencyPair(instrument.clone());
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
 
@@ -4765,7 +4802,7 @@ mod tests {
         account.set_leverage(instrument.id(), Decimal::ONE);
         let instrument_any = InstrumentAny::CurrencyPair(instrument.clone());
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
 
@@ -4797,7 +4834,7 @@ mod tests {
         account.set_leverage(instrument.id(), Decimal::ONE);
         let instrument_any = InstrumentAny::CurrencyPair(instrument.clone());
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
 
@@ -4858,7 +4895,7 @@ mod tests {
         account.set_leverage(instrument.id(), Decimal::ONE);
         let instrument_any = InstrumentAny::CurrencyPair(instrument.clone());
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
 
@@ -4917,7 +4954,7 @@ mod tests {
             Some(instrument.id()),
         ));
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
 
@@ -4950,7 +4987,7 @@ mod tests {
         account.set_leverage(instrument.id(), Decimal::ONE);
         let instrument_any = InstrumentAny::CurrencyPair(instrument.clone());
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
 
@@ -5042,7 +5079,7 @@ mod tests {
             let mut account = build_margin_account_usd(1_000_000.0);
             account.set_leverage(instrument.id(), Decimal::ONE);
 
-            let clock = Rc::new(RefCell::new(TestClock::new()));
+            let clock = Rc::new(RefCell::new(VirtualClock::new()));
             let cache = Rc::new(RefCell::new(Cache::new(None, None)));
             let manager = AccountsManager::new(clock, cache);
 
@@ -5092,7 +5129,7 @@ mod tests {
         account.set_leverage(instrument.id(), Decimal::ONE);
         let instrument_any = InstrumentAny::CurrencyPair(instrument);
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
 
@@ -5128,7 +5165,7 @@ mod tests {
         let instrument = audusd_sim();
         let instrument_any = InstrumentAny::CurrencyPair(instrument.clone());
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         add_usdeur_quote(&cache, "0.90000", "1.10000");
         let manager = AccountsManager::new(clock, cache);
@@ -5158,7 +5195,7 @@ mod tests {
         account.set_leverage(instrument.id(), Decimal::ONE);
         let instrument_any = InstrumentAny::CurrencyPair(instrument.clone());
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let manager = AccountsManager::new(clock, cache);
 

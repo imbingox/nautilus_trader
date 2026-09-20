@@ -109,6 +109,116 @@ caches do not hold. A material change is any serialized field other than `ts_eve
   still back open subscriptions. Suspension, expiry, and delisting arrive as
   `InstrumentStatus` events through the instruments channel.
 
+## Order book recovery
+
+The data client recovers each book independently. During recovery, it suppresses incremental
+updates and replaces the subscription to request a fresh snapshot. Output resumes only after the
+client accepts a snapshot, which requires the replacement unsubscribe and subscribe requests to
+have been sent. Accepted snapshots replace all existing price levels; an empty snapshot clears the book.
+
+### Recovery triggers
+
+Recovery starts when:
+
+- A sequence gap occurs.
+- An initial subscription send fails.
+- An initial or post-reconnect snapshot times out.
+- The venue rejects a subscription with a retryable error.
+
+On a sequence gap, the client drops the mismatched batch and suppresses further incremental updates.
+`book_snapshot_timeout_secs` sets the snapshot deadline. For initial subscriptions, the deadline
+starts after the subscription is sent, excluding time spent waiting to send.
+
+Reconnecting resets book synchronization on the affected socket. Spread books receive full snapshots
+on the business socket, so their recovery starts from an initial send failure, a missing initial
+or post-reconnect snapshot, or a subscription rejection.
+
+Stale-feed checks only log warnings. They do not start recovery because quiet markets can
+legitimately have no book changes.
+
+### Retry loop and limits
+
+The adapter uses the [shared book recovery machinery](../developer_guide/adapters.md#order-book-recovery-ownership).
+Each instrument has one recovery loop. It retries transient transport failures, retryable venue
+rejections, and missing snapshots.
+
+```mermaid
+stateDiagram-v2
+    state "Recovering: replace subscription and await snapshot" as Recovering
+    state "Book output resumes" as Streaming
+    state "Failed: book output suppressed" as Failed
+
+    [*] --> Recovering: Recovery triggered
+    Recovering --> Recovering: Retryable failure or snapshot timeout
+    Recovering --> Streaming: Fresh snapshot accepted
+    Recovering --> Failed: Permanent rejection or recovery limit reached
+```
+
+Sending a subscription request keeps the book in recovery until a fresh snapshot is accepted.
+
+- **Attempts:** At most eight per recovery episode.
+- **Total budget:** 180 seconds, including sends, snapshot waits, and retry delays.
+- **Delay:** The first retry is immediate. Later retries use exponential backoff starting at one
+  second, with up to one second of jitter and a ten-second cap.
+
+An active recovery continues across reconnects with its existing retry budget. This prevents
+cancellation between the replacement unsubscribe and subscribe requests. Replacing a subscription
+preserves its reconnect intent. Unsubscribe and shutdown cancel recovery.
+
+### Failed recovery
+
+A permanent venue rejection, exhausted retries, or an exhausted time budget logs an error and stops
+book output for that subscription. Subscription intent remains registered for reconnect.
+
+**Late snapshots do not clear the failed state.** Reconnect, or unsubscribe and subscribe again,
+to restart synchronization.
+
+### Snapshot correlation limitation
+
+Incremental book channels accept a snapshot only while establishing or recovering synchronization.
+Once synchronized, the client discards unsolicited snapshots without replacing the book or resetting
+its sequence. Channels that publish recurring full snapshots continue to accept them.
+
+Book subscription sends wait for a completed transport write on the intended connection.
+Both sends in a replacement use the same connection; a connection change fails the attempt.
+
+Snapshot acceptance does not correlate subscription acknowledgements with recovery attempts.
+A delayed snapshot from an earlier subscription can remain queued while a replacement is sent
+and complete the current recovery when the gate opens. Write confirmation does not eliminate this
+ambiguity. Recovery also cannot reliably distinguish an unsubscribe error from a subscribe error
+when the venue response identifies only the book channel and instrument.
+
+### Disabling snapshot deadlines
+
+Setting `book_snapshot_timeout_secs` to `0` disables snapshot deadlines, including initial and
+post-reconnect checks. Sequence gaps and retryable subscription rejections still start recovery.
+
+During recovery, a missing snapshot then leaves the current attempt waiting until a snapshot is
+accepted, a rejection arrives, recovery is cancelled, or the 180-second total budget ends.
+A missing snapshot alone does not trigger another attempt.
+
+### Mainnet recovery validation
+
+The `okx-book-sync-stress` example connects to OKX mainnet public market data and submits no orders.
+It checks emitted spot, RPI swap, and spread books against an independent reconstruction of the
+venue feed's best 20 levels.
+
+The example first checks recovery without reconnects, including a dropped replacement snapshot
+when deadlines are enabled. It then injects sequence gaps, drops and delays snapshots, forces
+reconnects, and exercises unsubscribe and shutdown during recovery.
+
+From the repository root, run:
+
+```bash
+CARGO_BUILD_JOBS=16 bash scripts/strip-adapter-env.bash \
+  cargo run -p nautilus-okx --features examples --example okx-book-sync-stress -- 10 18
+```
+
+The arguments set the snapshot timeout in seconds and the number of stress rounds. Use `0 18` to
+exercise disabled snapshot deadlines. The example requires access to the public and business
+WebSocket endpoints and the public instrument and spread APIs. Automated book lifecycle tests use
+local mock servers.
+
 ## Symbology
 
 OKX uses specific symbol conventions for different instrument types. Add the `.OKX`
@@ -251,16 +361,10 @@ liquidity.
 
 WebSocket snapshots and updates retain `seqId` and `prevSeqId`. Emitted deltas carry `seqId` as
 their sequence. The data client checks each update's `prevSeqId` against the last accepted `seqId`;
-the values do not need to increase by one. On a mismatch, the client:
-
-- Drops the mismatched frame.
-- Suppresses later updates for that instrument.
-- Replaces the subscription once to request a fresh snapshot.
-- Resumes emission after a snapshot with `prevSeqId: -1`.
-
-If the snapshot does not arrive before the configured snapshot timeout, the book monitor logs a
-warning and the client remains fail-closed. The adapter applies the same linkage rule to standard
-incremental OKX book channels when `prevSeqId` is present. `books-rpi` has no checksum.
+the values do not need to increase by one. A mismatch starts
+[order book recovery](#order-book-recovery). Emission resumes after an accepted snapshot with
+`prevSeqId: -1`. The adapter applies the same linkage rule to standard incremental OKX book channels when `prevSeqId`
+is present. `books-rpi` has no checksum.
 
 For WebSocket subscriptions, `rpi=True` selects `books-rpi` instead of depth or VIP channel
 selection. For REST snapshots, the requested depth becomes `sz`; OKX defaults to one level per side
@@ -566,6 +670,20 @@ order expiration by canceling the order at the specified expiry time.
 | Batch Submit | ✓                     | Submit multiple orders in single request. |
 | Batch Modify | ✓                     | Modify multiple orders in single request. |
 | Batch Cancel | ✓                     | Cancel multiple orders in single request. |
+
+### Cancel-all orders
+
+`Strategy.cancel_all_orders` supports `order_side` in both strategy-only and cross-strategy mode.
+See [Cancel-all routing](../concepts/execution/index.md#cancel-all-routing) for strategy scope.
+
+With `strategy_only=False` and an `order_side`, the adapter selects matching open orders from the cache
+across strategies. It sends regular orders through batch cancellation and conditional and spread orders
+through their individual-order cancellation APIs. This bypasses venue mass cancellation, including when
+the Rust configuration option `use_mm_mass_cancel` is `true`.
+
+Side-filtered cancellation excludes orders absent from the cache and orders still in `SUBMITTED` state.
+Without a side filter, ordinary non-spread cancellation also uses cached open orders by default;
+spread instruments and the Rust mass-cancel option use venue bulk endpoints.
 
 ### Position management
 
@@ -1215,14 +1333,15 @@ The OKX data client provides the following Python configuration options.
 | `update_instruments_interval_mins` | `60`                       | REST instrument cache reconciliation interval in minutes; `0` disables.        |
 | `book_stale_check_interval_secs`   | `5`                        | Stale book check interval.                                                     |
 | `book_stale_threshold_secs`        | `30`                       | Idle time before a stale book warning.                                         |
-| `book_snapshot_timeout_secs`       | `3`                        | Post-reconnect snapshot wait.                                                  |
+| `book_snapshot_timeout_secs`       | `10`                       | Initial, reconnect, and recovery snapshot wait.                                |
 | `vip_level`                        | `None`                     | Enables higher-depth books by VIP tier.                                        |
 | `proxy_url`                        | `None`                     | Optional HTTP and WebSocket proxy URL.                                         |
 | `transport_backend`                | `Sockudo`                  | WebSocket transport backend.                                                   |
 
-Set `book_stale_check_interval_secs`, `book_stale_threshold_secs`, or
-`book_snapshot_timeout_secs` to `0` to disable that health monitor. Quiet markets can idle
-without book updates; increase `book_stale_threshold_secs` for sparse instruments.
+Set `book_stale_check_interval_secs` or `book_stale_threshold_secs` to `0` to disable stale-feed
+warnings. Set `book_snapshot_timeout_secs` to `0` to disable snapshot deadlines, as described in
+[Order book recovery](#order-book-recovery). Quiet markets can idle without book updates; increase
+`book_stale_threshold_secs` for sparse instruments.
 
 Supported data client `instrument_types` values are `SPOT`, `MARGIN`, `SWAP`,
 `FUTURES`, `OPTION`, and `EVENTS`. See [Options trading](#options-trading) before selecting
@@ -1293,6 +1412,79 @@ official endpoint list.
 Use `OKXDataClientConfig` with `OKXDataClientFactory` and `OKXExecutionClientConfig` with
 `OKXExecutionClientFactory`. The Python examples show a complete
 `LiveNode.builder(...)` configuration for data and execution clients.
+
+## Deterministic simulation testing
+
+OKX is the reference implementation for the
+[adapter DST contract](../concepts/dst.md#adapter-dst-contract), which the
+[adapter developer guide](../developer_guide/adapters.md#deterministic-simulation) requires of
+maintained adapters. This section records the audited OKX slice: the files the static gate covers,
+the exclusion rationale for the rest, and the runtime slices the `dst` tests prove.
+
+### Audited files
+
+Audited OKX DST-path production files route state-affecting clock reads and timers through the DST
+seams and sort reconnect and bulk-unsubscribe subscription commands. The static gate covers these
+files in `crates/adapters/okx/src`:
+
+- **book**: `mod.rs`, `recovery.rs`, `sync.rs`
+- **common**: `parse.rs`, `task.rs`
+- **Top level**: `config.rs`, `data.rs`, `execution.rs`
+- **http**: `client.rs`, `models.rs`, `query.rs`
+- **websocket**: `client.rs`, `dispatch.rs`, `handler.rs`, `messages.rs`, `parse.rs`,
+  `subscription.rs`
+
+:::warning
+Static coverage alone does not establish runtime eligibility: these files also serve paths outside
+a proven runtime slice.
+:::
+
+### Excluded files
+
+The remaining non-Python OKX production files stay excluded because they carry no DST-path state,
+clock, RNG, task, or transport surface:
+
+- **Module declarations**: `lib.rs`, `common/mod.rs`, `http/mod.rs`, `websocket/mod.rs`.
+- **Pure venue types**: `common/enums.rs`, `websocket/enums.rs`, `http/error.rs`,
+  `websocket/error.rs`, `common/models.rs`.
+- **Pure tables and deterministic mappings**: `common/urls.rs` (endpoint tables) and
+  `common/consts.rs` (pure predicates, validators, and wire-value and channel resolvers; its
+  `AHashSet` is contains-only retry lookup, never iterated).
+- **Deterministic helpers**: `common/credential.rs`, whose HMAC signs a caller-provided timestamp
+  and whose credential resolution reads only config or declared environment at construction, and
+  `common/failure.rs`, which is pure error classification.
+- **Construction wiring only**: `factories.rs`.
+- **Test-only or placeholder**: `common/testing.rs`, `http/parse.rs`.
+
+`check-dst-conventions` records this rationale next to `ADAPTER_PATHS`; re-audit a file if it
+gains DST-path runtime logic. The seven files under `src/python/` stay excluded by the repo-wide
+Python/FFI policy, not by this audit (see
+[Python and FFI are not in DST scope](../concepts/dst.md#python-and-ffi-are-not-in-dst-scope)).
+
+### Proven and unproven slices
+
+Focused Madsim tests in `crates/adapters/okx/tests/integration/dst.rs` prove this slice:
+
+- **Subscribe bytes**: public WebSocket quotes, trades, and books; business WebSocket bars.
+- **Reconnect order**: multi-instrument quote reconnect in topic order. Reconnect also clears quote
+  and funding caches in `data.rs` so a new generation cannot reuse prior values.
+- **Login frame**: key, passphrase, and signature derived from the simulated wall clock.
+- **Wire fields**: single order-submit, amend, and cancel; algo order-submit and cancel; batch
+  order-submit in input order.
+
+Complete request-to-wire-to-domain fresh-process comparison stays in the downstream DST harness.
+These share the DST facades and convention gate but remain unproven:
+
+- Other public channels: tickers, funding rates, index tickers, option summaries, other book
+  depths, and the other candle granularities.
+- Private data streams.
+- Mass cancel, batch amend and cancel, and spread orders.
+- HTTP report and reconciliation paths.
+
+### Simulation test leg
+
+The standard-precision leg runs the integration `dst` tests under `simulation` without the crate's
+default `high-precision` feature.
 
 ## Contributing
 

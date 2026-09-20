@@ -53,6 +53,7 @@ use nautilus_core::{
 };
 use rust_decimal::{Decimal, RoundingStrategy};
 use rust_decimal_macros::dec;
+use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
 pub use crate::instruments::{
@@ -81,6 +82,58 @@ pub use crate::instruments::{
     },
     tokenized_asset::TokenizedAsset,
 };
+/// Instrument family selector used by streaming persistence filters.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, strum::Display, strum::EnumIter,
+)]
+pub enum NautilusInstrumentType {
+    BettingInstrument,
+    BinaryOption,
+    Cfd,
+    Commodity,
+    CryptoFuture,
+    CryptoFuturesSpread,
+    CryptoOption,
+    CryptoOptionSpread,
+    CryptoPerpetual,
+    CurrencyPair,
+    Equity,
+    FuturesContract,
+    FuturesSpread,
+    IndexInstrument,
+    OptionContract,
+    OptionSpread,
+    PerpetualContract,
+    TokenizedAsset,
+}
+
+impl FromStr for NautilusInstrumentType {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "BettingInstrument" | "Betting" | "betting_instrument" => Ok(Self::BettingInstrument),
+            "BinaryOption" | "binary_option" => Ok(Self::BinaryOption),
+            "Cfd" | "cfd" => Ok(Self::Cfd),
+            "Commodity" | "commodity" => Ok(Self::Commodity),
+            "CryptoFuture" | "crypto_future" => Ok(Self::CryptoFuture),
+            "CryptoFuturesSpread" | "crypto_futures_spread" => Ok(Self::CryptoFuturesSpread),
+            "CryptoOption" | "crypto_option" => Ok(Self::CryptoOption),
+            "CryptoOptionSpread" | "crypto_option_spread" => Ok(Self::CryptoOptionSpread),
+            "CryptoPerpetual" | "crypto_perpetual" => Ok(Self::CryptoPerpetual),
+            "CurrencyPair" | "currency_pair" => Ok(Self::CurrencyPair),
+            "Equity" | "equity" => Ok(Self::Equity),
+            "FuturesContract" | "futures_contract" => Ok(Self::FuturesContract),
+            "FuturesSpread" | "futures_spread" => Ok(Self::FuturesSpread),
+            "IndexInstrument" | "index_instrument" => Ok(Self::IndexInstrument),
+            "OptionContract" | "option_contract" => Ok(Self::OptionContract),
+            "OptionSpread" | "option_spread" => Ok(Self::OptionSpread),
+            "PerpetualContract" | "perpetual_contract" => Ok(Self::PerpetualContract),
+            "TokenizedAsset" | "tokenized_asset" => Ok(Self::TokenizedAsset),
+            _ => anyhow::bail!("Invalid `NautilusInstrumentType`: '{s}'"),
+        }
+    }
+}
 use crate::{
     enums::{AssetClass, InstrumentClass, OptionKind},
     identifiers::{InstrumentId, Symbol, Venue},
@@ -767,6 +820,44 @@ mod tests {
         instruments::stubs::*,
         types::{ERROR_PRICE, Money, PRICE_ERROR, PRICE_UNDEF, QUANTITY_UNDEF},
     };
+
+    #[cfg(feature = "defi")]
+    #[rstest]
+    fn test_try_normalize_price_rejects_wei_scale_against_standard_instrument(
+        audusd_sim: CurrencyPair,
+    ) {
+        let wei_price =
+            Price::from_wei(alloy_primitives::U256::from(1_000_000_000_000_000_000_u64));
+
+        let error = audusd_sim.try_normalize_price(wei_price).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "`price` raw scale does not match instrument price precision, price precision was 18, instrument price precision was {}",
+                audusd_sim.price_precision()
+            )
+        );
+    }
+
+    #[cfg(feature = "defi")]
+    #[rstest]
+    fn test_try_normalize_qty_rejects_wei_scale_against_standard_instrument(
+        audusd_sim: CurrencyPair,
+    ) {
+        let wei_qty =
+            Quantity::from_wei(alloy_primitives::U256::from(1_000_000_000_000_000_000_u64));
+
+        let error = audusd_sim.try_normalize_qty(wei_qty).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "`quantity` raw scale does not match instrument size precision, quantity precision was 18, instrument size precision was {}",
+                audusd_sim.size_precision()
+            )
+        );
+    }
 
     pub(super) fn default_price_increment(precision: u8) -> Price {
         let step = 10f64.powi(-i32::from(precision));

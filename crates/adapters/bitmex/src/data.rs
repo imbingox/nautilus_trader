@@ -29,17 +29,17 @@ use futures_util::StreamExt;
 use nautilus_common::{
     cache::quote::QuoteCache,
     clients::DataClient,
-    live::{runner::get_data_event_sender, runtime::get_runtime},
+    live::{runner::get_data_event_sender, runtime::get_runtime, sender::EventSender},
     messages::{
         DataEvent,
         data::{
             BarsResponse, BookResponse, DataResponse, FundingRatesResponse, InstrumentResponse,
             InstrumentsResponse, RequestBars, RequestBookSnapshot, RequestFundingRates,
             RequestInstrument, RequestInstruments, RequestTrades, SubscribeBars,
-            SubscribeBookDeltas, SubscribeBookDepth10, SubscribeFundingRates, SubscribeIndexPrices,
+            SubscribeBookDeltas, SubscribeBookDepth, SubscribeFundingRates, SubscribeIndexPrices,
             SubscribeInstrument, SubscribeInstrumentStatus, SubscribeInstruments,
             SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades, TradesResponse, UnsubscribeBars,
-            UnsubscribeBookDeltas, UnsubscribeBookDepth10, UnsubscribeFundingRates,
+            UnsubscribeBookDeltas, UnsubscribeBookDepth, UnsubscribeFundingRates,
             UnsubscribeIndexPrices, UnsubscribeInstrumentStatus, UnsubscribeMarkPrices,
             UnsubscribeQuotes, UnsubscribeTrades,
         },
@@ -97,7 +97,7 @@ pub struct BitmexDataClient {
     is_connected: AtomicBool,
     cancellation_token: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: EventSender<DataEvent>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     book_channels: Arc<AtomicMap<InstrumentId, BitmexBookChannel>>,
     instrument_refresh_active: bool,
@@ -175,7 +175,7 @@ impl BitmexDataClient {
             .context("websocket client not initialized; call connect first")
     }
 
-    fn send_data(sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>, data: Data) {
+    fn send_data(sender: &EventSender<DataEvent>, data: Data) {
         if let Err(e) = sender.send(DataEvent::Data(data)) {
             log::error!("Failed to emit data event: {e}");
         }
@@ -246,7 +246,7 @@ impl BitmexDataClient {
     fn handle_ws_message(
         ts_init: UnixNanos,
         message: BitmexWsMessage,
-        sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        sender: &EventSender<DataEvent>,
         instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
         instruments_by_symbol: &mut AHashMap<Ustr, InstrumentAny>,
         quote_cache: &mut QuoteCache,
@@ -397,7 +397,7 @@ impl BitmexDataClient {
         action: BitmexAction,
         data: Vec<crate::websocket::messages::BitmexInstrumentMsg>,
         ts_init: UnixNanos,
-        sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        sender: &EventSender<DataEvent>,
         instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
         instruments_by_symbol: &mut AHashMap<Ustr, InstrumentAny>,
     ) {
@@ -822,20 +822,20 @@ impl DataClient for BitmexDataClient {
         Ok(())
     }
 
-    fn subscribe_book_depth10(&mut self, cmd: SubscribeBookDepth10) -> anyhow::Result<()> {
+    fn subscribe_book_depth(&mut self, cmd: SubscribeBookDepth) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws_client()?.clone();
         let book_channels = Arc::clone(&self.book_channels);
 
         self.spawn_ws(
             async move {
-                ws.subscribe_book_depth10(instrument_id)
+                ws.subscribe_book_depth(instrument_id)
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?;
                 book_channels.insert(instrument_id, BitmexBookChannel::OrderBook10);
                 Ok(())
             },
-            "BitMEX book depth10 subscription",
+            "BitMEX book depth subscription",
         );
         Ok(())
     }
@@ -986,7 +986,7 @@ impl DataClient for BitmexDataClient {
                         .await
                         .map_err(|e| anyhow::anyhow!(e))?,
                     Some(BitmexBookChannel::OrderBook10) => ws
-                        .unsubscribe_book_depth10(instrument_id)
+                        .unsubscribe_book_depth(instrument_id)
                         .await
                         .map_err(|e| anyhow::anyhow!(e))?,
                     None => ws
@@ -1001,7 +1001,7 @@ impl DataClient for BitmexDataClient {
         Ok(())
     }
 
-    fn unsubscribe_book_depth10(&mut self, cmd: &UnsubscribeBookDepth10) -> anyhow::Result<()> {
+    fn unsubscribe_book_depth(&mut self, cmd: &UnsubscribeBookDepth) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws_client()?.clone();
         let book_channels = Arc::clone(&self.book_channels);
@@ -1009,11 +1009,11 @@ impl DataClient for BitmexDataClient {
         self.spawn_ws(
             async move {
                 book_channels.remove(&instrument_id);
-                ws.unsubscribe_book_depth10(instrument_id)
+                ws.unsubscribe_book_depth(instrument_id)
                     .await
                     .map_err(|e| anyhow::anyhow!(e))
             },
-            "BitMEX book depth10 unsubscribe",
+            "BitMEX book depth unsubscribe",
         );
         Ok(())
     }
@@ -1384,7 +1384,7 @@ fn handle_quote_messages(
     instruments_by_symbol: &AHashMap<Ustr, InstrumentAny>,
     quote_cache: &mut QuoteCache,
     ts_init: UnixNanos,
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &EventSender<DataEvent>,
 ) {
     for msg in data {
         let Some(instrument) = instruments_by_symbol.get(&msg.symbol) else {

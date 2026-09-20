@@ -67,10 +67,10 @@ V2 shortens common strategy and cache names. The `QuoteTick`, `TradeTick`, and
 | `request_quote_ticks`                | `request_quotes`               |
 | `request_trade_ticks`                | `request_trades`               |
 | `subscribe_order_book_deltas`        | `subscribe_book_deltas`        |
-| `subscribe_order_book_depth`         | `subscribe_book_depth10`       |
+| `subscribe_order_book_depth`         | `subscribe_book_depth`         |
 | `subscribe_order_book_at_interval`   | `subscribe_book_at_interval`   |
 | `unsubscribe_order_book_deltas`      | `unsubscribe_book_deltas`      |
-| `unsubscribe_order_book_depth`       | `unsubscribe_book_depth10`     |
+| `unsubscribe_order_book_depth`       | `unsubscribe_book_depth`       |
 | `unsubscribe_order_book_at_interval` | `unsubscribe_book_at_interval` |
 | `request_order_book_snapshot`        | `request_book_snapshot`        |
 | `request_order_book_deltas`          | `request_book_deltas`          |
@@ -158,7 +158,7 @@ Historical requests use type-specific batch callbacks in v2:
 | Custom data                          | `on_historical_data`          | One `CustomData` or `Sequence[CustomData]` |
 | Book snapshot                        | `on_book`                     | One `OrderBook`                            |
 | Book deltas                          | `on_historical_book_deltas`   | `Sequence[OrderBookDelta]`                 |
-| Book depth                           | `on_historical_book_depth`    | `Sequence[OrderBookDepth10]`               |
+| Book depth                           | `on_historical_book_depth`    | `Sequence[OrderBookDepth]`                 |
 | Quote ticks                          | `on_historical_quotes`        | `Sequence[QuoteTick]`                      |
 | Trade ticks                          | `on_historical_trades`        | `Sequence[TradeTick]`                      |
 | Funding rates                        | `on_historical_funding_rates` | `Sequence[FundingRateUpdate]`              |
@@ -433,6 +433,13 @@ Keep the venue-specific `account_id` on the execution client config. The Bybit, 
 Interactive Brokers execution factories now use no-argument constructors. Custom Rust execution
 factories must accept `TraderId` in their `ExecutionClientFactory::create` or
 `SimulatedExecutionClientFactory::create` implementation.
+
+`ExecutionClientFactory::create` also requires `clock: Rc<RefCell<dyn Clock>>` after the cache
+argument, matching `DataClientFactory::create`. Pass the owning node's clock when calling an
+execution factory directly. `SimulatedExecutionClientFactory` keeps its existing signature.
+The Python execution client bridge uses the supplied clock. Existing native execution adapters
+continue to use their realtime clocks internally; this signature change does not add test-clock
+support to those adapters.
 
 The v1 fill, fee, latency, margin, and simulation-module config and factory wrappers are also
 removed. This includes `Importable*ModelConfig`, `MarginModelConfig`, and their factories, which
@@ -794,6 +801,14 @@ Account for these differences from v1:
   the operand with `Decimal(str(value))`.
 - `Order.to_dict()` returns `avg_px` and `slippage` as strings, matching how the other decimal
   fields already serialize. Wrap the value in `Decimal(...)` before doing arithmetic on it.
+
+### Rust order history
+
+Rust callers construct `OrderCore` with `OrderCore::new`, apply events with `OrderCore::apply`, and
+inspect history with `OrderCore::events()`. Direct field access to `events` and struct-literal
+construction are no longer available. Use `OrderCore::prepend_events` to retain history when transforming an order;
+it preserves event order without applying state transitions. Use `OrderAny::from_events` to reconstruct
+an order from replacement history. The serialized order format is unchanged.
 
 ### PostgreSQL schema changes
 

@@ -35,7 +35,7 @@ use std::{cell::RefCell, fmt::Debug, rc::Rc, time::Duration};
 use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
-    clock::{Clock, TestClock},
+    clock::{Clock, VirtualClock},
     live::{
         dst,
         runner::{replace_data_event_sender, replace_exec_event_sender},
@@ -103,7 +103,7 @@ impl ExecutionHarness {
         instrument: InstrumentAny,
     ) -> Self {
         let _bus = MessageBus::new(trader_id, UUID4::new(), None, None).register_message_bus();
-        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::default()));
         let instrument_id = instrument.id();
         cache
@@ -112,6 +112,7 @@ impl ExecutionHarness {
             .expect("instrument should be added to the harness cache");
 
         let portfolio = Portfolio::new(clock.clone(), cache.clone(), None);
+
         let risk_engine = Rc::new(RefCell::new(RiskEngine::new(
             RiskEngineConfig::default(),
             portfolio,
@@ -124,6 +125,7 @@ impl ExecutionHarness {
             .manage_own_order_books(true)
             .build()
             .expect("execution engine config should be valid");
+
         let exec_engine = Rc::new(RefCell::new(ExecutionEngine::new(
             clock.clone(),
             cache.clone(),
@@ -218,13 +220,37 @@ impl ExecutionHarness {
         self.risk_engine.borrow().command_count()
     }
 
-    /// Registers an adapter execution client with the real execution engine.
+    /// Registers an adapter execution client and its native venue route with the execution engine.
     ///
     /// # Errors
     ///
     /// Returns an error when the engine already contains the client ID or venue route.
     pub fn register_client(&self, client: Box<dyn ExecutionClient>) -> anyhow::Result<()> {
-        self.exec_engine.borrow_mut().register_client(client)
+        let client_id = client.client_id();
+        let account_id = client.account_id();
+        let venue = client.venue();
+        let native_capital_check = client.native_capital_check();
+
+        {
+            let mut engine = self.exec_engine.borrow_mut();
+            engine.register_client(client)?;
+            if let Err(e) = engine.register_venue_routing(client_id, venue) {
+                engine.deregister_client(client_id)?;
+                return Err(e);
+            }
+        }
+
+        if let Some(check) = native_capital_check
+            && let Err(e) = self
+                .risk_engine
+                .borrow_mut()
+                .register_native_capital_check(account_id, client_id, check)
+        {
+            self.exec_engine.borrow_mut().deregister_client(client_id)?;
+            return Err(e);
+        }
+
+        Ok(())
     }
 
     /// Caches an order and sends its submission command through the risk engine.
@@ -260,6 +286,7 @@ impl ExecutionHarness {
             .borrow()
             .order(&order.client_order_id())
             .and_then(|cached| cached.venue_order_id());
+
         let cmd = ModifyOrder::new(
             self.trader_id,
             Some(self.client_id),
@@ -289,6 +316,7 @@ impl ExecutionHarness {
             .borrow()
             .order(&order.client_order_id())
             .and_then(|cached| cached.venue_order_id());
+
         let cmd = CancelOrder::new(
             self.trader_id,
             Some(self.client_id),
@@ -351,6 +379,7 @@ impl ExecutionHarness {
         config.close_positions_on_stop = false;
 
         let mut tester = ExecTester::new(config);
+
         let portfolio = Rc::new(RefCell::new(Portfolio::new(
             self.clock.clone(),
             self.cache.clone(),
@@ -534,6 +563,7 @@ pub mod invariants {
         let Some(book) = cache.own_order_book(instrument_id) else {
             return;
         };
+
         let mut order_ids = book.bid_client_order_ids();
         order_ids.extend(book.ask_client_order_ids());
 
@@ -567,5 +597,77 @@ pub mod invariants {
             present, expected,
             "order {id} own-book membership was {present}, expected {expected}",
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_execution::engine::stubs::StubExecutionClient;
+    use nautilus_model::{
+        enums::{OmsType, OrderType},
+        identifiers::{AccountId, ClientId, TraderId},
+        instruments::{Instrument, stubs::audusd_sim},
+        orders::OrderTestBuilder,
+        types::Quantity,
+    };
+    use rstest::rstest;
+
+    use super::ExecutionHarness;
+
+    #[rstest]
+    #[case::occupied_route(false, "Venue SIM already routed to A, cannot re-route to B")]
+    #[case::duplicate_client(true, "Client already registered with ID A")]
+    fn test_registration_failure_preserves_client_and_route(
+        #[case] duplicate_id: bool,
+        #[case] expected: &str,
+    ) {
+        let instrument = audusd_sim();
+        let client_id = ClientId::from("A");
+        let account_id = AccountId::from("A-001");
+
+        let harness = ExecutionHarness::new(
+            TraderId::from("TRADER-001"),
+            client_id,
+            account_id,
+            instrument.clone().into(),
+        );
+        harness
+            .register_client(Box::new(StubExecutionClient::new(
+                client_id,
+                account_id,
+                instrument.id().venue,
+                OmsType::Netting,
+                None,
+            )))
+            .unwrap();
+
+        let replacement_id = if duplicate_id {
+            client_id
+        } else {
+            ClientId::from("B")
+        };
+
+        let error = harness
+            .register_client(Box::new(StubExecutionClient::new(
+                replacement_id,
+                AccountId::from("B-002"),
+                instrument.id().venue,
+                OmsType::Hedging,
+                None,
+            )))
+            .unwrap_err();
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .quantity(Quantity::from(1))
+            .build();
+        let engine = harness.exec_engine().borrow();
+        let routed = engine.get_clients_for_orders(&[order]);
+
+        assert_eq!(error.to_string(), expected);
+        assert_eq!(engine.client_ids(), vec![client_id]);
+        assert_eq!(routed.len(), 1);
+        assert_eq!(routed[0].client_id(), client_id);
+        assert_eq!(routed[0].account_id(), account_id);
+        assert_eq!(routed[0].oms_type(), OmsType::Netting);
     }
 }

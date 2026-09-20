@@ -36,13 +36,12 @@ impl CashAccount {
     /// Represents a cash account that cannot hold leveraged positions.
     #[new]
     #[pyo3(signature = (event, calculate_account_state, allow_borrowing = false))]
-    #[must_use]
     pub fn py_new(
         event: AccountState,
         calculate_account_state: bool,
         allow_borrowing: bool,
-    ) -> Self {
-        Self::new(event, calculate_account_state, allow_borrowing)
+    ) -> PyResult<Self> {
+        Self::new_checked(event, calculate_account_state, allow_borrowing).map_err(to_pyvalue_err)
     }
 
     fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {

@@ -31,8 +31,8 @@ use indexmap::IndexMap;
 use jiff::Timestamp;
 use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{
-    AtomicMap, AtomicTime, UUID4, consts::NAUTILUS_USER_AGENT, datetime::NANOSECONDS_IN_SECOND,
-    nanos::UnixNanos, time::get_atomic_clock_realtime,
+    AtomicMap, AtomicTime, UUID4, datetime::NANOSECONDS_IN_SECOND, nanos::UnixNanos,
+    time::get_atomic_clock_realtime,
 };
 use nautilus_model::{
     data::{Bar, BarType, BookOrder, TradeTick},
@@ -48,7 +48,7 @@ use nautilus_model::{
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
 use nautilus_network::{
-    http::{HttpClient, HttpResponse, Method, USER_AGENT},
+    http::{HttpClient, HttpResponse, Method, create_standard_nautilus_headers},
     ratelimiter::quota::Quota,
     retry::{RetryConfig, RetryError, RetryManager},
 };
@@ -268,7 +268,7 @@ impl KrakenSpotRawHttpClient {
     }
 
     fn default_headers() -> HashMap<String, String> {
-        HashMap::from([(USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string())])
+        create_standard_nautilus_headers().into_iter().collect()
     }
 
     fn default_quota(max_requests_per_second: u32) -> anyhow::Result<Quota> {
@@ -1599,7 +1599,9 @@ impl KrakenSpotHttpClient {
     /// When `pairs` is `None` (loading all), also fetches tokenized asset pairs
     /// (xStocks) and merges them with the default currency pairs.
     /// When credentials are configured, instruments use account fee rates from `TradeVolume`;
-    /// otherwise, they use the public base-tier rates from `AssetPairs`.
+    /// otherwise, they use the public base-tier rates from `AssetPairs`. When the `TradeVolume`
+    /// request itself fails, instruments load with the public rates rather than failing, so a fee
+    /// problem cannot take down the execution client on connect.
     pub async fn request_instruments(
         &self,
         pairs: Option<Vec<String>>,
@@ -1728,10 +1730,23 @@ impl KrakenSpotHttpClient {
                     .collect(),
             ),
         };
-        let response = self
+        // A failure to resolve account fee rates must not abort instrument loading: this runs on
+        // the execution client connect path, where losing the listing costs the account state and
+        // reconciliation. Fall back to the public base-tier rates from `AssetPairs` instead.
+        // A malformed response is still an error, see the fee-key lookup below.
+        let response = match self
             .inner
             .get_trade_volume(&SpotTradeVolumeParams { pair: pair_ids })
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                log::warn!(
+                    "Failed to request Kraken account fee rates, falling back to public rates: {e}"
+                );
+                return Ok(AHashMap::new());
+            }
+        };
 
         fee_keys
             .into_iter()

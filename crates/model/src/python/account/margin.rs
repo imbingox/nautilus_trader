@@ -37,8 +37,8 @@ use crate::{
 impl MarginAccount {
     /// Represents a margin account that can hold leveraged positions.
     #[new]
-    fn py_new(event: AccountState, calculate_account_state: bool) -> Self {
-        Self::new(event, calculate_account_state)
+    fn py_new(event: AccountState, calculate_account_state: bool) -> PyResult<Self> {
+        Self::new_checked(event, calculate_account_state).map_err(to_pyvalue_err)
     }
 
     fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
@@ -137,6 +137,11 @@ impl MarginAccount {
     #[pyo3(name = "balances")]
     fn py_balances(&self) -> IndexMap<Currency, AccountBalance> {
         Account::balances(self)
+    }
+
+    #[pyo3(name = "total_only_balances")]
+    fn py_total_only_balances(&self) -> IndexMap<Currency, Money> {
+        Account::total_only_balances(self)
     }
 
     #[pyo3(name = "starting_balances")]

@@ -17,6 +17,7 @@
 
 use std::{cell::RefCell, collections::HashMap, fmt::Debug, rc::Rc, time::Duration};
 
+use ahash::{AHashMap, AHashSet};
 use nautilus_common::{
     cache::{CacheConfig, database::CacheDatabaseFactory},
     clients::ExecutionClient,
@@ -36,11 +37,12 @@ use nautilus_data::client::DataClientAdapter;
 use nautilus_execution::engine::ExecutionEngine;
 use nautilus_model::identifiers::{TraderId, Venue};
 use nautilus_portfolio::config::PortfolioConfig;
+#[cfg(feature = "streaming")]
+use nautilus_system::config::StreamingConfig;
 #[cfg(feature = "python")]
 use nautilus_system::trader::Trader;
 use nautilus_system::{
     clock_factory::ClockFactory,
-    config::StreamingConfig,
     event_store::{EventStoreFactory, KernelEventStore},
     kernel::{NautilusKernel, NautilusKernelDependencies},
 };
@@ -345,6 +347,7 @@ impl LiveNodeBuilder {
     ///
     /// The Rust live runtime does not support this setting yet.
     /// `build()` returns an error when it is set.
+    #[cfg(feature = "streaming")]
     #[must_use]
     pub fn with_streaming_config(mut self, config: StreamingConfig) -> Self {
         self.config.streaming = Some(config);
@@ -450,6 +453,16 @@ impl LiveNodeBuilder {
         self.add_data_client_with_routing(name, factory, config, RoutingConfig::default())
     }
 
+    #[cfg(feature = "python")]
+    pub(crate) fn has_data_client(&self, name: &str) -> bool {
+        self.data_client_factories.contains_key(name)
+    }
+
+    #[cfg(feature = "python")]
+    pub(crate) fn has_exec_client(&self, name: &str) -> bool {
+        self.exec_client_factories.contains_key(name)
+    }
+
     /// Adds a data client factory with configuration and explicit routing.
     ///
     /// # Errors
@@ -492,6 +505,10 @@ impl LiveNodeBuilder {
     }
 
     /// Adds an execution client factory with configuration and explicit routing.
+    ///
+    /// Explicit venue routes take precedence over automatic routes. The only client for a
+    /// venue routes it automatically. Multiple clients for that venue require an explicit
+    /// venue route or a default client.
     ///
     /// # Errors
     ///
@@ -553,8 +570,13 @@ impl LiveNodeBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if node construction fails.
+    /// Returns an error if node construction fails, including conflicting execution routes
+    /// or multiple execution clients for a venue without an explicit route or default client.
     pub fn build(mut self) -> anyhow::Result<LiveNode> {
+        self.build_in_place()
+    }
+
+    pub(crate) fn build_in_place(&mut self) -> anyhow::Result<LiveNode> {
         log::info!(
             "Building LiveNode with {} data clients and {} execution clients",
             self.data_client_factories.len(),
@@ -587,13 +609,14 @@ impl LiveNodeBuilder {
             self.name.clone(),
             self.config.clone(),
             NautilusKernelDependencies::default()
-                .with_clock_factory(self.clock_factory.take())
+                .with_clock_factory(self.clock_factory.clone())
                 .with_event_store_factory(self.event_store_factory.take()),
         )?;
         #[cfg(feature = "python")]
         if let Some(controller) = self.config.controller.as_ref() {
             Trader::add_controller_from_importable_config(&kernel.trader, controller)?;
         }
+
         #[cfg(not(feature = "python"))]
         if let Some(controller) = self.config.controller.as_ref() {
             anyhow::bail!(
@@ -602,27 +625,23 @@ impl LiveNodeBuilder {
             );
         }
 
-        self.install_external_msgbus_factory(&kernel)?;
+        let (external_egress, external_ingress) = self.create_external_msgbus(&kernel)?;
 
-        if let Some(external_egress) = self.external_msgbus_egress.take() {
+        if let Some(external_egress) = external_egress {
             let config = self.config.msgbus.clone().unwrap_or_default();
             nautilus_common::msgbus::get_message_bus()
                 .borrow_mut()
                 .set_external_egress_config(external_egress, &config)?;
         }
 
-        for (name, factory) in self.data_client_factories {
-            if let Some(config) = self.data_client_configs.remove(&name) {
+        for (name, factory) in &self.data_client_factories {
+            if let Some(config) = self.data_client_configs.get(name) {
                 log::debug!("Creating data client {name}");
 
                 let client = socket_registry.scope(|| {
-                    factory.create(
-                        &name,
-                        config.as_ref(),
-                        kernel.cache().into(),
-                        kernel.clock(),
-                    )
+                    factory.create(name, config.as_ref(), kernel.cache().into(), kernel.clock())
                 })?;
+
                 let client_id = client.client_id();
                 let venue = client.venue();
                 socket_registry.register_client(client_id);
@@ -633,7 +652,11 @@ impl LiveNodeBuilder {
                     client,
                 );
 
-                let routing = self.data_client_routing.remove(&name).unwrap_or_default();
+                let routing = self
+                    .data_client_routing
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_default();
 
                 {
                     let mut data_engine = kernel.data_engine.borrow_mut();
@@ -660,31 +683,38 @@ impl LiveNodeBuilder {
         }
 
         let mut exec_clients = Vec::new();
+        let mut venue_candidates = AHashMap::<Venue, Vec<_>>::new();
+        let mut venues_explicit = AHashSet::new();
+        let mut has_default_client = false;
+        let mut instrument_venues = AHashSet::new();
 
-        for (name, factory) in self.exec_client_factories {
-            if let Some(config) = self.exec_client_configs.remove(&name) {
+        for (name, factory) in &self.exec_client_factories {
+            if let Some(config) = self.exec_client_configs.get(name) {
                 log::debug!("Creating execution client {name}");
 
                 let client = socket_registry.scope(|| match factory {
                     ExecutionClientFactoryEntry::Adapter(factory) => factory.create(
                         self.config.trader_id,
-                        &name,
+                        name,
                         config.as_ref(),
                         kernel.cache().into(),
+                        kernel.clock(),
                     ),
-                    ExecutionClientFactoryEntry::Simulated(factory) => factory.create(
-                        self.config.trader_id,
-                        &name,
-                        config.as_ref(),
-                        kernel.cache(),
-                    ),
+                    ExecutionClientFactoryEntry::Simulated(factory) => {
+                        factory.create(self.config.trader_id, name, config.as_ref(), kernel.cache())
+                    }
                 })?;
+
                 let client = LiveExecutionClient::new(client);
                 let client_id = client.client_id();
                 let venue = client.venue();
                 socket_registry.register_client(client_id);
 
-                let routing = self.exec_client_routing.remove(&name).unwrap_or_default();
+                let routing = self
+                    .exec_client_routing
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_default();
 
                 {
                     let mut exec_engine = kernel.exec_engine.borrow_mut();
@@ -692,18 +722,28 @@ impl LiveNodeBuilder {
 
                     if routing.default {
                         exec_engine.set_default_client(client_id)?;
+                        has_default_client = true;
                     }
 
                     if let Some(venues) = &routing.venues {
                         for venue_str in venues {
-                            exec_engine.register_venue_routing(
-                                client_id,
-                                Venue::new(venue_str.as_str()),
-                            )?;
+                            let route_venue = Venue::new(venue_str.as_str());
+                            exec_engine.register_venue_routing(client_id, route_venue)?;
+                            venues_explicit.insert(route_venue);
+                            instrument_venues.insert(route_venue);
                         }
                     }
                 }
-                ExecutionEngine::subscribe_venue_instruments(&kernel.exec_engine, venue);
+
+                if let Some(check) = client.native_capital_check() {
+                    kernel
+                        .risk_engine
+                        .borrow_mut()
+                        .register_native_capital_check(client.account_id(), client_id, check)?;
+                }
+
+                venue_candidates.entry(venue).or_default().push(client_id);
+                instrument_venues.insert(venue);
                 exec_clients.push(client);
 
                 log::info!("Registered ExecutionClient-{client_id}");
@@ -712,8 +752,31 @@ impl LiveNodeBuilder {
             }
         }
 
+        {
+            let mut exec_engine = kernel.exec_engine.borrow_mut();
+
+            for (venue, candidates) in venue_candidates {
+                if venues_explicit.contains(&venue) {
+                    continue;
+                }
+
+                if let [client_id] = candidates.as_slice() {
+                    exec_engine.register_venue_routing(*client_id, venue)?;
+                } else if !has_default_client {
+                    anyhow::bail!(
+                        "Multiple execution clients for venue {venue}: configure an explicit venue route or default client"
+                    );
+                }
+            }
+        }
+
+        for venue in instrument_venues {
+            ExecutionEngine::subscribe_venue_instruments(&kernel.exec_engine, venue);
+        }
+
         let exec_manager_config = ExecutionManagerConfig::from(&self.config.exec_engine)
             .with_trader_id(self.config.trader_id);
+
         let mut exec_manager = ExecutionManager::new(
             kernel.clock.clone(),
             kernel.cache.clone(),
@@ -727,26 +790,40 @@ impl LiveNodeBuilder {
             );
         }
 
-        let node = LiveNode::new_from_builder(
+        let mut node = LiveNode::new_from_builder(
             kernel,
             runner,
-            self.config,
+            self.config.clone(),
             exec_manager,
             exec_clients,
             socket_registry,
-            self.cache_database_factory,
-            self.external_msgbus_ingress,
+            None,
+            external_ingress,
         );
         node.load_configured_plugins()?;
+        node.cache_database_factory = self.cache_database_factory.take();
 
         log::info!("Built successfully");
 
         Ok(node)
     }
 
-    fn install_external_msgbus_factory(&mut self, kernel: &NautilusKernel) -> anyhow::Result<()> {
-        let Some(factory) = self.external_msgbus_factory.take() else {
-            return Ok(());
+    #[expect(
+        clippy::type_complexity,
+        reason = "external backing returns its paired egress and ingress"
+    )]
+    fn create_external_msgbus(
+        &mut self,
+        kernel: &NautilusKernel,
+    ) -> anyhow::Result<(
+        Option<Box<dyn MessageBusExternalEgress>>,
+        Option<ExternalMessageBusIngress>,
+    )> {
+        let Some(factory) = self.external_msgbus_factory.as_ref() else {
+            return Ok((
+                self.external_msgbus_egress.take(),
+                self.external_msgbus_ingress.take(),
+            ));
         };
 
         let config = self.config.msgbus.clone().unwrap_or_default();
@@ -759,13 +836,13 @@ impl LiveNodeBuilder {
 
         if has_external_streams {
             let (external_egress, external_ingress) = external_io_from_backing(backing);
-            self.external_msgbus_egress = Some(external_egress);
-            self.external_msgbus_ingress = Some(ExternalMessageBusIngress(external_ingress));
+            Ok((
+                Some(external_egress),
+                Some(ExternalMessageBusIngress(external_ingress)),
+            ))
         } else {
-            self.external_msgbus_egress = Some(external_egress_from_backing(backing));
+            Ok((Some(external_egress_from_backing(backing)), None))
         }
-
-        Ok(())
     }
 }
 
@@ -787,14 +864,32 @@ impl ExternalMessageBusIngress {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
-    use nautilus_common::enums::Environment;
-    use nautilus_model::identifiers::TraderId;
+    use nautilus_common::{
+        cache::CacheView,
+        clients::ExecutionClient,
+        clock::Clock,
+        enums::Environment,
+        factories::{ClientConfig, ExecutionClientFactory},
+        messages::execution::{SubmitOrder, TradingCommand},
+        msgbus::{self, switchboard},
+    };
+    use nautilus_core::{UUID4, UnixNanos};
+    use nautilus_execution::engine::stubs::StubExecutionClient;
+    use nautilus_model::{
+        enums::{OmsType, OrderType},
+        identifiers::{AccountId, ClientId, ClientOrderId, TraderId, Venue},
+        instruments::{Instrument, InstrumentAny, stubs::audusd_sim},
+        orders::{Order, OrderTestBuilder},
+        stubs::TestDefault,
+        types::Quantity,
+    };
     use nautilus_trading::ImportableControllerConfig;
     use rstest::rstest;
 
     use super::LiveNodeBuilder;
+    use crate::node::config::RoutingConfig;
 
     #[rstest]
     fn test_with_controller_sets_config_controller() {
@@ -809,5 +904,325 @@ mod tests {
             .with_controller(controller);
 
         assert!(builder.config.controller.is_some());
+    }
+
+    #[rstest]
+    #[case::single(1, false, false, false)]
+    #[case::explicit(2, true, false, false)]
+    #[case::default(2, false, true, false)]
+    #[case::explicit_over_default(2, true, true, false)]
+    #[case::single_empty_venues(1, false, false, true)]
+    #[case::default_empty_venues(2, false, true, true)]
+    fn test_execution_client_routing_and_instruments(
+        #[case] count: usize,
+        #[case] explicit: bool,
+        #[case] default: bool,
+        #[case] empty_venues: bool,
+        #[values(false, true)] reverse: bool,
+    ) {
+        let clients: Vec<_> = (0..count)
+            .map(|i| {
+                StubExecutionClient::new(
+                    ClientId::new(format!("CLIENT-{i}")),
+                    AccountId::new(format!("ACCOUNT-{i}")),
+                    Venue::from("SIM"),
+                    OmsType::Netting,
+                    None,
+                )
+            })
+            .collect();
+
+        let mut builder =
+            LiveNodeBuilder::new(TraderId::test_default(), Environment::Live).unwrap();
+        let mut indices: Vec<_> = (0..count).collect();
+        if reverse {
+            indices.reverse();
+        }
+
+        for i in indices {
+            builder = builder
+                .add_exec_client_with_routing(
+                    Some(format!("client-{i}")),
+                    Box::new(RoutingClientFactory(clients[i].clone())),
+                    Box::new(RoutingClientConfig),
+                    RoutingConfig {
+                        default: default && i == 0,
+                        venues: if empty_venues {
+                            Some(vec![])
+                        } else {
+                            (explicit && i == 1).then(|| vec!["SIM".to_string()])
+                        },
+                    },
+                )
+                .unwrap();
+        }
+
+        let node = builder.build().unwrap();
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        msgbus::publish_instrument(
+            switchboard::get_instrument_topic(instrument.id()),
+            &instrument,
+        );
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .quantity(Quantity::from(1))
+            .build();
+        node.kernel()
+            .cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        node.kernel()
+            .cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+        let engine = node.kernel().exec_engine.borrow();
+        engine.execute(TradingCommand::SubmitOrder(SubmitOrder::from_order(
+            &order,
+            TraderId::test_default(),
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+        )));
+        let routed = engine.get_clients_for_orders(std::slice::from_ref(&order));
+        let explicit_index = count - 1 - usize::from(explicit);
+        let explicit_order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-EXPLICIT"))
+            .quantity(Quantity::from(2))
+            .build();
+        node.kernel()
+            .cache
+            .borrow_mut()
+            .add_order(explicit_order.clone(), None, None, false)
+            .unwrap();
+        engine.execute(TradingCommand::SubmitOrder(SubmitOrder::from_order(
+            &explicit_order,
+            TraderId::test_default(),
+            Some(clients[explicit_index].client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+        )));
+
+        assert_eq!(engine.client_ids().len(), count);
+        assert_eq!(routed.len(), 1);
+        assert_eq!(
+            routed[0].client_id(),
+            clients[usize::from(explicit)].client_id()
+        );
+
+        for (i, client) in clients.iter().enumerate() {
+            let mut expected_orders = if i == usize::from(explicit) {
+                vec![order.client_order_id()]
+            } else {
+                vec![]
+            };
+
+            if i == explicit_index {
+                expected_orders.push(explicit_order.client_order_id());
+            }
+
+            assert_eq!(*client.submitted_order_ids().borrow(), expected_orders);
+            assert_eq!(
+                *client.received_instruments().borrow(),
+                vec![instrument.clone()]
+            );
+        }
+    }
+
+    #[rstest]
+    fn test_execution_client_keeps_native_route_with_extra_venue(
+        #[values(false, true)] other_native_client: bool,
+    ) {
+        let client = StubExecutionClient::new(
+            ClientId::from("CLIENT"),
+            AccountId::from("CLIENT-001"),
+            Venue::from("SIM"),
+            OmsType::Netting,
+            None,
+        )
+        .with_handles_all_order_venues();
+
+        let other_client = StubExecutionClient::new(
+            ClientId::from("OTHER_CLIENT"),
+            AccountId::from("OTHER_CLIENT-002"),
+            Venue::from("OTHER"),
+            OmsType::Netting,
+            None,
+        );
+
+        let mut builder = LiveNodeBuilder::new(TraderId::test_default(), Environment::Live)
+            .unwrap()
+            .add_exec_client_with_routing(
+                Some("client".to_string()),
+                Box::new(RoutingClientFactory(client.clone())),
+                Box::new(RoutingClientConfig),
+                RoutingConfig {
+                    default: false,
+                    venues: Some(vec!["OTHER".to_string(), "OTHER".to_string()]),
+                },
+            )
+            .unwrap();
+
+        if other_native_client {
+            builder = builder
+                .add_exec_client_with_routing(
+                    Some("other-client".to_string()),
+                    Box::new(RoutingClientFactory(other_client.clone())),
+                    Box::new(RoutingClientConfig),
+                    RoutingConfig::default(),
+                )
+                .unwrap();
+        }
+
+        let node = builder.build().unwrap();
+
+        let native = audusd_sim();
+        let mut other = native.clone();
+        other.id.venue = Venue::from("OTHER");
+        let instruments = [
+            InstrumentAny::CurrencyPair(native),
+            InstrumentAny::CurrencyPair(other),
+        ];
+
+        for instrument in &instruments {
+            let order = OrderTestBuilder::new(OrderType::Market)
+                .instrument_id(instrument.id())
+                .client_order_id(ClientOrderId::new(format!("O-{}", instrument.id().venue)))
+                .quantity(Quantity::from(1))
+                .build();
+            let engine = node.kernel().exec_engine.borrow();
+            node.kernel()
+                .cache
+                .borrow_mut()
+                .add_instrument(instrument.clone())
+                .unwrap();
+            node.kernel()
+                .cache
+                .borrow_mut()
+                .add_order(order.clone(), None, None, false)
+                .unwrap();
+            engine.execute(TradingCommand::SubmitOrder(SubmitOrder::from_order(
+                &order,
+                TraderId::test_default(),
+                None,
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+            )));
+            let routed = engine.get_clients_for_orders(&[order]);
+            assert_eq!(
+                routed
+                    .iter()
+                    .map(|client| client.client_id())
+                    .collect::<Vec<_>>(),
+                vec![client.client_id()]
+            );
+            drop(engine);
+            msgbus::publish_instrument(
+                switchboard::get_instrument_topic(instrument.id()),
+                instrument,
+            );
+        }
+
+        assert_eq!(*client.received_instruments().borrow(), instruments);
+        assert_eq!(
+            *client.submitted_order_ids().borrow(),
+            vec![ClientOrderId::from("O-SIM"), ClientOrderId::from("O-OTHER")]
+        );
+        assert_eq!(*other_client.submitted_order_ids().borrow(), vec![]);
+
+        let expected_other = if other_native_client {
+            vec![instruments[1].clone()]
+        } else {
+            vec![]
+        };
+
+        assert_eq!(
+            *other_client.received_instruments().borrow(),
+            expected_other
+        );
+    }
+
+    #[rstest]
+    #[case::ambiguous(
+        false,
+        false,
+        false,
+        "Multiple execution clients for venue SIM: configure an explicit venue route or default client"
+    )]
+    #[case::duplicate_id(true, false, false, "Client already registered with ID CLIENT-0")]
+    #[case::duplicate_default(false, true, false, "default client already registered")]
+    #[case::duplicate_route(false, false, true, "cannot re-route")]
+    fn test_execution_client_routing_rejects_ambiguity(
+        #[case] duplicate_id: bool,
+        #[case] default: bool,
+        #[case] explicit: bool,
+        #[case] expected: &str,
+    ) {
+        let mut builder =
+            LiveNodeBuilder::new(TraderId::test_default(), Environment::Live).unwrap();
+
+        for i in 0..2 {
+            let id = if duplicate_id { 0 } else { i };
+
+            let client = StubExecutionClient::new(
+                ClientId::new(format!("CLIENT-{id}")),
+                AccountId::new(format!("ACCOUNT-{i}")),
+                Venue::from("SIM"),
+                OmsType::Netting,
+                None,
+            );
+            builder = builder
+                .add_exec_client_with_routing(
+                    Some(format!("client-{i}")),
+                    Box::new(RoutingClientFactory(client)),
+                    Box::new(RoutingClientConfig),
+                    RoutingConfig {
+                        default,
+                        venues: explicit.then(|| vec!["SIM".to_string()]),
+                    },
+                )
+                .unwrap();
+        }
+
+        let error = builder.build().unwrap_err().to_string();
+        assert!(error.contains(expected), "Unexpected error: {error}");
+    }
+
+    #[derive(Debug)]
+    struct RoutingClientFactory(StubExecutionClient);
+
+    impl ExecutionClientFactory for RoutingClientFactory {
+        fn create(
+            &self,
+            _trader_id: TraderId,
+            _name: &str,
+            _config: &dyn ClientConfig,
+            _cache: CacheView,
+            _clock: Rc<RefCell<dyn Clock>>,
+        ) -> anyhow::Result<Box<dyn ExecutionClient>> {
+            Ok(Box::new(self.0.clone()))
+        }
+
+        fn name(&self) -> &'static str {
+            "routing"
+        }
+
+        fn config_type(&self) -> &'static str {
+            "RoutingClientConfig"
+        }
+    }
+
+    #[derive(Debug)]
+    struct RoutingClientConfig;
+
+    impl ClientConfig for RoutingClientConfig {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
 }

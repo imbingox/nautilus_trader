@@ -35,12 +35,12 @@ integration, scheduled checks, and publication.
 - [`codeql-analysis.yml`](workflows/codeql-analysis.yml): runs CodeQL analysis for Python and Rust.
 - [`docker.yml`](workflows/docker.yml): builds, publishes, signs, and attests the multi-platform
   `nautilus_trader` and `jupyterlab` images.
-- [`dst.yml`](workflows/dst.yml): runs deterministic simulation smoke tests.
 - [`nightly-merge.yml`](workflows/nightly-merge.yml): fast-forwards `nightly` to the latest
   successful `develop` commit.
 - [`nightly-tests.yml`](workflows/nightly-tests.yml): runs Rust doctests, Python memory leak tests,
-  standard-precision Clippy, extended network tests, Cargo publication checks, docs.rs builds,
-  crate feature combinations, example target checks, and Miri.
+  standard-precision Clippy, extended network tests, deterministic simulation (DST) smoke tests,
+  Cargo publication checks, docs.rs builds, crate feature combinations, example target checks, and
+  Miri.
 - [`openssf-scorecard.yml`](workflows/openssf-scorecard.yml): publishes OpenSSF Scorecard results
   and uploads SARIF.
 - [`performance.yml`](workflows/performance.yml): runs Rust tests and registered benchmarks on
@@ -85,6 +85,9 @@ artifact integrity records, and verification flow. This section records CI-speci
   trusted repository maintainers before the workflow reaches the self-hosted build pool.
 - `build.yml` cancels superseded pull request runs. Push runs use commit-specific concurrency groups,
   so a later push cannot replace an earlier candidate's result.
+- Jobs that publish wheels to R2, merge `nightly`, or dispatch documentation builds declare a GitHub
+  Environment with a deployment branch policy: `r2-develop` (`develop`), `r2-nightly` (`nightly`),
+  `release` (`master`), `nightly-merge` (`develop`), and `build-docs` (`master` and `nightly`).
 
 ### Publication integrity
 

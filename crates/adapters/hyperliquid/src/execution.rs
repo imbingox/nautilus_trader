@@ -51,11 +51,13 @@ use nautilus_model::{
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
     },
+    instruments::{Instrument, InstrumentAny},
     orders::{Order, any::OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Quantity},
 };
 use parking_lot::Mutex;
+use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use crate::{
@@ -181,6 +183,13 @@ impl HyperliquidExecutionClient {
         )?;
         request.cloid = Some(cloid);
 
+        if let Some(base_size) = self
+            .quote_converted_size(order)
+            .map_err(|reason| anyhow::anyhow!("{reason}"))?
+        {
+            request.size = base_size;
+        }
+
         // Market orders need a limit price derived from the cached quote,
         // leaving the conversion's zero placeholder when none is cached.
         if order.order_type() == OrderType::Market {
@@ -199,6 +208,51 @@ impl HyperliquidExecutionClient {
         }
 
         Ok(request)
+    }
+
+    // Hyperliquid accepts only base-denominated sizes on the wire, so a quote
+    // amount must convert (or deny) before it can reach the venue.
+    fn quote_converted_size(&self, order: &OrderAny) -> Result<Option<Decimal>, OrderDeniedReason> {
+        if !order.is_quote_quantity() {
+            return Ok(None);
+        }
+
+        let instrument_id = order.instrument_id();
+        let cache = self.core.cache();
+
+        let Some(instrument) = cache.instrument(&instrument_id) else {
+            return Err(OrderDeniedReason::InstrumentNotFound { instrument_id });
+        };
+
+        let Some(quote) = cache.quote(&instrument_id) else {
+            return Err(OrderDeniedReason::MarketPriceUnavailable {
+                order_type: order.order_type(),
+                instrument_id,
+            });
+        };
+
+        let reference_price = if order.order_side() == OrderSide::Buy {
+            quote.ask_price
+        } else {
+            quote.bid_price
+        };
+
+        let base_size = instrument
+            .try_calculate_base_quantity(order.quantity(), reference_price)
+            .map_err(|e| OrderDeniedReason::ValidationFailed {
+                detail: format!("Quote-denominated quantity conversion failed: {e}"),
+            })?;
+
+        if base_size.is_zero() {
+            return Err(OrderDeniedReason::ValidationFailed {
+                detail: format!(
+                    "Quote-denominated quantity {} converts to a zero base size at the instrument size precision",
+                    order.quantity()
+                ),
+            });
+        }
+
+        Ok(Some(base_size.as_decimal().normalize()))
     }
 
     fn restore_staged_brackets(&self) -> Vec<ClientOrderId> {
@@ -704,6 +758,23 @@ impl ExecutionClient for HyperliquidExecutionClient {
         Ok(())
     }
 
+    /// Registers an instrument published by the data client so a market listed
+    /// after this client bootstrapped becomes submittable without a restart.
+    ///
+    /// The HTTP client takes the venue asset index from the instrument's `info`
+    /// map. WebSocket submissions sign through `&self.http_client`, so that one
+    /// write serves both submission paths.
+    fn on_instrument(&mut self, instrument: InstrumentAny) {
+        // this is the only step that makes a market listed after our bootstrap
+        // submittable, so it is traceable rather than silent
+        log::debug!(
+            "Applying instrument update: instrument_id={}",
+            instrument.id()
+        );
+        self.http_client.cache_instrument(&instrument);
+        self.ws_client.cache_instrument(instrument);
+    }
+
     fn start(&mut self) -> anyhow::Result<()> {
         if self.core.is_started() {
             return Ok(());
@@ -820,6 +891,15 @@ impl ExecutionClient for HyperliquidExecutionClient {
             .cached_client_order_id_cloid(&order.client_order_id())
             .unwrap_or_else(|| Cloid::from_client_order_id(order.client_order_id()));
         hyperliquid_order.cloid = Some(cloid);
+
+        match self.quote_converted_size(&order) {
+            Ok(Some(base_size)) => hyperliquid_order.size = base_size,
+            Ok(None) => {}
+            Err(reason) => {
+                self.emitter.emit_order_denied(&order, &reason.to_string());
+                return Ok(());
+            }
+        }
 
         if order.order_type() == OrderType::Market {
             let instrument_id = order.instrument_id();
@@ -1117,6 +1197,24 @@ impl ExecutionClient for HyperliquidExecutionClient {
         let symbol = cmd.instrument_id.symbol.inner();
         let should_normalize = self.config.normalize_prices;
         let slippage_bps = self.resolve_slippage_bps(cmd.params.as_ref());
+
+        // A modify replaces a base-denominated size, and a quote target cannot
+        // be reconciled against the venue's base-denominated fill reports.
+        if order.is_quote_quantity() {
+            let reason =
+                "quote-denominated quantity orders cannot be modified; cancel and resubmit";
+            log::warn!("Cannot modify order {client_order_id}: {reason}");
+            self.emitter.emit_order_modify_rejected_event(
+                cmd.strategy_id,
+                cmd.instrument_id,
+                client_order_id,
+                venue_order_id,
+                reason,
+                self.clock.get_time_ns(),
+            );
+            return Ok(());
+        }
+
         let modify_target = match http_client.unique_cached_client_order_id_cloid(&client_order_id)
         {
             Some(cloid) => HyperliquidExchangeModifyTarget::Cloid(cloid),
@@ -2401,7 +2499,7 @@ impl HyperliquidExecutionClient {
                         NautilusWsMessage::Trades(_)
                         | NautilusWsMessage::Quote(_)
                         | NautilusWsMessage::Deltas(_)
-                        | NautilusWsMessage::Depth10(_)
+                        | NautilusWsMessage::Depth(_)
                         | NautilusWsMessage::Candle(_)
                         | NautilusWsMessage::MarkPrice(_)
                         | NautilusWsMessage::IndexPrice(_)
@@ -3599,11 +3697,13 @@ use crate::common::parse::determine_order_list_grouping;
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{cell::RefCell, rc::Rc, sync::Arc};
 
     use alloy::signers::local::PrivateKeySigner;
-    use nautilus_common::messages::ExecutionEvent;
-    use nautilus_core::{UUID4, UnixNanos, time::get_atomic_clock_realtime};
+    use nautilus_common::{cache::Cache, messages::ExecutionEvent};
+    use nautilus_core::{
+        UUID4, UnixNanos, string::secret::SecretString, time::get_atomic_clock_realtime,
+    };
     use nautilus_live::{
         ExecutionEventEmitter,
         execution::{
@@ -3614,8 +3714,8 @@ mod tests {
     };
     use nautilus_model::{
         enums::{
-            AccountType, ContingencyType, LiquiditySide, OrderSide, OrderStatus, OrderType,
-            TimeInForce, TriggerType,
+            AccountType, ContingencyType, LiquiditySide, OmsType, OrderSide, OrderStatus,
+            OrderType, TimeInForce, TriggerType,
         },
         events::OrderEventAny,
         identifiers::{
@@ -3632,19 +3732,28 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::{
-        CancelEntry, ExecutionReport, FifoCache, HyperliquidHttpClient, HyperliquidWebSocketClient,
-        PostRejectionRoute, StagedBracketChild, StagedBracketState, WsDispatchState,
-        attach_known_client_order_id, build_ouo_resize_request, can_fast_cancel_order,
-        classify_post_failure, determine_order_list_grouping, handle_execution_report,
-        register_order_context_into, split_fast_cancel_requests, validate_order_for_hyperliquid,
+        CancelEntry, ExecutionClient, ExecutionClientCore, ExecutionReport, FifoCache,
+        HyperliquidExecutionClient, HyperliquidExecutionClientConfig, HyperliquidHttpClient,
+        HyperliquidWebSocketClient, PostRejectionRoute, StagedBracketChild, StagedBracketState,
+        WsDispatchState, attach_known_client_order_id, build_ouo_resize_request,
+        can_fast_cancel_order, classify_post_failure, determine_order_list_grouping,
+        handle_execution_report, register_order_context_into, split_fast_cancel_requests,
+        validate_order_for_hyperliquid,
     };
     use crate::{
-        common::enums::HyperliquidEnvironment,
-        http::models::{
-            Cloid, HyperliquidExchangeAction, HyperliquidExchangeCancelOrderRequest,
-            HyperliquidExchangeGrouping, HyperliquidExchangeLimitParams,
-            HyperliquidExchangeOrderKind, HyperliquidExchangePlaceOrderRequest,
-            HyperliquidExchangeTif,
+        common::{
+            consts::{HYPERLIQUID_CLIENT_ID, HYPERLIQUID_VENUE},
+            enums::HyperliquidEnvironment,
+            testing::load_test_data,
+        },
+        http::{
+            models::{
+                Cloid, HyperliquidExchangeAction, HyperliquidExchangeCancelOrderRequest,
+                HyperliquidExchangeGrouping, HyperliquidExchangeLimitParams,
+                HyperliquidExchangeOrderKind, HyperliquidExchangePlaceOrderRequest,
+                HyperliquidExchangeTif, PerpMeta,
+            },
+            parse::{create_instrument_from_def, parse_perp_instruments},
         },
     };
 
@@ -3694,6 +3803,27 @@ mod tests {
         HyperliquidHttpClient::new(HyperliquidEnvironment::Testnet, 1, None).unwrap()
     }
 
+    fn make_execution_client() -> HyperliquidExecutionClient {
+        let wallet = PrivateKeySigner::random();
+        let key = Zeroizing::new(format!("{:#x}", wallet.to_bytes()));
+        let core = ExecutionClientCore::new(
+            TraderId::from("TESTER-001"),
+            *HYPERLIQUID_CLIENT_ID,
+            *HYPERLIQUID_VENUE,
+            OmsType::Netting,
+            AccountId::from("HYPERLIQUID-001"),
+            AccountType::Margin,
+            None,
+            Rc::new(RefCell::new(Cache::default())),
+        );
+        let config = HyperliquidExecutionClientConfig::builder()
+            .private_key(SecretString::from(key.to_string()))
+            .environment(HyperliquidEnvironment::Testnet)
+            .build();
+
+        HyperliquidExecutionClient::new(core, config).unwrap()
+    }
+
     // Matches the order built by `limit_order_with_flags` so registration
     // tests can assert the stored context by equality.
     fn test_context(client_order_id: ClientOrderId) -> OrderContext {
@@ -3714,6 +3844,29 @@ mod tests {
             is_reduce_only: false,
             is_quote_quantity: false,
         }
+    }
+
+    #[rstest]
+    fn test_on_instrument_registers_asset_index_for_a_new_market() {
+        // A market listed after the client bootstrapped arrives through the
+        // message bus, and must become submittable without a restart.
+        let mut client = make_execution_client();
+        let meta: PerpMeta = load_test_data("http_meta_perp_sample.json");
+        let defs = parse_perp_instruments(&meta, 0).unwrap();
+        let def = &defs[1];
+        let instrument = create_instrument_from_def(def, UnixNanos::default()).unwrap();
+
+        assert_eq!(
+            client.http_client.get_asset_index(def.symbol.as_str()),
+            None
+        );
+
+        client.on_instrument(instrument);
+
+        assert_eq!(
+            client.http_client.get_asset_index(def.symbol.as_str()),
+            Some(def.asset_index),
+        );
     }
 
     #[rstest]

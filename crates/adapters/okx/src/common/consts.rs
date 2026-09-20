@@ -164,8 +164,8 @@ pub(crate) fn okx_reduce_only_wire_value(
 ///
 /// - OKX implements IOC and FOK as order types rather than separate time-in-force parameters.
 /// - FOK is only supported with Limit orders (Market + FOK is not supported).
-/// - IOC with Market orders uses OptimalLimitIoc, with Limit orders uses Ioc.
-/// - GTD is supported via expire_time parameter.
+/// - IOC with Market orders uses `OptimalLimitIoc`, with Limit orders uses Ioc.
+/// - GTD is supported via `expire_time` parameter.
 pub const OKX_SUPPORTED_TIME_IN_FORCE: &[TimeInForce] = &[
     TimeInForce::Gtc, // Good Till Cancel (default)
     TimeInForce::Ioc, // Immediate or Cancel (mapped to OKXOrderType::Ioc or OptimalLimitIoc)
@@ -176,7 +176,7 @@ pub const OKX_SUPPORTED_TIME_IN_FORCE: &[TimeInForce] = &[
 ///
 /// # Notes
 ///
-/// - PostOnly is supported as a flag on limit orders.
+/// - `PostOnly` is supported as a flag on limit orders.
 /// - Conditional orders (stop/trigger) are supported via algo orders.
 pub const OKX_SUPPORTED_ORDER_TYPES: &[OrderType] = &[
     OrderType::Market,
@@ -364,7 +364,7 @@ pub fn resolve_book_depth(raw_depth: usize) -> usize {
 pub(crate) fn select_book_channel(depth: usize, vip: OKXVipLevel) -> OKXBookChannel {
     match depth {
         50 if vip >= OKXVipLevel::Vip4 => OKXBookChannel::Books50L2Tbt,
-        0 | 400 if vip >= OKXVipLevel::Vip5 => OKXBookChannel::BookL2Tbt,
+        0 | 400 if vip >= OKXVipLevel::Vip4 => OKXBookChannel::BookL2Tbt,
         0 | 50 | 400 => OKXBookChannel::Book,
         _ => unreachable!("book depth must be resolved before channel selection"),
     }
@@ -378,11 +378,13 @@ mod tests {
 
     #[rstest]
     #[case::auto_default(0, OKXVipLevel::Vip0, OKXBookChannel::Book)]
-    #[case::auto_vip4(0, OKXVipLevel::Vip4, OKXBookChannel::Book)]
+    #[case::auto_vip3(0, OKXVipLevel::Vip3, OKXBookChannel::Book)]
+    #[case::auto_vip4(0, OKXVipLevel::Vip4, OKXBookChannel::BookL2Tbt)]
     #[case::auto_vip5(0, OKXVipLevel::Vip5, OKXBookChannel::BookL2Tbt)]
     #[case::depth_50_vip3(50, OKXVipLevel::Vip3, OKXBookChannel::Book)]
     #[case::depth_50_vip4(50, OKXVipLevel::Vip4, OKXBookChannel::Books50L2Tbt)]
-    #[case::depth_400_vip4(400, OKXVipLevel::Vip4, OKXBookChannel::Book)]
+    #[case::depth_400_vip3(400, OKXVipLevel::Vip3, OKXBookChannel::Book)]
+    #[case::depth_400_vip4(400, OKXVipLevel::Vip4, OKXBookChannel::BookL2Tbt)]
     #[case::depth_400_vip5(400, OKXVipLevel::Vip5, OKXBookChannel::BookL2Tbt)]
     fn test_select_book_channel(
         #[case] depth: usize,
@@ -405,6 +407,8 @@ mod tests {
     #[case("50001", true)]
     #[case("50011", true)]
     #[case("60005", true)]
+    #[case("60014", false)]
+    #[case("64007", false)]
     #[case(OKX_SERVICE_UPGRADE_RECONNECT_CODE, true)]
     #[case("50113", false)]
     #[case("60012", false)]

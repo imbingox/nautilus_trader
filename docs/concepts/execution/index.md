@@ -97,7 +97,7 @@ enum.
 
 The `OmsType` enum has three variants:
 
-- `UNSPECIFIED`: The strategy uses the venue's OMS type.
+- `UNSPECIFIED`: The strategy uses the owning execution client's OMS type.
 - `NETTING`: Positions combine into one position per instrument and strategy.
 - `HEDGING`: Multiple positions per instrument and strategy can remain open.
 
@@ -115,11 +115,21 @@ as a separate venue position.
 If a fill resolves to a cached position for a different instrument, the `ExecutionEngine` logs an
 error and drops the fill. The order remains non-terminal so a subsequent valid fill can be applied.
 
+For reductions of inherited inventory, see [Reducing external positions](reconciliation.md#reducing-external-positions).
+
 ### OMS configuration
 
-When a strategy omits `oms_type` or uses `UNSPECIFIED`, the `ExecutionEngine` follows the venue's
-OMS type without overriding venue `position_id` values. Configure a backtest venue with the OMS
-type used by the venue being modeled.
+When a strategy omits `oms_type` or uses `UNSPECIFIED`, the `ExecutionEngine` uses the owning
+execution client's OMS type. An explicit `NETTING` or `HEDGING` strategy override takes precedence.
+Submission validation uses the client selected by command routing. Fill processing uses the cached
+order's client origin, or the one registered client that matches the fill's account and handles its
+instrument venue when that origin is unavailable. This account lookup also covers spread-leg fills
+without a cached order. For fills associated with an order, an existing cached position retains its
+recorded OMS type.
+
+If ownership is absent or ambiguous, fills use `NETTING` unless the strategy supplies an explicit
+override. Venue and default command routes do not select the fill's OMS type. Configure a backtest
+venue with the OMS type used by the venue being modeled.
 
 Venue position modes may require adapter-specific configuration. For example, see
 [Binance Futures hedge mode](../../integrations/binance.md#futures-hedge-mode).
@@ -289,7 +299,7 @@ For a local execution client, the `ExecutionEngine` resolves the root command to
 in this order:
 
 1. The explicit `client_id`, when it identifies a registered local client.
-1. The client registered for the instrument's venue.
+1. The client routed for the instrument's venue.
 1. The default execution client.
 
 The engine then creates fresh child commands for the selected client and its account:
@@ -412,6 +422,7 @@ cross or immediately match. Other venue rejections leave it `false`.
 | `NOTIONAL_EXCEEDS_MAX_PER_ORDER`                 | The order notional exceeds the configured maximum per order.                          |
 | `NOTIONAL_EXCEEDS_FREE_BALANCE`                  | The order notional exceeds the account free balance.                                  |
 | `INITIAL_MARGIN_CALCULATION_FAILED`              | The order initial margin could not be calculated.                                     |
+| `NATIVE_CAPITAL_CHECK_UNAVAILABLE`               | Native capital checking is unavailable for reported totals-only balances.             |
 | `INITIAL_MARGIN_EXCEEDS_FREE_BALANCE`            | The order initial margin exceeds the account free balance.                            |
 | `BETTING_BALANCE_LOCKED_CALCULATION_FAILED`      | The balance to lock for the betting order could not be calculated.                    |
 | `CUMULATIVE_NOTIONAL_EXCEEDS_FREE_BALANCE`       | The cumulative order notional exceeds the account free balance.                       |

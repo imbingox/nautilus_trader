@@ -1423,12 +1423,13 @@ pub const MY_CONSTANT: u64 = 42;
     assert consts[names.index("MY_CONSTANT")].python_type == "int"
 
 
-def test_collect_module_constants_uses_adapter_package_path(tmp_path: Path) -> None:
+@pytest.mark.parametrize("adapter", ["polymarket", "binance-papi"])
+def test_collect_module_constants_uses_adapter_package_path(tmp_path: Path, adapter: str) -> None:
     """
     Test collect module constants uses adapter package path.
     """
     # Arrange
-    mod_rs = tmp_path / "crates" / "adapters" / "polymarket" / "src" / "python" / "mod.rs"
+    mod_rs = tmp_path / "crates" / "adapters" / adapter / "src" / "python" / "mod.rs"
     mod_rs.parent.mkdir(parents=True)
     mod_rs.write_text(
         """
@@ -1441,7 +1442,7 @@ pub fn polymarket(m: &Bound<'_, PyModule>) -> PyResult<()> {
         encoding="utf-8",
     )
 
-    const_rs = tmp_path / "crates" / "adapters" / "polymarket" / "src" / "common" / "consts.rs"
+    const_rs = tmp_path / "crates" / "adapters" / adapter / "src" / "common" / "consts.rs"
     const_rs.parent.mkdir(parents=True, exist_ok=True)
     const_rs.write_text(
         """
@@ -1454,8 +1455,8 @@ pub const POLYMARKET: &str = "POLYMARKET";
     result = generate_stubs.collect_module_constants(tmp_path)
 
     # Assert
-    assert "adapters.polymarket" in result
-    assert "polymarket" not in result
+    assert f"adapters.{adapter.replace('-', '_')}" in result
+    assert adapter not in result
 
 
 def test_remove_stale_top_level_adapter_stubs_deletes_generated_aliases(tmp_path: Path) -> None:
@@ -1923,11 +1924,15 @@ ADAPTER_CONFIG_SECRET_FIELDS = {
     "api_secret",
     "api_passphrase",
     "app_key",
+    "builder_api_key",
+    "builder_api_secret",
+    "builder_passphrase",
     "http_rpc_url",
     "password",
     "passphrase",
     "private_key",
     "session_key",
+    "tardis_http_url",
     "tardis_ws_url",
     "wss_rpc_url",
 }
@@ -1954,6 +1959,17 @@ ADAPTER_CONFIG_FIELD_READBACK_REPLACEMENTS = {
     ): "has_password",
 }
 ADAPTER_CONFIG_CONSTRUCTOR_ONLY_FIELDS = {
+    # Private PAPI gateway origins remain opaque alongside the credentials
+    (
+        "nautilus_trader.adapters.binance_papi",
+        "BinancePapiReadOnlyConfig",
+        "base_url",
+    ),
+    (
+        "nautilus_trader.adapters.binance_papi",
+        "BinancePapiReadOnlyConfig",
+        "websocket_url",
+    ),
     (
         "nautilus_trader.adapters.interactive_brokers",
         "InteractiveBrokersDataClientConfig",
@@ -2846,6 +2862,7 @@ def test_adapter_config_secret_values_are_not_exposed(tmp_path: Path) -> None:
         "chain": Chain(Blockchain.ARBITRUM, 42161),
         "client_id": AccountId("BLOCKCHAIN-001"),
         "dex_ids": [DexType.UNISWAP_V3],
+        "funder": "0x3333333333333333333333333333333333333333",
         "gas_buffer_bps": 100,
         "gas_limit": 1_000_000,
         "identity": provider_identity,
@@ -2856,6 +2873,15 @@ def test_adapter_config_secret_values_are_not_exposed(tmp_path: Path) -> None:
         "trader_id": TraderId("TRADER-001"),
         "wallet_address": "0x2222222222222222222222222222222222222222",
         "weth_address": "0x3333333333333333333333333333333333333333",
+    }
+
+    # PAPI validates the account issuer and alphanumeric HMAC credentials
+    constructor_overrides = {
+        ("nautilus_trader.adapters.binance_papi", "BinancePapiReadOnlyConfig"): {
+            "account_id": AccountId("BINANCE-PAPI-001"),
+            "api_key": "RawSecretPapiKey",
+            "api_secret": "RawSecretPapiSecret",
+        },
     }
     failures = []
 
@@ -2879,6 +2905,7 @@ def test_adapter_config_secret_values_are_not_exposed(tmp_path: Path) -> None:
                 continue
 
             kwargs = {name: f"raw-secret-{name}" for name in secret_parameters}
+            kwargs.update(constructor_overrides.get((module_name, stub_class.name), {}))
             for parameter in signature.parameters.values():
                 if parameter.default is not inspect.Parameter.empty or parameter.name in kwargs:
                     continue
@@ -3287,6 +3314,8 @@ def _collect_rust_config_source_blocks(config_names: object):  # noqa: C901
                 )
         for match in RUST_CONFIG_IMPL_RE.finditer(content):
             class_name = match.group(1)
+            if class_name.startswith("Py") and class_name[2:] in config_names:
+                class_name = class_name[2:]
             if class_name in config_names:
                 impl_blocks.setdefault(class_name, []).append(
                     _rust_block_after_position(content, match.start()),

@@ -2317,10 +2317,6 @@ criteria = "safe-to-deploy"
 version = "0.1.8"
 criteria = "safe-to-deploy"
 
-[[exemptions.shlex]]
-version = "2.0.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.signal-hook-registry]]
 version = "1.4.8"
 criteria = "safe-to-deploy"
@@ -2607,10 +2603,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.uint]]
 version = "0.9.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.unbounded-interval-tree]]
-version = "1.1.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.unic-emoji-char]]

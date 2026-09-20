@@ -43,8 +43,8 @@ use nautilus_common::{
 use nautilus_core::{UUID4, UnixNanos, correctness::CorrectnessResult};
 use nautilus_model::{
     data::{
-        Bar, BarType, InstrumentClose, OrderBookDelta, OrderBookDeltas, OrderBookDepth10,
-        QuoteTick, TradeTick,
+        Bar, BarType, InstrumentClose, OrderBookDelta, OrderBookDeltas, OrderBookDepth, QuoteTick,
+        TradeTick,
         order::{BookOrder, OrderId},
     },
     enums::{
@@ -66,7 +66,9 @@ use nautilus_model::{
     orders::{MarketOrder, Order, OrderAny, OrderCore},
     position::{Position, PositionReplayEvent},
     types::{
-        Currency, Money, Price, Quantity, fixed::FIXED_PRECISION, price::PriceRaw,
+        Currency, Money, Price, Quantity,
+        fixed::{FIXED_PRECISION, raw_scales_match},
+        price::PriceRaw,
         quantity::QuantityRaw,
     },
 };
@@ -1036,6 +1038,8 @@ impl OrderMatchingEngine {
 
         // Resolve pending snapshots when BBO reaches a tracked order's price
         self.resolve_pending_l1_snapshots(bid_price_raw, bid_size_raw, ask_price_raw, ask_size_raw);
+        self.cap_queue_ahead(bid_price_raw, bid_size_raw, Some(OrderSide::Buy));
+        self.cap_queue_ahead(ask_price_raw, ask_size_raw, Some(OrderSide::Sell));
     }
 
     fn adjust_l1_queue_on_price_move(
@@ -1617,7 +1621,7 @@ impl OrderMatchingEngine {
         Ok(())
     }
 
-    /// Process the venues market for the given order book depth10.
+    /// Process the venues market for the given order book depth.
     ///
     /// # Errors
     ///
@@ -1625,8 +1629,8 @@ impl OrderMatchingEngine {
     /// - If any bid/ask size precision does not match the instrument.
     /// - If applying the depth to the book fails.
     /// - If updating the L1 order book with the top-of-book quote fails.
-    pub fn process_order_book_depth10(&mut self, depth: &OrderBookDepth10) -> anyhow::Result<()> {
-        log::debug!("Processing OrderBookDepth10 for {}", depth.instrument_id);
+    pub fn process_order_book_depth(&mut self, depth: &OrderBookDepth) -> anyhow::Result<()> {
+        log::debug!("Processing OrderBookDepth for {}", depth.instrument_id);
 
         // Validate precision for non-padding entries
         for order in &depth.bids {
@@ -1667,7 +1671,7 @@ impl OrderMatchingEngine {
             self.book.apply_depth(depth)?;
         }
 
-        // Depth10 always replaces the full book via apply_depth regardless of flags
+        // Depth always replaces the full book via apply_depth regardless of flags
         if self.config.queue_position {
             self.rebase_queue_positions();
             let bid_price_raw = top_bid.map_or(0, |order| order.price.raw());
@@ -2984,7 +2988,8 @@ impl OrderMatchingEngine {
             }
 
             // Check for valid order quantity precision
-            if order.quantity().precision != self.instrument.size_precision() {
+            if !order_precision_valid(order.quantity().precision, self.instrument.size_precision())
+            {
                 break 'validate Some(
                     format!(
                         "Invalid order quantity precision for order {}, was {} when {} size precision is {}",
@@ -2999,7 +3004,7 @@ impl OrderMatchingEngine {
 
             // Check for valid order display quantity precision
             if let Some(display_qty) = order.display_qty()
-                && display_qty.precision != self.instrument.size_precision()
+                && !order_precision_valid(display_qty.precision, self.instrument.size_precision())
             {
                 break 'validate Some(
                     format!(
@@ -3015,7 +3020,7 @@ impl OrderMatchingEngine {
 
             // Check for valid order price precision
             if let Some(price) = order.price()
-                && price.precision != self.instrument.price_precision()
+                && !order_precision_valid(price.precision, self.instrument.price_precision())
             {
                 break 'validate Some(
                     format!(
@@ -3031,7 +3036,10 @@ impl OrderMatchingEngine {
 
             // Check for valid order trigger price precision
             if let Some(trigger_price) = order.trigger_price()
-                && trigger_price.precision != self.instrument.price_precision()
+                && !order_precision_valid(
+                    trigger_price.precision,
+                    self.instrument.price_precision(),
+                )
             {
                 break 'validate Some(
                     format!(
@@ -3872,28 +3880,67 @@ impl OrderMatchingEngine {
     }
 
     fn process_trailing_stop_order(&mut self, order: &mut OrderAny) {
-        if let Some(trigger_price) = order.trigger_price()
-            && self.core.is_stop_matched_with_trigger_type(
-                order.order_side(),
-                trigger_price,
-                order.trigger_type().unwrap_or(TriggerType::Default),
-            )
+        let side = order.order_side();
+        let trigger_type = order.trigger_type().unwrap_or(TriggerType::Default);
+
+        if let Some(activation_price) = order.activation_price()
+            && self.core.is_touch_triggered(side, activation_price)
+            && self.config.reject_stop_orders
         {
             self.generate_order_rejected(
-                    order,
-                    format!(
-                        "{} {} order trigger px of {} was in the market: bid={}, ask={}, but rejected because of configuration",
-                        order.order_type(),
-                        order.order_side(),
-                        trigger_price,
-                        self.core
-                            .bid
-                            .map_or_else(|| "None".to_string(), |p| p.to_string()),
-                        self.core
-                            .ask
-                            .map_or_else(|| "None".to_string(), |p| p.to_string())
-                    ).into(),
-                );
+                order,
+                format!(
+                    "{} {} order activation px of {} was in the market: bid={}, ask={}, but rejected because of configuration",
+                    order.order_type(),
+                    side,
+                    activation_price,
+                    self.core
+                        .bid
+                        .map_or_else(|| "None".to_string(), |p| p.to_string()),
+                    self.core
+                        .ask
+                        .map_or_else(|| "None".to_string(), |p| p.to_string())
+                )
+                .into(),
+            );
+            return;
+        }
+
+        let activates_now = match order.activation_price() {
+            Some(activation_price) => self.core.is_touch_triggered(side, activation_price),
+            None => self
+                .get_trailing_activation_price(
+                    trigger_type,
+                    side,
+                    self.core.bid,
+                    self.core.ask,
+                    self.core.last,
+                )
+                .is_some(),
+        };
+
+        if activates_now
+            && let Some(trigger_price) = order.trigger_price()
+            && self
+                .core
+                .is_stop_matched_with_trigger_type(side, trigger_price, trigger_type)
+        {
+            self.generate_order_rejected(
+                order,
+                format!(
+                    "{} {} order trigger px of {} was in the market: bid={}, ask={}, but rejected because of configuration",
+                    order.order_type(),
+                    side,
+                    trigger_price,
+                    self.core
+                        .bid
+                        .map_or_else(|| "None".to_string(), |p| p.to_string()),
+                    self.core
+                        .ask
+                        .map_or_else(|| "None".to_string(), |p| p.to_string())
+                )
+                .into(),
+            );
             return;
         }
 
@@ -4268,13 +4315,13 @@ impl OrderMatchingEngine {
                     self.book.simulate_fills(&book_order)
                 };
 
-                // Trade execution: use trade-driven fill when book doesn't reflect trade price
+                // L1 trade updates replace book levels, so use the per-trade budget
                 if let Some(trade_size) = self.last_trade_size
                     && let Some(trade_price) = self.core.last
                 {
                     let fills_at_trade_price = fills.iter().any(|(px, _)| *px == trade_price);
 
-                    if !fills_at_trade_price
+                    if (self.book_type == BookType::L1_MBP || !fills_at_trade_price)
                         && self.core.is_limit_matched(order.order_side(), order_price)
                     {
                         // Fill model check for MAKER at limit is already handled in fill_limit_order,
@@ -4290,10 +4337,19 @@ impl OrderMatchingEngine {
                         let fill_qty = min(leaves_qty, available_qty);
 
                         if fill_qty.non_zero() {
+                            let fill_price = if self.book_type == BookType::L1_MBP
+                                && fills_at_trade_price
+                                && order.liquidity_side() == Some(LiquiditySide::Taker)
+                            {
+                                trade_price
+                            } else {
+                                order_price
+                            };
+
                             log::debug!(
                                 "Trade execution fill: {} @ {} (trade_price={}, available: {}, book had {} fills)",
                                 fill_qty,
-                                order_price,
+                                fill_price,
                                 trade_price,
                                 available_qty,
                                 fills.len()
@@ -4303,11 +4359,13 @@ impl OrderMatchingEngine {
                                 self.trade_consumption += fill_qty.raw();
                             }
 
-                            // Fill at the limit price (conservative) rather than the trade price.
-                            // Trade execution fills already account for consumption via trade_consumption,
-                            // return early to bypass apply_liquidity_consumption which would incorrectly
-                            // discard these fills when the trade price isn't in the order book.
-                            return vec![(order_price, fill_qty)];
+                            // The trade budget already accounts for consumption, so bypass
+                            // persistent book consumption for this event's liquidity.
+                            return vec![(fill_price, fill_qty)];
+                        }
+
+                        if self.book_type == BookType::L1_MBP {
+                            return Vec::new();
                         }
                     }
                 }
@@ -5027,7 +5085,7 @@ impl OrderMatchingEngine {
                     .unwrap_or(initial_total_filled)
                     .checked_add(capped_fill_qty)
                     .expect("Overflow occurred when adding reduce-only target quantity");
-                reduce_only_target.precision = order.quantity().precision;
+                reduce_only_target.precision = self.instrument.size_precision();
 
                 if order.quantity() != reduce_only_target {
                     self.generate_order_updated(order, reduce_only_target, None, None, None);
@@ -5128,7 +5186,7 @@ impl OrderMatchingEngine {
                         .unwrap_or(initial_total_filled)
                         .checked_add(leaves_qty)
                         .expect("Overflow occurred when adding reduce-only target quantity");
-                    reduce_only_target.precision = order.quantity().precision;
+                    reduce_only_target.precision = self.instrument.size_precision();
 
                     if order.quantity() != reduce_only_target {
                         self.generate_order_updated(order, reduce_only_target, None, None, None);
@@ -6132,7 +6190,7 @@ impl OrderMatchingEngine {
         let size_prec = self.instrument.size_precision();
         let instrument_id = self.instrument.id();
 
-        if quantity.precision != size_prec {
+        if !order_precision_valid(quantity.precision, size_prec) {
             self.generate_order_modify_rejected(
                 order.trader_id(),
                 order.strategy_id(),
@@ -6149,7 +6207,7 @@ impl OrderMatchingEngine {
         }
 
         if let Some(px) = price
-            && px.precision != price_prec
+            && !order_precision_valid(px.precision, price_prec)
         {
             self.generate_order_modify_rejected(
                 order.trader_id(),
@@ -6167,7 +6225,7 @@ impl OrderMatchingEngine {
         }
 
         if let Some(tp) = trigger_price
-            && tp.precision != price_prec
+            && !order_precision_valid(tp.precision, price_prec)
         {
             self.generate_order_modify_rejected(
                 order.trader_id(),
@@ -6868,6 +6926,10 @@ enum PostMatchOrderAction {
     NoMaintenance,
 }
 
+fn order_precision_valid(actual: u8, expected: u8) -> bool {
+    actual <= expected && raw_scales_match(actual, expected)
+}
+
 fn post_match_order_action<F>(
     order: &OrderAny,
     support_gtd_orders: bool,
@@ -6990,7 +7052,7 @@ mod tests {
 
     use nautilus_common::{
         cache::Cache,
-        clock::TestClock,
+        clock::VirtualClock,
         messages::execution::{CancelAllOrders, ModifyOrder},
     };
     use nautilus_core::{UUID4, UnixNanos, correctness::CorrectnessError};
@@ -6998,8 +7060,8 @@ mod tests {
     use nautilus_model::orderbook::BookLevel;
     use nautilus_model::{
         data::{
-            Bar, BarType, DEPTH10_LEN, OrderBookDelta, OrderBookDeltas, OrderBookDepth10,
-            QuoteTick, TradeTick,
+            Bar, BarType, DEPTH10_LEN, OrderBookDelta, OrderBookDeltas, OrderBookDepth, QuoteTick,
+            TradeTick,
             option_chain::OptionGreeks,
             order::{BookOrder, OrderId},
         },
@@ -7024,7 +7086,7 @@ mod tests {
 
     use super::{
         BarTickSizes, OrderFilled, OrderMatchingEngine, Position, PositionId, PostMatchOrderAction,
-        post_match_order_action,
+        order_precision_valid, post_match_order_action,
     };
     use crate::{
         matching_engine::config::OrderMatchingEngineConfig,
@@ -7059,6 +7121,21 @@ mod tests {
                 volume.raw() - total_raw,
             );
         }
+    }
+
+    #[rstest]
+    #[case::lower(0, FIXED_PRECISION, true)]
+    #[case::equal(FIXED_PRECISION, FIXED_PRECISION, true)]
+    #[case::excess(3, 2, false)]
+    #[case::native_equal(18, 18, true)]
+    #[case::native_lower(17, 18, false)]
+    #[case::native_shared_lower(FIXED_PRECISION, 18, false)]
+    fn test_order_precision_valid(
+        #[case] actual: u8,
+        #[case] expected: u8,
+        #[case] accepted: bool,
+    ) {
+        assert_eq!(order_precision_valid(actual, expected), accepted);
     }
 
     #[rstest]
@@ -7150,7 +7227,7 @@ mod tests {
             BookType::L1_MBP,
             OmsType::Netting,
             AccountType::Margin,
-            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(VirtualClock::new())),
             cache.clone(),
             Default::default(),
         );
@@ -7189,7 +7266,7 @@ mod tests {
             BookType::L1_MBP,
             oms_type,
             AccountType::Margin,
-            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(VirtualClock::new())),
             cache.clone(),
             Default::default(),
         );
@@ -7306,7 +7383,7 @@ mod tests {
             BookType::L1_MBP,
             OmsType::Netting,
             AccountType::Cash,
-            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(VirtualClock::new())),
             cache.clone(),
             Default::default(),
         );
@@ -7369,7 +7446,7 @@ mod tests {
             BookType::L1_MBP,
             OmsType::Netting,
             AccountType::Margin,
-            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(VirtualClock::new())),
             cache.clone(),
             Default::default(),
         );
@@ -7478,7 +7555,7 @@ mod tests {
             BookType::L2_MBP,
             oms_type,
             AccountType::Margin,
-            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(VirtualClock::new())),
             cache.clone(),
             OrderMatchingEngineConfig {
                 support_contingent_orders,
@@ -7792,7 +7869,7 @@ mod tests {
             BookType::L2_MBP,
             OmsType::Hedging,
             AccountType::Margin,
-            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(VirtualClock::new())),
             cache.clone(),
             OrderMatchingEngineConfig {
                 use_reduce_only,
@@ -8017,7 +8094,7 @@ mod tests {
             BookType::L2_MBP,
             OmsType::Hedging,
             AccountType::Margin,
-            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(VirtualClock::new())),
             cache.clone(),
             OrderMatchingEngineConfig {
                 support_contingent_orders,
@@ -8328,7 +8405,7 @@ mod tests {
             BookType::L2_MBP,
             OmsType::Hedging,
             AccountType::Margin,
-            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(VirtualClock::new())),
             cache.clone(),
             Default::default(),
         );
@@ -8487,7 +8564,7 @@ mod tests {
             BookType::L2_MBP,
             OmsType::Hedging,
             AccountType::Margin,
-            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(VirtualClock::new())),
             cache.clone(),
             Default::default(),
         );
@@ -8683,7 +8760,7 @@ mod tests {
             BookType::L2_MBP,
             OmsType::Hedging,
             AccountType::Margin,
-            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(VirtualClock::new())),
             cache.clone(),
             Default::default(),
         );
@@ -8959,7 +9036,7 @@ mod tests {
             BookType::L2_MBP,
             OmsType::Hedging,
             AccountType::Margin,
-            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(VirtualClock::new())),
             cache.clone(),
             Default::default(),
         );
@@ -9149,7 +9226,7 @@ mod tests {
             BookType::L2_MBP,
             OmsType::Hedging,
             AccountType::Margin,
-            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(VirtualClock::new())),
             cache.clone(),
             Default::default(),
         );
@@ -9322,7 +9399,7 @@ mod tests {
             BookType::L2_MBP,
             OmsType::Netting,
             AccountType::Margin,
-            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(VirtualClock::new())),
             cache.clone(),
             OrderMatchingEngineConfig::default(),
         );
@@ -9419,7 +9496,7 @@ mod tests {
             BookType::L1_MBP,
             OmsType::Netting,
             AccountType::Margin,
-            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(VirtualClock::new())),
             Rc::new(RefCell::new(Cache::default())),
             OrderMatchingEngineConfig::builder()
                 .use_reduce_only(false)
@@ -9562,7 +9639,7 @@ mod tests {
     fn test_fill_order_calculates_commission_from_fill_liquidity_side() {
         let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let mut engine = OrderMatchingEngine::new(
             instrument.clone(),
             1,
@@ -9622,7 +9699,7 @@ mod tests {
     fn test_custom_fee_model_handle_is_called_by_fill_order() {
         let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let calls = Rc::new(Cell::new(0));
         let expected_commission = Money::from("1.23 USDT");
         let fee_model = FeeModelHandle::new(RecordingFeeModel {
@@ -9685,7 +9762,7 @@ mod tests {
     fn test_fill_order_does_not_cache_filled_qty_when_fee_model_fails() {
         let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let mut engine = OrderMatchingEngine::new(
             instrument.clone(),
             1,
@@ -9733,7 +9810,7 @@ mod tests {
         let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
         let instrument_id = instrument.id();
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let mut engine = OrderMatchingEngine::new(
             instrument,
             1,
@@ -9836,7 +9913,7 @@ mod tests {
         let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
         let instrument_id = instrument.id();
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let mut engine = OrderMatchingEngine::new(
             instrument,
             1,
@@ -9930,7 +10007,7 @@ mod tests {
         let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
         let instrument_id = instrument.id();
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let mut engine = OrderMatchingEngine::new(
             instrument,
             1,
@@ -10038,7 +10115,7 @@ mod tests {
             BookType::L1_MBP,
             OmsType::Netting,
             AccountType::Margin,
-            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(VirtualClock::new())),
             Rc::clone(&cache),
             Default::default(),
         );
@@ -10138,7 +10215,7 @@ mod tests {
     fn test_custom_fill_model_handle_is_called_by_market_fill() {
         let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let calls = Rc::new(Cell::new(0));
         let fill_model = FillModelHandle::new(RecordingFillModel {
             calls: Rc::clone(&calls),
@@ -10178,10 +10255,10 @@ mod tests {
     }
 
     #[rstest]
-    fn test_l1_depth10_skips_padding_for_last_quote_tracking() {
+    fn test_l1_depth_skips_padding_for_last_quote_tracking() {
         let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let mut engine = OrderMatchingEngine::new(
             instrument.clone(),
             1,
@@ -10209,7 +10286,7 @@ mod tests {
             2,
         );
 
-        let depth = OrderBookDepth10::new(
+        let depth = OrderBookDepth::new(
             instrument.id(),
             bids,
             asks,
@@ -10220,12 +10297,12 @@ mod tests {
             UnixNanos::from(1_u64),
             UnixNanos::from(1_u64),
         );
-        engine.process_order_book_depth10(&depth).unwrap();
+        engine.process_order_book_depth(&depth).unwrap();
 
         assert_eq!(engine.last_quote_bid, Some(Price::from("1499.00")));
         assert_eq!(engine.last_quote_ask, Some(Price::from("1500.00")));
 
-        let depth_without_bid = OrderBookDepth10::new(
+        let depth_without_bid = OrderBookDepth::new(
             instrument.id(),
             [BookOrder::default(); DEPTH10_LEN],
             asks,
@@ -10236,9 +10313,7 @@ mod tests {
             UnixNanos::from(2_u64),
             UnixNanos::from(2_u64),
         );
-        engine
-            .process_order_book_depth10(&depth_without_bid)
-            .unwrap();
+        engine.process_order_book_depth(&depth_without_bid).unwrap();
 
         assert_eq!(engine.last_quote_bid, None);
         assert_eq!(engine.last_quote_ask, Some(Price::from("1500.00")));
@@ -10283,7 +10358,7 @@ mod tests {
             underlying_price: Some(50_000.0),
             ..Default::default()
         });
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let engine = OrderMatchingEngine::new(
             instrument,
             1,
@@ -10320,7 +10395,7 @@ mod tests {
             underlying_price: Some(f64::NAN),
             ..Default::default()
         });
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let engine = OrderMatchingEngine::new(
             instrument,
             1,
@@ -10445,7 +10520,7 @@ mod tests {
         instrument: InstrumentAny,
         book_type: BookType,
     ) -> (OrderMatchingEngine, Rc<RefCell<Cache>>) {
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::default()));
         let config = OrderMatchingEngineConfig {
             trade_execution: true,
@@ -10768,7 +10843,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_depth10_rebases_l2_queue_position() {
+    fn test_depth_rebases_l2_queue_position() {
         let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
         let instrument_id = instrument.id();
         let (mut engine, _cache) = get_queue_engine(instrument, BookType::L2_MBP);
@@ -10780,7 +10855,7 @@ mod tests {
             Quantity::from("10.000"),
             0,
         );
-        let initial = OrderBookDepth10::new(
+        let initial = OrderBookDepth::new(
             instrument_id,
             [BookOrder::default(); DEPTH10_LEN],
             asks,
@@ -10791,9 +10866,9 @@ mod tests {
             UnixNanos::from(1_u64),
             UnixNanos::from(1_u64),
         );
-        engine.process_order_book_depth10(&initial).unwrap();
+        engine.process_order_book_depth(&initial).unwrap();
 
-        let client_order_id = ClientOrderId::from("O-DEPTH10-REBASE");
+        let client_order_id = ClientOrderId::from("O-DEPTH-REBASE");
         let mut order = OrderTestBuilder::new(OrderType::Limit)
             .instrument_id(instrument_id)
             .side(OrderSide::Sell)
@@ -10810,7 +10885,7 @@ mod tests {
             Quantity::from("8.000"),
             0,
         );
-        let replacement = OrderBookDepth10::new(
+        let replacement = OrderBookDepth::new(
             instrument_id,
             [BookOrder::default(); DEPTH10_LEN],
             asks,
@@ -10821,7 +10896,7 @@ mod tests {
             UnixNanos::from(2_u64),
             UnixNanos::from(2_u64),
         );
-        engine.process_order_book_depth10(&replacement).unwrap();
+        engine.process_order_book_depth(&replacement).unwrap();
 
         assert_eq!(
             engine.queue_ahead_total.get(&client_order_id),

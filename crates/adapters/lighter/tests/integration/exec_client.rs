@@ -118,7 +118,7 @@ const TEST_ACCOUNT_INDEX: u64 = 12_345;
 const TEST_API_KEY_INDEX: u8 = 5;
 const ETH_PERP_SYMBOL: &str = "ETH-PERP";
 const ETH_SPOT_SYMBOL: &str = "ETH/USDC-SPOT";
-const TEST_MARKET_INDEX: i16 = 0;
+const TEST_MARKET_INDEX: i64 = 0;
 const TEST_NEXT_NONCE: i64 = 9_999;
 const TEST_ORDER_NONCE: i64 = 281_474_720_725_346;
 const INTEGRATOR_APPROVAL_MAX_TTL_MS: i64 = 5 * 365 * 24 * 60 * 60 * 1_000;
@@ -838,6 +838,7 @@ fn build_config(addr: SocketAddr) -> LighterExecutionClientConfig {
         rest_quota_per_min: None,
         sendtx_quota_per_min: None,
         transport_backend: Default::default(),
+        use_gtd: true,
     }
 }
 

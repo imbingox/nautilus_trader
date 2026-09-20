@@ -24,13 +24,17 @@ use nautilus_core::{
         to_pyvalue_err,
     },
 };
-use pyo3::{basic::CompareOp, prelude::*, types::PyDict};
+use pyo3::{
+    basic::CompareOp,
+    prelude::*,
+    types::{PyDict, PyList},
+};
 
 use crate::{
     enums::AccountType,
     events::AccountState,
     identifiers::AccountId,
-    types::{AccountBalance, Currency, MarginBalance},
+    types::{AccountBalance, Currency, MarginBalance, Money},
 };
 
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -44,7 +48,7 @@ impl AccountState {
     /// context that accompanied a given snapshot.
     #[expect(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature = (account_id, account_type, balances, margins, is_reported, event_id, ts_event, ts_init, base_currency=None, info=None))]
+    #[pyo3(signature = (account_id, account_type, balances, margins, is_reported, event_id, ts_event, ts_init, base_currency=None, info=None, total_only_balances=Vec::new()))]
     fn py_new(
         account_id: AccountId,
         account_type: AccountType,
@@ -56,12 +60,13 @@ impl AccountState {
         ts_init: u64,
         base_currency: Option<Currency>,
         info: Option<pyo3::Py<PyDict>>,
+        total_only_balances: Vec<Money>,
     ) -> PyResult<Self> {
         let info_params = info
             .map(|dict| Python::attach(|py| nautilus_core::from_pydict(py, &dict)))
             .transpose()?
             .flatten();
-        Ok(Self::new(
+        Self::new(
             account_id,
             account_type,
             balances,
@@ -72,7 +77,9 @@ impl AccountState {
             ts_init.into(),
             base_currency,
         )
-        .with_info(info_params))
+        .with_info(info_params)
+        .with_total_only_balances(total_only_balances)
+        .map_err(to_pyvalue_err)
     }
 
     #[getter]
@@ -93,6 +100,11 @@ impl AccountState {
     #[getter]
     fn balances(&self) -> Vec<AccountBalance> {
         self.balances.clone()
+    }
+
+    #[getter]
+    fn total_only_balances(&self) -> Vec<Money> {
+        self.total_only_balances.clone()
     }
 
     #[getter]
@@ -177,6 +189,17 @@ impl AccountState {
             })
             .collect::<PyResult<Vec<AccountBalance>>>()?;
         let margins_list = get_required_list(values, "margins")?;
+        let total_only_balances = match values.get_item("total_only_balances")? {
+            Some(item) => item
+                .cast::<PyList>()?
+                .iter()
+                .map(|item| {
+                    let value = item.extract::<String>()?;
+                    Money::from_str(&value).map_err(to_pyvalue_err)
+                })
+                .collect::<PyResult<Vec<_>>>()?,
+            None => Vec::new(),
+        };
         let margins: Vec<MarginBalance> = margins_list
             .iter()
             .map(|m| {
@@ -212,7 +235,9 @@ impl AccountState {
             ts_init.into(),
             base_currency,
         )
-        .with_info(info);
+        .with_info(info)
+        .with_total_only_balances(total_only_balances)
+        .map_err(to_pyvalue_err)?;
         Ok(account)
     }
 
@@ -233,6 +258,13 @@ impl AccountState {
         let margins_dict: PyResult<Vec<_>> =
             self.margins.iter().map(|m| m.py_to_dict(py)).collect();
         dict.set_item("balances", balances_dict?)?;
+        dict.set_item(
+            "total_only_balances",
+            self.total_only_balances
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        )?;
         dict.set_item("margins", margins_dict?)?;
         dict.set_item("reported", self.is_reported)?;
         dict.set_item("event_id", self.event_id.to_string())?;

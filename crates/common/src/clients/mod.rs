@@ -18,13 +18,17 @@
 //! Provides the core trait interfaces that define how clients interact with
 //! data providers and execution venues.
 
+pub mod capital;
+
 mod data;
 mod execution;
 
 use std::fmt::{Debug, Display};
 
 pub use data::DataClient;
-pub use execution::{DEFAULT_POSITION_RECONCILIATION_TOLERANCE, ExecutionClient};
+pub use execution::{
+    DEFAULT_POSITION_RECONCILIATION_TOLERANCE, ExecutionClient, generate_mass_status,
+};
 
 #[inline(always)]
 fn log_not_implemented<T: Debug>(cmd: &T) {

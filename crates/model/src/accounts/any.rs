@@ -86,7 +86,16 @@ impl AccountAny {
     }
 
     /// Sets whether account state should be recalculated from order fills.
+    ///
+    /// # Panics
+    ///
+    /// Panics if local calculation is enabled while totals-only balances are present.
     pub fn set_calculate_account_state(&mut self, calculate_account_state: bool) {
+        assert!(
+            !calculate_account_state || self.total_only_balances().is_empty(),
+            "Totals-only balances require local account-state calculation to be disabled"
+        );
+
         match self {
             Self::Margin(margin) => margin.base.calculate_account_state = calculate_account_state,
             Self::Cash(cash) => cash.base.calculate_account_state = calculate_account_state,
@@ -102,6 +111,12 @@ impl AccountAny {
     #[must_use]
     pub fn balances(&self) -> IndexMap<Currency, AccountBalance> {
         Account::balances(self)
+    }
+
+    /// Returns reported totals with unavailable free and locked components.
+    #[must_use]
+    pub fn total_only_balances(&self) -> IndexMap<Currency, Money> {
+        Account::total_only_balances(self)
     }
 
     #[must_use]
@@ -175,16 +190,21 @@ impl AccountAny {
     ///
     /// # Errors
     ///
-    /// Returns an error if a wallet account state is invalid.
+    /// Returns an error if the account balance representations are invalid or unsupported.
     pub fn try_from_state(event: AccountState) -> Result<Self, &'static str> {
-        Self::from_state_checked(event).map_err(|_| "Invalid wallet account state")
+        let message = if event.account_type == AccountType::Wallet {
+            "Invalid wallet account state"
+        } else {
+            "Invalid account state"
+        };
+        Self::from_state_checked(event).map_err(|_| message)
     }
 
     fn from_state_checked(event: AccountState) -> CorrectnessResult<Self> {
         match event.account_type {
-            AccountType::Margin => Ok(Self::Margin(MarginAccount::new(event, false))),
-            AccountType::Cash => Ok(Self::Cash(CashAccount::new(event, false, false))),
-            AccountType::Betting => Ok(Self::Betting(BettingAccount::new(event, false))),
+            AccountType::Margin => Ok(Self::Margin(MarginAccount::new_checked(event, false)?)),
+            AccountType::Cash => Ok(Self::Cash(CashAccount::new_checked(event, false, false)?)),
+            AccountType::Betting => Ok(Self::Betting(BettingAccount::new_checked(event, false)?)),
             AccountType::Wallet => Ok(Self::Wallet(WalletAccount::new_checked(event, false)?)),
         }
     }
@@ -195,7 +215,7 @@ impl From<AccountState> for AccountAny {
     ///
     /// # Panics
     ///
-    /// Panics if a wallet account state is invalid.
+    /// Panics if account balance representations are invalid or unsupported.
     /// Use [`AccountAny::try_from_state`] for fallible conversion.
     fn from(event: AccountState) -> Self {
         Self::from_state_checked(event).expect_display(FAILED)
@@ -218,6 +238,7 @@ mod tests {
             Account, AccountAny,
             margin_model::{MarginModel, MarginModelAny, StandardMarginModel},
         },
+        enums::AccountType,
         events::{AccountState, account::stubs::*},
         identifiers::{AccountId, InstrumentId},
         types::Money,
@@ -232,6 +253,39 @@ mod tests {
             result.unwrap_err().to_string(),
             "No account events provided to create `AccountAny`"
         );
+    }
+
+    #[rstest]
+    #[case(AccountType::Cash)]
+    #[case(AccountType::Betting)]
+    #[case(AccountType::Wallet)]
+    fn test_totals_only_rejects_unsupported_account_types(#[case] account_type: AccountType) {
+        let mut initial = margin_account_state();
+        initial.balances.clear();
+        initial.margins.clear();
+        initial.base_currency = None;
+        initial.account_type = account_type;
+        let mut account = AccountAny::try_from_state(initial.clone()).unwrap();
+        let before = serde_json::to_value(&account).unwrap();
+        initial.total_only_balances = vec![Money::from("19.23 USD")];
+
+        assert!(AccountAny::try_from_state(initial.clone()).is_err());
+        assert!(account.apply(initial).is_err());
+        assert_eq!(serde_json::to_value(&account).unwrap(), before);
+    }
+
+    #[rstest]
+    #[should_panic(
+        expected = "Totals-only balances require local account-state calculation to be disabled"
+    )]
+    fn test_totals_only_rejects_enabling_local_calculation() {
+        let mut state = margin_account_state();
+        state.balances.clear();
+        let state = state
+            .with_total_only_balances(vec![Money::from("19.23 USD")])
+            .unwrap();
+        let mut account = AccountAny::try_from_state(state).unwrap();
+        account.set_calculate_account_state(true);
     }
 
     #[rstest]
@@ -273,6 +327,33 @@ mod tests {
         );
         assert_eq!(account.event_count(), 1);
         assert_eq!(account.balances(), balances_before);
+    }
+
+    #[rstest]
+    fn test_delegated_state_accessors(cash_account_state: AccountState) {
+        let balance = cash_account_state.balances[0];
+        let account = AccountAny::try_from_state(cash_account_state.clone()).unwrap();
+
+        assert_eq!(account.last_event(), Some(cash_account_state.clone()));
+        assert_eq!(account.events(), vec![cash_account_state.clone()]);
+        assert_eq!(account.base_currency(), cash_account_state.base_currency);
+        assert_eq!(
+            account.balances_locked().get(&balance.currency),
+            Some(&balance.locked)
+        );
+        assert_eq!(account.balances().get(&balance.currency), Some(&balance));
+    }
+
+    #[rstest]
+    fn test_equality_compares_account_ids(cash_account_state: AccountState) {
+        let account = AccountAny::try_from_state(cash_account_state.clone()).unwrap();
+        let same = AccountAny::try_from_state(cash_account_state.clone()).unwrap();
+        let mut other_state = cash_account_state;
+        other_state.account_id = AccountId::from("OTHER-001");
+        let other = AccountAny::try_from_state(other_state).unwrap();
+
+        assert_eq!(account, same);
+        assert_ne!(account, other);
     }
 
     #[rstest]

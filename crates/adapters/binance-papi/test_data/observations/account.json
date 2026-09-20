@@ -1,0 +1,13 @@
+{
+  "uniMMR": "51.12345678",
+  "accountEquity": "1234.12345678",
+  "actualEquity": "2234.12345678",
+  "accountInitialMargin": "10.12345678",
+  "accountMaintMargin": "5.12345678",
+  "accountStatus": "FUTURE_STATUS",
+  "virtualMaxWithdrawAmount": "500.12345678",
+  "totalAvailableBalance": "",
+  "totalMarginOpenLoss": null,
+  "updateTime": 1617939110373,
+  "futureField": "retained"
+}

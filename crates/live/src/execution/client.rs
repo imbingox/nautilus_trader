@@ -26,11 +26,15 @@ use std::{cell::RefCell, collections::VecDeque, fmt::Debug, rc::Rc};
 
 use async_trait::async_trait;
 use nautilus_common::{
-    clients::ExecutionClient,
-    messages::execution::{
-        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-        GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
-        ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+    clients::{ExecutionClient, capital::NativeCapitalCheck},
+    messages::{
+        ExecutionReport,
+        execution::{
+            BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder,
+            GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
+            GeneratePositionStatusReports, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
+            SubmitOrderList,
+        },
     },
 };
 use nautilus_core::{Params, UnixNanos};
@@ -123,6 +127,7 @@ impl LiveExecutionClient {
                 .generate_order_status_reports(cmd)
                 .await
         };
+
         self.flush_pending_instruments();
         result
     }
@@ -154,6 +159,7 @@ impl LiveExecutionClient {
                 .generate_position_status_reports(cmd)
                 .await
         };
+
         self.flush_pending_instruments();
         result
     }
@@ -169,6 +175,7 @@ impl LiveExecutionClient {
         while let Some(instrument) = pending.pop_front() {
             client.on_instrument(instrument);
         }
+
         log::debug!("Flushed {count} deferred execution client instrument update(s)");
     }
 }
@@ -197,6 +204,14 @@ impl ExecutionClient for LiveExecutionClient {
 
     fn get_account(&self) -> Option<AccountAny> {
         self.client.borrow().get_account()
+    }
+
+    fn native_capital_check(&self) -> Option<NativeCapitalCheck> {
+        self.client.borrow().native_capital_check()
+    }
+
+    fn on_execution_report_applied(&self, report: &ExecutionReport) {
+        self.client.borrow().on_execution_report_applied(report);
     }
 
     fn position_reconciliation_tolerance(&self) -> Decimal {

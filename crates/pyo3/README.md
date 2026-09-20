@@ -28,6 +28,7 @@ This crate provides feature flags to control source code inclusion during compil
 - `high-precision`: Uses 128-bit value types throughout the workspace.
 - `hypersync`: Enables [`hypersync-client`](https://crates.io/crates/hypersync-client) support for the blockchain adapter.
 - `mimalloc`: Sets [mimalloc](https://crates.io/crates/mimalloc) as Rust's global allocator.
+- `papi` (default): Enables the Binance Portfolio Margin construction skeleton and Python bindings.
 - `postgres`: Enables PostgreSQL (sqlx) back-ends in dependent crates.
 - `redis`: Enables Redis based infrastructure in dependent crates.
 - `tracing-bridge`: Enables the `tracing` subscriber bridge for log integration.

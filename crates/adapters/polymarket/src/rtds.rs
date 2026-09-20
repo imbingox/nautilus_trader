@@ -27,7 +27,7 @@ use ahash::AHashMap;
 use anyhow::Context;
 #[cfg(test)]
 use nautilus_common::live::get_runtime;
-use nautilus_common::messages::DataEvent;
+use nautilus_common::{live::sender::EventSender, messages::DataEvent};
 use nautilus_core::{UnixNanos, time::AtomicTime};
 use nautilus_live::{
     SocketControl,
@@ -39,6 +39,7 @@ use nautilus_model::{
 };
 use nautilus_network::{
     RECONNECTED, SocketStateSink,
+    http::create_standard_nautilus_headers,
     websocket::{
         TransportBackend, WebSocketClient, WebSocketConfig, channel_message_handler,
         proxy::ProxyUrl,
@@ -150,7 +151,7 @@ struct PolymarketRtdsFeedInner {
     proxy_url: Option<ProxyUrl>,
     transport_backend: TransportBackend,
     clock: &'static AtomicTime,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: EventSender<DataEvent>,
     socket_sink: Option<SocketStateSink>,
     socket_control: Option<SocketControl>,
     subscriptions: dashmap::DashMap<String, TrackedSubscription>,
@@ -350,7 +351,7 @@ impl PolymarketRtdsFeed {
         url: String,
         transport_backend: TransportBackend,
         clock: &'static AtomicTime,
-        data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data_sender: EventSender<DataEvent>,
     ) -> Self {
         Self::new_with_proxy(url, transport_backend, clock, data_sender, None)
     }
@@ -360,7 +361,7 @@ impl PolymarketRtdsFeed {
         url: String,
         transport_backend: TransportBackend,
         clock: &'static AtomicTime,
-        data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data_sender: EventSender<DataEvent>,
         proxy_url: Option<ProxyUrl>,
     ) -> Self {
         Self::new_with_proxy_and_state_sink(
@@ -378,7 +379,7 @@ impl PolymarketRtdsFeed {
         url: String,
         transport_backend: TransportBackend,
         clock: &'static AtomicTime,
-        data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data_sender: EventSender<DataEvent>,
         proxy_url: Option<ProxyUrl>,
         state_sink: Option<SocketStateSink>,
     ) -> Self {
@@ -397,7 +398,7 @@ impl PolymarketRtdsFeed {
         url: String,
         transport_backend: TransportBackend,
         clock: &'static AtomicTime,
-        data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data_sender: EventSender<DataEvent>,
         proxy_url: Option<ProxyUrl>,
         socket_control: Option<SocketControl>,
     ) -> Self {
@@ -416,7 +417,7 @@ impl PolymarketRtdsFeed {
         url: String,
         transport_backend: TransportBackend,
         clock: &'static AtomicTime,
-        data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data_sender: EventSender<DataEvent>,
         proxy_url: Option<ProxyUrl>,
         socket_sink: Option<SocketStateSink>,
         socket_control: Option<SocketControl>,
@@ -985,9 +986,11 @@ impl PolymarketRtdsFeed {
     }
 
     fn websocket_config(&self) -> WebSocketConfig {
+        let headers = create_standard_nautilus_headers();
+
         WebSocketConfig {
             url: self.inner.url.clone(),
-            headers: vec![],
+            headers,
             heartbeat_interval_secs: Some(POLYMARKET_RTDS_HEARTBEAT_SECS),
             heartbeat_payload: Some("PING".to_string()),
             connect_timeout_ms: Some(POLYMARKET_RTDS_RECONNECT_TIMEOUT_MS),
@@ -1759,7 +1762,7 @@ mod tests {
             "ws://localhost/rtds".to_string(),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
         (feed, rx)
     }
@@ -1899,7 +1902,7 @@ mod tests {
             "ws://rtds.example/ws".to_string(),
             TransportBackend::Tungstenite,
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
             Some(ProxyUrl::parse(PROXY_URL).unwrap()),
         );
         let config = feed.websocket_config();
@@ -1907,7 +1910,6 @@ mod tests {
 
         assert_eq!(feed.proxy_url().unwrap().expose(), PROXY_URL);
         assert_eq!(config.url, "ws://rtds.example/ws");
-        assert_eq!(config.headers, Vec::<(String, String)>::new());
         assert_eq!(
             config.heartbeat_interval_secs,
             Some(POLYMARKET_RTDS_HEARTBEAT_SECS)
@@ -2108,7 +2110,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            data_tx,
+            data_tx.into(),
             None,
             Some(socket_factory.control(crate::websocket::RTDS_STREAMS_ENDPOINT)),
         );
@@ -2165,7 +2167,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            data_tx,
+            data_tx.into(),
             None,
             Some(state_sink),
         );
@@ -2825,7 +2827,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            data_tx,
+            data_tx.into(),
         );
         let data_type = crypto_twap_data_type("BTC/USD", 60);
         feed.track_subscribe(data_type)
@@ -3580,7 +3582,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         feed.track_subscribe(crypto_data_type("BTCUSDT"))
@@ -3622,7 +3624,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         feed.track_subscribe(equity_data_type("AAPL"))
@@ -3664,7 +3666,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         let btc = crypto_data_type("BTCUSDT");
@@ -3704,7 +3706,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         let aapl = equity_data_type("AAPL");
@@ -3744,7 +3746,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         let btc = crypto_data_type("BTCUSDT");
@@ -3793,7 +3795,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         let aapl = equity_data_type("AAPL");
@@ -3846,7 +3848,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         feed.track_subscribe(crypto_data_type("BTCUSDT"))
@@ -3905,7 +3907,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         feed.track_subscribe(crypto_data_type("BTCUSDT"))
@@ -3993,7 +3995,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         feed.track_subscribe(crypto_data_type("BTCUSDT"))
@@ -4046,7 +4048,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         feed.track_subscribe(crypto_data_type("BTCUSDT"))
@@ -4143,7 +4145,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         let btc = crypto_data_type("BTCUSDT");
@@ -4225,7 +4227,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         feed.track_subscribe(crypto_data_type("BTCUSDT"))
@@ -4255,7 +4257,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         feed.disconnect().await.expect("disconnect feed");
@@ -4295,7 +4297,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         feed.request_reconcile(ReconcileReason::EnsureConnected);
@@ -4321,7 +4323,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         feed.track_subscribe(crypto_data_type("BTCUSDT"))
@@ -4504,7 +4506,7 @@ mod tests {
             format!("ws://{addr}/rtds"),
             TransportBackend::default(),
             get_atomic_clock_realtime(),
-            tx,
+            tx.into(),
         );
 
         feed.track_subscribe(crypto_data_type("BTCUSDT"))

@@ -32,7 +32,7 @@ use super::{
     BusMessage, BusPayloadType, HAS_EXTERNAL_EGRESS, SUPPRESS_EXTERNAL_DEPTH,
     SuppressExternalGuard,
     api::{
-        publish_account_state, publish_any, publish_bar, publish_deltas, publish_depth10,
+        publish_account_state, publish_any, publish_bar, publish_deltas, publish_depth,
         publish_funding_rate, publish_index_price, publish_instrument, publish_mark_price,
         publish_option_greeks, publish_order_event, publish_portfolio_snapshot,
         publish_position_event, publish_quote, publish_trade,
@@ -217,12 +217,12 @@ pub fn republish_external_message(message: &BusMessage) -> anyhow::Result<()> {
             codec::deserialize_order_book_deltas,
             publish_deltas,
         )?,
-        BusPayloadType::OrderBookDepth10 => handle_market_data(
+        BusPayloadType::OrderBookDepth => handle_market_data(
             topic,
             message.encoding,
             &message.payload,
-            codec::deserialize_order_book_depth10,
-            publish_depth10,
+            codec::deserialize_order_book_depth,
+            publish_depth,
         )?,
         BusPayloadType::QuoteTick => handle_market_data(
             topic,
@@ -380,33 +380,19 @@ pub fn process_external_typed_message(
         MStr::<Topic>::topic_from_ustr(message.topic).context("invalid external message topic")?;
     let _guard = SuppressExternalGuard::new();
 
-    match message.payload_type {
-        BusPayloadType::SubscribeCommand => {
-            process_typed_payload::<SubscribeCommand>(topic, message, processor)
-        }
-        BusPayloadType::UnsubscribeCommand => {
-            process_typed_payload::<UnsubscribeCommand>(topic, message, processor)
-        }
-        BusPayloadType::TradingCommand => {
-            process_typed_payload::<TradingCommand>(topic, message, processor)
-        }
-        BusPayloadType::GenerateExecutionMassStatus => {
-            process_typed_payload::<GenerateExecutionMassStatus>(topic, message, processor)
-        }
-        BusPayloadType::OrderStatusReport => {
-            process_typed_payload::<OrderStatusReport>(topic, message, processor)
-        }
-        BusPayloadType::FillReport => {
-            process_typed_payload::<FillReport>(topic, message, processor)
-        }
-        BusPayloadType::PositionStatusReport => {
-            process_typed_payload::<PositionStatusReport>(topic, message, processor)
-        }
-        BusPayloadType::ExecutionMassStatus => {
-            process_typed_payload::<ExecutionMassStatus>(topic, message, processor)
-        }
+    #[rustfmt::skip]
+    let result = match message.payload_type {
+        BusPayloadType::SubscribeCommand => process_typed_payload::<SubscribeCommand>(topic, message, processor),
+        BusPayloadType::UnsubscribeCommand => process_typed_payload::<UnsubscribeCommand>(topic, message, processor),
+        BusPayloadType::TradingCommand => process_typed_payload::<TradingCommand>(topic, message, processor),
+        BusPayloadType::GenerateExecutionMassStatus => process_typed_payload::<GenerateExecutionMassStatus>(topic, message, processor),
+        BusPayloadType::OrderStatusReport => process_typed_payload::<OrderStatusReport>(topic, message, processor),
+        BusPayloadType::FillReport => process_typed_payload::<FillReport>(topic, message, processor),
+        BusPayloadType::PositionStatusReport => process_typed_payload::<PositionStatusReport>(topic, message, processor),
+        BusPayloadType::ExecutionMassStatus => process_typed_payload::<ExecutionMassStatus>(topic, message, processor),
         _ => republish_external_message(message),
-    }
+    };
+    result
 }
 
 fn handle_json_msgpack_any<T>(topic: MStr<Topic>, message: &BusMessage) -> anyhow::Result<()>

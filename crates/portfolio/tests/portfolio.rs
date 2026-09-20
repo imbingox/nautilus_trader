@@ -18,7 +18,7 @@ use std::{cell::RefCell, rc::Rc, sync::Arc};
 use nautilus_analysis::{Returns, analyzer::Statistic, statistic::PortfolioStatistic};
 use nautilus_common::{
     cache::Cache,
-    clock::{Clock, TestClock},
+    clock::{Clock, VirtualClock},
     msgbus::{self, MessageBus, MessagingSwitchboard, TypedHandler},
 };
 use nautilus_core::{DurationNanos, UUID4, UnixNanos, approx_eq, datetime::NANOSECONDS_IN_DAY};
@@ -71,8 +71,8 @@ fn simple_cache() -> Cache {
 }
 
 #[fixture]
-fn clock() -> TestClock {
-    TestClock::new()
+fn clock() -> VirtualClock {
+    VirtualClock::new()
 }
 
 #[fixture]
@@ -170,7 +170,7 @@ fn usd_usdt_future(quote_currency: Currency) -> InstrumentAny {
 #[fixture]
 fn portfolio(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
     instrument_gbpusd: InstrumentAny,
     instrument_btcusdt: InstrumentAny,
@@ -480,6 +480,68 @@ fn test_account_when_account_returns_the_account_facade(mut portfolio: Portfolio
 }
 
 #[rstest]
+fn test_totals_only_account_updates_through_portfolio_and_cache(mut portfolio: Portfolio) {
+    let account_id = AccountId::from("BINANCE-PAPI-001");
+    let usd = Currency::USD();
+    let total = Money::from("-19.23 USD");
+    let mut state = get_margin_account(Some(account_id.as_str()));
+    state.balances.clear();
+    state.margins.clear();
+    state.base_currency = None;
+    let state = state.with_total_only_balances(vec![total]).unwrap();
+    portfolio.update_account(&state);
+
+    {
+        let cache = portfolio.cache().borrow();
+        let account = cache.account(&account_id).unwrap();
+        assert_eq!(account.balance_total(Some(usd)), Some(total));
+        assert_eq!(account.balance_free(Some(usd)), None);
+        assert_eq!(account.starting_balances(), IndexMap::from([(usd, total)]));
+        assert!(!account.calculated_account_state());
+    }
+
+    let mut complete = state.clone();
+    complete.event_id = UUID4::new();
+    complete.total_only_balances.clear();
+    complete.balances = vec![AccountBalance::new(total, Money::zero(usd), total)];
+    portfolio.update_account(&complete);
+
+    {
+        let cache = portfolio.cache().borrow();
+        let account = cache.account(&account_id).unwrap();
+        assert_eq!(account.balance_free(Some(usd)), Some(total));
+        assert!(account.total_only_balances().is_empty());
+        assert_eq!(account.event_count(), 2);
+    }
+
+    let mut state = state;
+    state.event_id = UUID4::new();
+    portfolio.update_account(&state);
+    let before = portfolio
+        .cache()
+        .borrow()
+        .account_owned(&account_id)
+        .unwrap();
+    let mut invalid = state;
+    invalid.event_id = UUID4::new();
+    invalid.total_only_balances.push(total);
+    portfolio.update_account(&invalid);
+    let after = portfolio
+        .cache()
+        .borrow()
+        .account_owned(&account_id)
+        .unwrap();
+
+    assert_eq!(after.balance_total(Some(usd)), Some(total));
+    assert_eq!(after.balance_free(Some(usd)), None);
+    assert_eq!(after.event_count(), 3);
+    assert_eq!(after.balances_total(), before.balances_total());
+    assert_eq!(after.balances(), before.balances());
+    assert_eq!(after.total_only_balances(), before.total_only_balances());
+    assert_eq!(after.events(), before.events());
+}
+
+#[rstest]
 fn test_balances_locked_when_no_account_for_venue_returns_none(portfolio: Portfolio, venue: Venue) {
     let result = portfolio.balances_locked(&venue);
     assert_eq!(result, IndexMap::new());
@@ -542,7 +604,7 @@ fn test_realized_pnl_for_venue_when_no_account_returns_empty_dict(
 #[rstest]
 fn test_pnl_resolves_account_via_position_when_venue_mismatches(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
 ) {
     // Broker-routed instrument: account registered under broker venue `IB`
     // while the instrument carries the exchange MIC `IBIS`.
@@ -605,7 +667,7 @@ fn test_pnl_resolves_account_via_position_when_venue_mismatches(
 #[rstest]
 fn test_initialize_positions_splits_margin_by_account_when_broker_routed(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
 ) {
     let account_a = AccountId::new("IB-DUN433229");
     let account_b = AccountId::new("IB-DUN558814");
@@ -669,7 +731,7 @@ fn test_initialize_positions_splits_margin_by_account_when_broker_routed(
 #[rstest]
 fn test_initialize_orders_splits_initial_margin_by_account_when_broker_routed(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
 ) {
     let account_a = AccountId::new("IB-DUN433229");
     let account_b = AccountId::new("IB-DUN558814");
@@ -757,7 +819,7 @@ fn test_initialize_orders_splits_initial_margin_by_account_when_broker_routed(
 #[rstest]
 fn test_wallet_submitted_market_sell_reserves_and_rebuilds_with_calculation_disabled(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     let account_id = AccountId::new("WALLET-001");
@@ -867,7 +929,7 @@ fn test_wallet_submitted_market_sell_reserves_and_rebuilds_with_calculation_disa
 #[rstest]
 fn test_initialize_wallet_orders_fails_when_debit_balance_is_missing(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     let account_id = AccountId::new("WALLET-001");
@@ -984,7 +1046,7 @@ fn ordering_portfolio(reversed: bool) -> (Portfolio, AccountId, Vec<InstrumentAn
     }
 
     let mut portfolio = Portfolio::new(
-        Rc::new(RefCell::new(TestClock::new())),
+        Rc::new(RefCell::new(VirtualClock::new())),
         Rc::new(RefCell::new(cache)),
         None,
     );
@@ -1128,7 +1190,7 @@ fn test_initialization_recalculates_margins_in_instrument_id_order(
 #[rstest]
 fn test_pending_tick_recovery_preserves_account_margins_when_broker_routed(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
 ) {
     let account_a = AccountId::new("IB-DUN433229");
     let account_b = AccountId::new("IB-DUN558814");
@@ -1262,7 +1324,7 @@ fn test_pending_tick_recovery_preserves_account_margins_when_broker_routed(
 #[rstest]
 fn test_order_fill_resolves_pnl_before_position_cached_when_broker_routed(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
 ) {
     *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
 
@@ -1314,7 +1376,7 @@ fn test_order_fill_resolves_pnl_before_position_cached_when_broker_routed(
 #[rstest]
 fn test_equity_resolves_when_broker_routed_position_is_flat(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
 ) {
     let account_id = AccountId::new("IB-DUN433229");
     let instrument = InstrumentAny::CurrencyPair(default_fx_ccy(
@@ -1448,7 +1510,7 @@ fn test_reset_clears_initialized_flag(mut portfolio: Portfolio) {
 #[rstest]
 fn test_order_topic_republishes_last_account_state_without_order_update(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     cash_account_state: AccountState,
     instrument_audusd: InstrumentAny,
 ) {
@@ -1509,7 +1571,7 @@ fn test_order_topic_republishes_last_account_state_without_order_update(
 #[case(OrderEventAny::FillVoided(OrderFillVoidedSpec::builder().build()))]
 fn test_wallet_only_order_topic_does_not_republish_cash_account_state(
     simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     cash_account_state: AccountState,
     #[case] event: OrderEventAny,
 ) {
@@ -1550,7 +1612,7 @@ fn test_wallet_only_order_topic_does_not_republish_cash_account_state(
 #[case(OrderEventAny::FillVoided(OrderFillVoidedSpec::builder().build()))]
 fn test_wallet_order_topic_republishes_last_account_state(
     simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     #[case] event: OrderEventAny,
 ) {
     use nautilus_common::msgbus::{MessageBus, TypedHandler, switchboard};
@@ -1600,7 +1662,7 @@ fn test_wallet_order_topic_republishes_last_account_state(
 #[rstest]
 fn test_order_endpoint_then_topic_publishes_account_state_once(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     cash_account_state: AccountState,
     instrument_audusd: InstrumentAny,
 ) {
@@ -1689,7 +1751,7 @@ fn test_order_endpoint_then_topic_publishes_account_state_once(
 #[rstest]
 fn test_position_update_publishes_margin_account_state(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
@@ -1760,7 +1822,7 @@ fn test_position_update_publishes_margin_account_state(
 #[rstest]
 fn test_margin_fill_endpoint_then_position_publishes_account_state_once(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
@@ -1830,7 +1892,7 @@ fn test_margin_fill_endpoint_then_position_publishes_account_state_once(
 #[rstest]
 fn test_cash_order_updates_use_event_account_orders(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     let account_a = AccountId::new("SIM-001");
@@ -1960,7 +2022,7 @@ fn test_cash_order_updates_use_event_account_orders(
 #[rstest]
 fn test_account_updates_use_event_account_orders_and_positions(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     let account_a = AccountId::new("SIM-001");
@@ -2134,7 +2196,7 @@ fn test_account_updates_use_event_account_orders_and_positions(
 #[rstest]
 fn test_cash_fill_endpoint_then_position_publishes_account_state_once(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     cash_account_state: AccountState,
     instrument_audusd: InstrumentAny,
 ) {
@@ -2210,7 +2272,7 @@ fn test_cash_fill_endpoint_then_position_publishes_account_state_once(
 #[rstest]
 fn test_rejected_endpoint_then_topic_republishes_existing_account_state_once(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     cash_account_state: AccountState,
     instrument_audusd: InstrumentAny,
 ) {
@@ -2408,7 +2470,7 @@ fn test_update_orders_open_cash_account(
 #[rstest]
 fn test_update_order_without_account_state_restores_account(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     let account_id = AccountId::new("SIM-001");
@@ -2483,7 +2545,7 @@ fn test_update_order_without_account_state_restores_account(
 #[rstest]
 fn test_update_order_filled_restores_account_before_unrealized_pnl(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_btcusdt: InstrumentAny,
 ) {
     let account_id = AccountId::new("BINANCE-01234");
@@ -2547,7 +2609,7 @@ fn test_update_order_filled_restores_account_before_unrealized_pnl(
 #[rstest]
 fn test_update_order_filled_without_cached_order_updates_account(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_btcusdt: InstrumentAny,
 ) {
     let account_id = AccountId::new("BINANCE-01234");
@@ -2592,7 +2654,7 @@ fn test_update_order_filled_without_cached_order_updates_account(
 #[rstest]
 fn test_update_order_filled_spread_instrument_skips_balance_update(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
 ) {
     let account_id = AccountId::new("BINANCE-01234");
     let account_state = get_margin_account(Some("BINANCE-01234"));
@@ -2909,7 +2971,7 @@ fn test_initialize_orders_cash_account_with_base_currency() {
     cache.add_instrument(instrument.clone()).unwrap();
 
     let cache = Rc::new(RefCell::new(cache));
-    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
     let mut portfolio = Portfolio::new(clock, cache.clone(), None);
 
     // Cash account with base_currency set (like Polymarket with USDC)
@@ -4011,7 +4073,7 @@ fn test_closing_position_updates_portfolio(
 #[rstest]
 fn test_position_records_account_currency_realized_pnl(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     simple_cache
@@ -4056,6 +4118,7 @@ fn test_position_records_account_currency_realized_pnl(
         position_id,
     );
     let position = Position::new(&instrument_audusd, fill);
+
     let closed_position = Position {
         side: PositionSide::Flat,
         signed_qty: 0.0,
@@ -4108,6 +4171,7 @@ fn test_position_records_account_currency_realized_pnl(
         realized_pnl: Some(Money::from("20.00 USD")),
         ..position
     };
+
     portfolio
         .cache()
         .borrow_mut()
@@ -4798,7 +4862,7 @@ fn test_realized_pnl_cache_clears_when_recalculation_fails(
 #[rstest]
 fn test_realized_pnl_currency_conversion_overflow_returns_none(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     simple_cache
@@ -4853,7 +4917,7 @@ fn test_realized_pnl_currency_conversion_overflow_returns_none(
 #[rstest]
 fn test_query_target_currency_converts_all_pnl_and_exposure_results(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     simple_cache
@@ -5088,7 +5152,7 @@ fn test_price_overrides_are_fresh_and_leave_cached_query_values_unchanged(
 #[rstest]
 fn test_unrealized_pnl_and_net_exposure_conversion_overflow_return_none(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     simple_cache
@@ -5354,7 +5418,7 @@ fn test_snapshot_aggregation_overflow_is_account_local_and_recovers_after_settle
 #[rstest]
 fn test_realized_pnl_snapshot_without_netting_position_uses_mark_xrate(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     simple_cache
@@ -5852,7 +5916,7 @@ fn test_realized_pnl_for_closed_cached_netting_position_adds_unsnapshotted_final
 #[rstest]
 fn test_realized_pnl_for_closed_cached_netting_position_uses_mark_xrate(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     simple_cache
@@ -5906,7 +5970,7 @@ fn test_realized_pnl_for_closed_cached_netting_position_uses_mark_xrate(
 #[rstest]
 fn test_realized_pnl_for_closed_cached_netting_position_without_base_conversion(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     simple_cache
@@ -5961,7 +6025,7 @@ fn test_realized_pnl_for_closed_cached_netting_position_without_base_conversion(
 #[rstest]
 fn test_pnls_and_exposure_without_base_conversion_keep_cost_currency(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     let account_id = AccountId::new("SIM-001");
@@ -6039,7 +6103,7 @@ fn test_pnls_and_exposure_without_base_conversion_keep_cost_currency(
 #[rstest]
 fn test_account_state_log_throttle_survives_regressing_ts_init(
     simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
 ) {
     let account_id = AccountId::new("SIM-001");
     let config = PortfolioConfig::builder()
@@ -6666,7 +6730,7 @@ fn test_net_exposures_does_not_net_across_instruments(
 #[rstest]
 fn test_default_pnl_queries_ignore_cross_account_instrument_caches(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     simple_cache
@@ -7036,7 +7100,7 @@ fn test_mark_values_follow_mark_price_policy(
     #[case] use_default: bool,
     #[case] expected: Decimal,
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     simple_cache
@@ -7273,7 +7337,7 @@ fn test_equity_multi_currency_wallet_fill_counts_credited_asset_once(
 #[rstest]
 fn test_equity_multi_currency_cash_broker_routed_counts_credited_asset_once(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
 ) {
     let account_id = AccountId::new("IB-DUN433229");
     let aud = Currency::AUD();
@@ -7634,7 +7698,7 @@ fn test_portfolio_valuation_uses_instrument_cost_currency(
 #[rstest]
 fn test_portfolio_valuation_converts_from_instrument_cost_currency(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_usd_usdt_future: InstrumentAny,
 ) {
     let instrument = instrument_usd_usdt_future;
@@ -8036,6 +8100,7 @@ fn test_build_snapshot_clears_stale_flag_after_stale_side_closes(
         ts_closed: Some(UnixNanos::from(1)),
         ..long_position
     };
+
     portfolio
         .cache()
         .borrow_mut()
@@ -8135,7 +8200,7 @@ fn test_build_snapshot_keeps_unpriced_flag_for_credited_cash_asset(
 #[rstest]
 fn test_build_snapshot_carries_last_valid_xrate(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     let account_id = AccountId::new("SIM-001");
@@ -8261,7 +8326,7 @@ fn test_snapshot_timer_not_armed_without_config(
 }
 
 #[rstest]
-fn test_default_equity_curve_samples_daily_while_flat(simple_cache: Cache, clock: TestClock) {
+fn test_default_equity_curve_samples_daily_while_flat(simple_cache: Cache, clock: VirtualClock) {
     use nautilus_common::timer::TimeEventCallback;
     use nautilus_core::datetime::NANOSECONDS_IN_DAY;
 
@@ -8304,7 +8369,7 @@ fn test_default_equity_curve_samples_daily_while_flat(simple_cache: Cache, clock
 }
 
 #[rstest]
-fn test_portfolio_statistics_use_daily_equity_curve(simple_cache: Cache, clock: TestClock) {
+fn test_portfolio_statistics_use_daily_equity_curve(simple_cache: Cache, clock: VirtualClock) {
     use nautilus_common::timer::TimeEventCallback;
     use nautilus_core::datetime::NANOSECONDS_IN_DAY;
 
@@ -8370,7 +8435,7 @@ fn test_portfolio_statistics_use_daily_equity_curve(simple_cache: Cache, clock: 
 }
 
 #[rstest]
-fn test_equity_curve_can_be_disabled(simple_cache: Cache, clock: TestClock) {
+fn test_equity_curve_can_be_disabled(simple_cache: Cache, clock: VirtualClock) {
     let config = PortfolioConfig::builder()
         .equity_curve(false)
         .build()
@@ -8397,7 +8462,7 @@ fn test_equity_curve_can_be_disabled(simple_cache: Cache, clock: TestClock) {
 #[rstest]
 fn test_finalize_equity_curve_samples_once_and_cancels_timer(
     simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
 ) {
     let mut portfolio = Portfolio::new(
         Rc::new(RefCell::new(clock)),
@@ -8428,7 +8493,7 @@ fn test_finalize_equity_curve_samples_once_and_cancels_timer(
 #[rstest]
 fn test_snapshot_timer_arms_and_disarms_on_position_lifecycle(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     simple_cache
@@ -8837,7 +8902,7 @@ fn test_margin_snapshot_keeps_priced_pnl_when_another_instrument_is_unpriced(
 #[rstest]
 fn test_margin_snapshot_does_not_mask_overflow_as_an_unpriced_instrument(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
     instrument_gbpusd: InstrumentAny,
 ) {
@@ -9036,6 +9101,7 @@ fn test_account_scoped_query_preserves_other_account_missing_price(
         ts_closed: Some(UnixNanos::from(1)),
         ..account_a_position.unwrap()
     };
+
     portfolio
         .cache()
         .borrow_mut()
@@ -9195,7 +9261,7 @@ fn test_equity_cash_account_short_position(
 #[rstest]
 fn test_equity_cash_account_foreign_settlement_converts(
     simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     // AUD/USD settles in USD, account base currency is EUR, mark-xrate USD->EUR = 0.9
@@ -9276,7 +9342,7 @@ fn test_equity_cash_account_foreign_settlement_converts(
 #[rstest]
 fn test_equity_rounds_once_across_small_foreign_positions(
     simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     // Per-position rounding drops each 0.004 EUR notional to 0; round-once keeps 0.008 -> 0.01
@@ -9355,7 +9421,7 @@ fn test_equity_rounds_once_across_small_foreign_positions(
 #[rstest]
 fn test_missing_xrate_flags_instrument(
     simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     // Account base currency EUR with no mark-xrate configured;
@@ -9436,7 +9502,7 @@ fn test_missing_xrate_flags_instrument(
 #[rstest]
 fn test_build_snapshot_conversion_opt_out_has_no_headline_or_staleness(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     let account_id = AccountId::new("SIM-001");
@@ -9533,6 +9599,7 @@ fn test_flat_venue_clears_missing_price_tracker(
         ts_closed: Some(UnixNanos::from(1)),
         ..position
     };
+
     portfolio
         .cache()
         .borrow_mut()
@@ -9609,7 +9676,7 @@ fn test_update_position_with_calculate_account_state_does_not_panic(
 #[rstest]
 fn test_update_position_without_account_state_restores_account(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     // An EUR-base account on a USD-settled instrument has no xrate, so the recompute produces
@@ -9757,7 +9824,7 @@ fn test_update_position_margin_state_across_multiple_open_positions(
 #[rstest]
 fn test_initialize_positions_arms_snapshot_timer_for_reconciled_venues(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     simple_cache
@@ -9826,7 +9893,7 @@ fn test_emit_snapshot_publishes_and_appends_to_ring(instrument_audusd: Instrumen
         .add_instrument(instrument_audusd.clone())
         .unwrap();
 
-    let test_clock = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock = Rc::new(RefCell::new(VirtualClock::new()));
     let cache = Rc::new(RefCell::new(simple_cache));
     let clock: Rc<RefCell<dyn Clock>> = test_clock.clone();
 
@@ -9868,7 +9935,7 @@ fn test_emit_snapshot_publishes_and_appends_to_ring(instrument_audusd: Instrumen
         .unwrap();
     portfolio.update_position(&PositionEvent::PositionOpened(get_open_position(&position)));
 
-    // Advance TestClock past the 1s interval and invoke the matched handler
+    // Advance VirtualClock past the 1s interval and invoke the matched handler
     let events = test_clock
         .borrow_mut()
         .advance_time(UnixNanos::from(1_500_000_000u64), true);
@@ -9903,7 +9970,7 @@ fn test_emit_snapshot_publishes_and_appends_to_ring(instrument_audusd: Instrumen
 #[rstest]
 fn test_reset_cancels_snapshot_timers(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     simple_cache
@@ -9986,7 +10053,7 @@ fn test_reset_cancels_snapshot_timers(
 #[rstest]
 fn test_portfolio_statistics_returns_snapshot(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     let account_id = AccountId::new("SIM-001");
@@ -10075,7 +10142,7 @@ impl PortfolioStatistic for InputCountStatistic {
 #[rstest]
 fn test_registered_statistic_reaches_portfolio_statistics(
     mut simple_cache: Cache,
-    clock: TestClock,
+    clock: VirtualClock,
     instrument_audusd: InstrumentAny,
 ) {
     let account_id = AccountId::new("SIM-001");
@@ -10161,7 +10228,7 @@ fn test_registered_statistic_reaches_portfolio_statistics(
 }
 
 #[rstest]
-fn test_deregister_statistics_clears_defaults(simple_cache: Cache, clock: TestClock) {
+fn test_deregister_statistics_clears_defaults(simple_cache: Cache, clock: VirtualClock) {
     let mut portfolio = Portfolio::new(
         Rc::new(RefCell::new(clock)),
         Rc::new(RefCell::new(simple_cache)),

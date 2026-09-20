@@ -34,6 +34,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwapOption;
 use nautilus_common::{
     factories::OrderEventFactory,
+    live::sender::EventSender,
     messages::{ExecutionEvent, ExecutionReport},
 };
 use nautilus_core::{Params, UUID4, UnixNanos, time::AtomicTime};
@@ -65,7 +66,7 @@ use nautilus_model::{
 pub struct ExecutionEventEmitter {
     clock: &'static AtomicTime,
     factory: OrderEventFactory,
-    sender: Arc<ArcSwapOption<tokio::sync::mpsc::UnboundedSender<ExecutionEvent>>>,
+    sender: Arc<ArcSwapOption<EventSender<ExecutionEvent>>>,
 }
 
 impl ExecutionEventEmitter {
@@ -103,8 +104,8 @@ impl ExecutionEventEmitter {
     /// `try_get_exec_event_sender` returns `Some`; `None` there means the calling thread has no
     /// bound senders and is not a construction failure. See the adapter guide for hosts that drive
     /// a client outside `LiveNode`.
-    pub fn set_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<ExecutionEvent>) {
-        self.sender.store(Some(Arc::new(sender)));
+    pub fn set_sender(&mut self, sender: impl Into<EventSender<ExecutionEvent>>) {
+        self.sender.store(Some(Arc::new(sender.into())));
     }
 
     /// Returns true if the sender is initialized for this emitter and its clones.
@@ -180,6 +181,16 @@ impl ExecutionEventEmitter {
     pub fn emit_order_submitted(&self, order: &OrderAny) {
         let event = self.factory.generate_order_submitted(order, self.ts_init());
         self.send_order_event(event);
+    }
+
+    /// Generates and emits an order submitted event, returning any channel error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sender is uninitialized or its receiver is closed.
+    pub fn try_emit_order_submitted(&self, order: &OrderAny) -> anyhow::Result<()> {
+        let event = self.factory.generate_order_submitted(order, self.ts_init());
+        self.try_send_order_event(event)
     }
 
     /// Generates and emits an order rejected event.
@@ -516,9 +527,11 @@ impl ExecutionEventEmitter {
     /// Returns an error if the sender is not initialized or the receiving channel is closed.
     pub fn try_send_execution_report(&self, report: ExecutionReport) -> anyhow::Result<()> {
         let sender = self.sender.load();
+
         let sender = sender.as_ref().ok_or_else(|| {
             anyhow::anyhow!("Cannot send execution report: sender not initialized")
         })?;
+
         sender
             .send(ExecutionEvent::Report(report))
             .map_err(|e| anyhow::anyhow!("Failed to send execution report: {e}"))

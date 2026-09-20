@@ -13,15 +13,21 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{collections::HashMap, fmt::Display};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Display,
+};
 
-use nautilus_core::{Params, UUID4, UnixNanos};
+use nautilus_core::{
+    Params, UUID4, UnixNanos,
+    correctness::{CorrectnessResult, check_predicate_true},
+};
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 
 use crate::{
     enums::AccountType,
     identifiers::{AccountId, InstrumentId},
-    types::{AccountBalance, Currency, MarginBalance, balance::WalletAccountBalances},
+    types::{AccountBalance, Currency, MarginBalance, Money, balance::WalletAccountBalances},
 };
 
 /// Represents an event which includes information on the state of the account.
@@ -63,6 +69,11 @@ pub struct AccountState {
     /// Additional implementation-specific account information, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub info: Option<Params>,
+    /// Reported totals whose free and locked components are unavailable.
+    ///
+    /// Supported only by margin accounts without local account-state calculation.
+    #[serde(default)]
+    pub total_only_balances: Vec<Money>,
 }
 
 impl Serialize for AccountState {
@@ -70,7 +81,8 @@ impl Serialize for AccountState {
     where
         S: Serializer,
     {
-        let field_count = 9 + usize::from(self.info.is_some());
+        let include_info = self.info.is_some() || !serializer.is_human_readable();
+        let field_count = 10 + usize::from(include_info);
         let mut state = serializer.serialize_struct("AccountState", field_count)?;
         state.serialize_field("account_id", &self.account_id)?;
         state.serialize_field("account_type", &self.account_type)?;
@@ -85,9 +97,10 @@ impl Serialize for AccountState {
         state.serialize_field("event_id", &self.event_id)?;
         state.serialize_field("ts_event", &self.ts_event)?;
         state.serialize_field("ts_init", &self.ts_init)?;
-        if let Some(info) = &self.info {
-            state.serialize_field("info", info)?;
+        if include_info {
+            state.serialize_field("info", &self.info)?;
         }
+        state.serialize_field("total_only_balances", &self.total_only_balances)?;
         state.end()
     }
 }
@@ -112,6 +125,7 @@ impl AccountState {
             account_type,
             base_currency,
             balances,
+            total_only_balances: Vec::new(),
             margins,
             is_reported,
             event_id,
@@ -128,6 +142,38 @@ impl AccountState {
         self
     }
 
+    /// Attaches reported totals with unavailable free and locked components.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for non-margin accounts, duplicate currencies, or currencies
+    /// present in both balance representations.
+    pub fn with_total_only_balances(mut self, balances: Vec<Money>) -> CorrectnessResult<Self> {
+        self.total_only_balances = balances;
+        self.validate_balances()?;
+        Ok(self)
+    }
+
+    pub(crate) fn validate_balances(&self) -> CorrectnessResult<()> {
+        check_predicate_true(
+            self.total_only_balances.is_empty() || self.account_type == AccountType::Margin,
+            "totals-only balances require a margin account",
+        )?;
+        let mut currencies = HashSet::new();
+
+        for currency in self.balances.iter().map(|balance| balance.currency).chain(
+            self.total_only_balances
+                .iter()
+                .map(|balance| balance.currency),
+        ) {
+            check_predicate_true(
+                currencies.insert(currency),
+                &format!("duplicate or overlapping balance currency: {currency}"),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Returns `true` if this account state has the same balances and margins as another.
     ///
     /// This compares all balances and margins for equality, returning `true` only if
@@ -141,8 +187,25 @@ impl AccountState {
     #[must_use]
     pub fn has_same_balances_and_margins(&self, other: &Self) -> bool {
         // Quick check - if lengths differ, they can't be equal
-        if self.balances.len() != other.balances.len() || self.margins.len() != other.margins.len()
+        if self.balances.len() != other.balances.len()
+            || self.margins.len() != other.margins.len()
+            || self.total_only_balances.len() != other.total_only_balances.len()
         {
+            return false;
+        }
+
+        let self_totals: HashMap<Currency, Money> = self
+            .total_only_balances
+            .iter()
+            .map(|balance| (balance.currency, *balance))
+            .collect();
+        let other_totals: HashMap<Currency, Money> = other
+            .total_only_balances
+            .iter()
+            .map(|balance| (balance.currency, *balance))
+            .collect();
+
+        if self_totals != other_totals {
             return false;
         }
 
@@ -206,7 +269,7 @@ impl Display for AccountState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}(account_id={}, account_type={}, base_currency={}, is_reported={}, balances=[{}], margins=[{}], event_id={})",
+            "{}(account_id={}, account_type={}, base_currency={}, is_reported={}, balances=[{}]{}, margins=[{}], event_id={})",
             stringify!(AccountState),
             self.account_id,
             self.account_type,
@@ -220,6 +283,18 @@ impl Display for AccountState {
                 .map(|b| format!("{b}"))
                 .collect::<Vec<String>>()
                 .join(", "),
+            if self.total_only_balances.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", total_only_balances=[{}]",
+                    self.total_only_balances
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            },
             self.margins
                 .iter()
                 .map(|m| format!("{m}"))
@@ -263,6 +338,68 @@ mod tests {
         let cash_account_state_1 = cash_account_state();
         let cash_account_state_2 = cash_account_state();
         assert_eq!(cash_account_state_1, cash_account_state_2);
+    }
+
+    #[rstest]
+    fn test_totals_only_balance_deduplication_and_event_identity() {
+        let mut state = margin_account_state();
+        state.balances.clear();
+        let total = Money::from("19.23 USD");
+        let original = state
+            .clone()
+            .with_total_only_balances(vec![total, Money::from("0 USDT")])
+            .unwrap();
+        let reordered = state
+            .clone()
+            .with_total_only_balances(vec![Money::from("0 USDT"), total])
+            .unwrap();
+        let changed = state
+            .clone()
+            .with_total_only_balances(vec![Money::from("-19.23 USD"), Money::from("0 USDT")])
+            .unwrap();
+        let mut complete = state;
+        complete.balances = vec![AccountBalance::new(
+            total,
+            Money::zero(total.currency),
+            total,
+        )];
+
+        assert!(original.has_same_balances_and_margins(&reordered));
+        assert!(!original.has_same_balances_and_margins(&changed));
+        assert!(!original.has_same_balances_and_margins(&complete));
+        assert_eq!(original, changed);
+        assert!(
+            original
+                .to_string()
+                .contains("total_only_balances=[19.23 USD, 0.00000000 USDT]")
+        );
+    }
+
+    #[rstest]
+    fn test_totals_only_json_round_trip_and_legacy_default() {
+        let mut state = margin_account_state();
+        state.balances.clear();
+        let state = state
+            .with_total_only_balances(vec![
+                Money::from("-19.23 USD"),
+                Money::from("0 USDT"),
+                Money::from("0.12345678 BTC"),
+            ])
+            .unwrap();
+        let encoded = serde_json::to_value(&state).unwrap();
+        let restored: AccountState = serde_json::from_value(encoded.clone()).unwrap();
+
+        assert_eq!(restored.total_only_balances, state.total_only_balances);
+        assert_eq!(serde_json::to_value(&restored).unwrap(), encoded);
+
+        let mut legacy = encoded;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("total_only_balances");
+        let restored: AccountState = serde_json::from_value(legacy).unwrap();
+
+        assert!(restored.total_only_balances.is_empty());
     }
 
     #[rstest]

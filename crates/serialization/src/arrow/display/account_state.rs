@@ -26,6 +26,7 @@ use arrow::{
 use nautilus_model::events::AccountState;
 
 use super::{bool_field, timestamp_field, unix_nanos_to_i64, utf8_field};
+use crate::arrow::timestamp_data_type;
 
 /// Returns the display-mode Arrow schema for [`AccountState`].
 #[must_use]
@@ -40,6 +41,7 @@ pub fn account_state_schema() -> Schema {
         utf8_field("event_id", false),
         timestamp_field("ts_event", false),
         timestamp_field("ts_init", false),
+        utf8_field("total_only_balances", false),
     ])
 }
 
@@ -80,7 +82,8 @@ fn margins_to_json(state: &AccountState) -> String {
 /// Emits `Utf8` columns for identifiers and JSON-serialized balances/margins,
 /// `Timestamp(Nanosecond)` columns for event and init times, and a `Boolean`
 /// column for `is_reported`. Balances and margins are serialized as JSON arrays
-/// with `f64` amounts for display readability.
+/// with `f64` amounts for display readability. Totals-only balances retain exact
+/// decimal amounts as JSON strings.
 ///
 /// Returns an empty [`RecordBatch`] with the correct schema when `data` is empty.
 ///
@@ -95,8 +98,11 @@ pub fn encode_account_states(data: &[AccountState]) -> Result<RecordBatch, Arrow
     let mut margins = StringBuilder::new();
     let mut is_reported = BooleanBuilder::with_capacity(data.len());
     let mut event_id = StringBuilder::new();
-    let mut ts_event = TimestampNanosecondBuilder::with_capacity(data.len());
-    let mut ts_init = TimestampNanosecondBuilder::with_capacity(data.len());
+    let mut ts_event =
+        TimestampNanosecondBuilder::with_capacity(data.len()).with_data_type(timestamp_data_type());
+    let mut ts_init =
+        TimestampNanosecondBuilder::with_capacity(data.len()).with_data_type(timestamp_data_type());
+    let mut total_only_balances = StringBuilder::new();
 
     for state in data {
         account_id.append_value(state.account_id);
@@ -108,6 +114,10 @@ pub fn encode_account_states(data: &[AccountState]) -> Result<RecordBatch, Arrow
         event_id.append_value(state.event_id.to_string());
         ts_event.append_value(unix_nanos_to_i64(state.ts_event.as_u64()));
         ts_init.append_value(unix_nanos_to_i64(state.ts_init.as_u64()));
+        total_only_balances.append_value(
+            serde_json::to_string(&state.total_only_balances)
+                .map_err(|e| ArrowError::JsonError(e.to_string()))?,
+        );
     }
 
     RecordBatch::try_new(
@@ -122,6 +132,7 @@ pub fn encode_account_states(data: &[AccountState]) -> Result<RecordBatch, Arrow
             Arc::new(event_id.finish()),
             Arc::new(ts_event.finish()),
             Arc::new(ts_init.finish()),
+            Arc::new(total_only_balances.finish()),
         ],
     )
 }
@@ -154,6 +165,7 @@ mod tests {
             account_type: AccountType::Cash,
             base_currency: Some(currency),
             balances: vec![balance],
+            total_only_balances: vec![],
             margins: vec![],
             is_reported: false,
             event_id: UUID4::default(),
@@ -168,7 +180,7 @@ mod tests {
         let batch = encode_account_states(&[]).unwrap();
         let schema = batch.schema();
         let fields = schema.fields();
-        assert_eq!(fields.len(), 9);
+        assert_eq!(fields.len(), 10);
         assert_eq!(fields[0].name(), "account_id");
         assert_eq!(fields[0].data_type(), &DataType::Utf8);
         assert_eq!(fields[5].name(), "is_reported");
@@ -176,7 +188,7 @@ mod tests {
         assert_eq!(fields[7].name(), "ts_event");
         assert_eq!(
             fields[7].data_type(),
-            &DataType::Timestamp(TimeUnit::Nanosecond, None)
+            &DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
         );
     }
 
@@ -224,7 +236,31 @@ mod tests {
     fn test_encode_account_states_empty() {
         let batch = encode_account_states(&[]).unwrap();
         assert_eq!(batch.num_rows(), 0);
-        assert_eq!(batch.schema().fields().len(), 9);
+        assert_eq!(batch.schema().fields().len(), 10);
+    }
+
+    #[rstest]
+    fn test_encode_totals_only_balances_preserves_exact_amounts() {
+        let mut state = make_account_state(1_000);
+        state.account_type = AccountType::Margin;
+        state.balances.clear();
+        let state = state
+            .with_total_only_balances(vec![
+                Money::from("-19.23 USD"),
+                Money::from("0 USDT"),
+                Money::from("0.12345678 BTC"),
+            ])
+            .unwrap();
+        let batch = encode_account_states(std::slice::from_ref(&state)).unwrap();
+        let totals = batch
+            .column_by_name("total_only_balances")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let decoded: Vec<Money> = serde_json::from_str(totals.value(0)).unwrap();
+
+        assert_eq!(decoded, state.total_only_balances);
     }
 
     #[rstest]

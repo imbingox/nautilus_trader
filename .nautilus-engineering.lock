@@ -1,6 +1,6 @@
 version = 1
 repository = "https://github.com/nautechsystems/nautilus_engineering"
-revision = "2d855175e82edf7bda4a77e4053198359d8c9cdd"
+revision = "17adc2db33b00154f76bf604e8ba8f7e20c5a4e5"
 manifest_sha256 = "591f89f0394dfd8a02a4c3bda884dbdc02298d2da3a1cb4861ed8d4c6d67e97e"
 marker_file = ".nautilus-engineering.syncing"
 profiles = ["sync"]
@@ -14,7 +14,7 @@ executable = false
 [[file]]
 artifact = "pre-commit-shell"
 path = ".nautilus-engineering/pre-commit/shell.yaml"
-sha256 = "a8aefc574b99250a8f5fd7a80699f931b9b8406f4f124df82bf35a331c77fed3"
+sha256 = "e7bc92530160b85a1774328d443ef46c5f706cf1cf2fedb0a75e89588c35453d"
 executable = false
 
 [[file]]
@@ -38,13 +38,13 @@ executable = false
 [[file]]
 artifact = "pre-commit-zizmor"
 path = ".nautilus-engineering/pre-commit/zizmor.yaml"
-sha256 = "8b7bc448021f124aceb7ee61f774904efd89429bee2af7a8f605c1972e9d2e60"
+sha256 = "c156b701b14fea09ed9e6af84c20e3065a26d5240a22c85ce174ce8388c215f0"
 executable = false
 
 [[file]]
 artifact = "shared-tool-catalog"
 path = ".nautilus-engineering/tools.toml"
-sha256 = "e350c79fbb9c20ad154bce54263d6e1c6bdf90a7c40e54f2268b367579d14eae"
+sha256 = "5ce24820adec9df3f67cd940f885cf21016ddeedb734c65ef300e359d207e156"
 executable = false
 
 [[file]]
@@ -80,7 +80,7 @@ executable = true
 [[file]]
 artifact = "cargo-cooldown-check"
 path = "scripts/check-cargo-cooldown.sh"
-sha256 = "1191ea85fc5ed82fcdef145a2d5b99da8bf64a5a0543ada798fa57ed326b1f38"
+sha256 = "dd36ed72236b3fc1e4e94793a6d6c9aa54bc9dd209d2a1bf3d7b2c6c2d99d95b"
 executable = true
 
 [[file]]
@@ -140,17 +140,17 @@ executable = false
 [[file]]
 artifact = "tool-version"
 path = "scripts/tool-version.sh"
-sha256 = "9e92f3e629b2e2d05e453cecb7c3e2222ee2899b19fab9241c9573a0f0268b47"
+sha256 = "2cff99f661fd9a6644aa25dfbd78db1a710877f8af92fbcd5ccfecc84e9e410c"
 executable = true
 
 [[file]]
 artifact = "cargo-dependency-update"
 path = "scripts/update-cargo-dependencies.bash"
-sha256 = "4e6a4756ab6aa7927cabcd65cd1e00b5fabfd5e2b496f9916707a058879a21bb"
+sha256 = "e466808b185c45c357f0947224116edced67235630bff95e68fcb9db33c97833"
 executable = true
 
 [[file]]
 artifact = "uv-version"
 path = "scripts/uv-version.sh"
-sha256 = "793b1291d0c71b37ebabde56909b4b74253e85922b49f95082119f4c8ccb8ee4"
+sha256 = "655d4b377b619707cdbdab8ad565cadc9bffb08770763869f22df76ad3b6652d"
 executable = true

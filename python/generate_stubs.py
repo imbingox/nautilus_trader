@@ -166,6 +166,9 @@ MODULE_FIXUPS: dict[str, StubFixup] = {
 # every regeneration; the redundant `as` alias marks them as explicit re-exports so
 # `from <module> import <symbol>` type-checks. Keyed by stub path suffix.
 EXTRA_REEXPORTS: dict[str, tuple[str, ...]] = {
+    "nautilus_trader/live/__init__.pyi": (
+        "from nautilus_trader.live.providers import InstrumentProvider as InstrumentProvider",
+    ),
     "nautilus_trader/analysis/__init__.pyi": (
         "from nautilus_trader.analysis.config import GridLayout as GridLayout",
         (
@@ -375,6 +378,10 @@ def generate_stubs() -> bool:
     # extension-module (stripped above) is what enables gateway in the wheel build
     if "nautilus-interactive-brokers/gateway" not in cargo_features:
         cargo_features.append("nautilus-interactive-brokers/gateway")
+
+    # Keep PAPI stubs available for builds with default features disabled
+    if "papi" not in cargo_features:
+        cargo_features.append("papi")
 
     cmd = stub_generator_command(cargo_features)
 
@@ -3069,7 +3076,7 @@ def _derive_module_path(crate_dir: Path, workspace_root: Path) -> str:
 
     """
     relative = crate_dir.relative_to(workspace_root / "crates")
-    return ".".join(relative.parts)
+    return ".".join(part.replace("-", "_") for part in relative.parts)
 
 
 def _infer_constant_python_type(

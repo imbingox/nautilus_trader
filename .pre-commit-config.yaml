@@ -47,7 +47,7 @@ repos:
 
   # nautilus-engineering: hooks begin
   - repo: https://github.com/scop/pre-commit-shfmt
-    rev: v3.13.1-1
+    rev: v3.14.1-1
     hooks:
       - id: shfmt
         args: ["-i", "2", "-ci", "-sr", "-ln", "bash", "-w"]
@@ -74,7 +74,7 @@ repos:
         args: [--strict]
 
   - repo: https://github.com/zizmorcore/zizmor-pre-commit
-    rev: v1.30.0
+    rev: v1.30.1
     hooks:
       - id: zizmor
         name: zizmor (security)
@@ -454,11 +454,12 @@ repos:
       - id: cargo-cooldown
         name: cargo cooldown
         description: Blocks crate versions published inside the cooldown window
-        entry: bash scripts/check-cargo-cooldown.sh
+        entry: bash scripts/check-cargo-cooldown.sh --all
         language: system
         files: >-
           (?x)^(
             (?:.*/)?Cargo\.(lock|toml)|
+            \.supply-chain/crate-dates\.json|
             scripts/check-cargo-cooldown\.sh
           )$
         pass_filenames: false
@@ -480,7 +481,7 @@ repos:
         types: [python]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.6
+    rev: v0.16.8
     hooks:
       - id: ruff
         name: ruff
@@ -509,7 +510,7 @@ repos:
           - "--in-place"
 
   - repo: https://github.com/astral-sh/uv-pre-commit
-    rev: 0.12.9 # Must match [uv] in .nautilus-engineering/tools.toml
+    rev: 0.12.15 # Must match [uv] in .nautilus-engineering/tools.toml
     hooks:
       - id: uv-lock
         args: ["--project", "python"]

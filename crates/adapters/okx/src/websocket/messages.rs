@@ -16,8 +16,6 @@
 //! Data structures modeling OKX WebSocket request and response payloads.
 
 use derive_builder::Builder;
-#[cfg(test)]
-use nautilus_core::string::secret::REDACTED;
 use nautilus_core::string::secret::SecretString;
 use nautilus_model::{
     data::{Data, FundingRateUpdate, InstrumentStatus, OrderBookDeltas},
@@ -1095,7 +1093,7 @@ pub struct OKXOrderMsg {
     pub tag: Option<String>,
     /// Trade mode.
     pub td_mode: OKXTradeMode,
-    /// Target currency (base_ccy or quote_ccy). Empty for margin modes.
+    /// Target currency (`base_ccy` or `quote_ccy`). Empty for margin modes.
     #[serde(default, deserialize_with = "deserialize_target_currency_as_none")]
     pub tgt_ccy: Option<OKXTargetCurrency>,
     /// Take-profit order price.
@@ -1146,7 +1144,7 @@ pub struct OKXAlgoOrderMsg {
     pub inst_id: Ustr,
     /// Instrument type.
     pub inst_type: OKXInstrumentType,
-    /// Algo order type (trigger, move_order_stop, oco, iceberg, twap).
+    /// Algo order type (trigger, `move_order_stop`, oco, iceberg, twap).
     pub ord_type: OKXAlgoOrderType,
     /// Order state.
     pub state: OKXAlgoOrderStatus,
@@ -1230,7 +1228,7 @@ pub struct OKXAlgoOrderMsg {
     /// Currency.
     #[serde(default, deserialize_with = "deserialize_empty_ustr_as_none")]
     pub ccy: Option<Ustr>,
-    /// Target currency (base_ccy or quote_ccy).
+    /// Target currency (`base_ccy` or `quote_ccy`).
     #[serde(default, deserialize_with = "deserialize_target_currency_as_none")]
     pub tgt_ccy: Option<OKXTargetCurrency>,
     /// Fee amount.
@@ -1318,7 +1316,7 @@ pub struct WsPostOrderParams {
     #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pos_side: Option<OKXPositionSide>,
-    /// Order type: limit, market, post_only, fok, ioc, etc.
+    /// Order type: limit, market, `post_only`, fok, ioc, etc.
     pub ord_type: OKXOrderType,
     /// Order size.
     pub sz: String,
@@ -1510,16 +1508,18 @@ pub struct WsCancelAlgoOrderParams {
     /// Instrument ID code (numeric). Replaced `instId` for WebSocket order operations.
     pub inst_id_code: u64,
     /// Algo order ID.
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub algo_id: Option<String>,
     /// Client algo order ID.
+    #[builder(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub algo_cl_ord_id: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
-    use nautilus_core::time::get_atomic_clock_realtime;
+    use nautilus_core::{string::secret::REDACTED, time::get_atomic_clock_realtime};
     use rstest::rstest;
     use rust_decimal::Decimal;
 
@@ -2494,6 +2494,29 @@ mod tests {
     }
 
     #[rstest]
+    fn test_ws_cancel_algo_order_params_builder_allows_either_identifier() {
+        use super::WsCancelAlgoOrderParamsBuilder;
+
+        let by_cl_ord_id = WsCancelAlgoOrderParamsBuilder::default()
+            .inst_id_code(10459u64)
+            .algo_cl_ord_id("Odstalgocancel0000001".to_string())
+            .build()
+            .unwrap();
+        let json = serde_json::to_value(&by_cl_ord_id).unwrap();
+        assert_eq!(json["algoClOrdId"], "Odstalgocancel0000001");
+        assert!(json.get("algoId").is_none());
+
+        let by_algo_id = WsCancelAlgoOrderParamsBuilder::default()
+            .inst_id_code(10459u64)
+            .algo_id("987654321".to_string())
+            .build()
+            .unwrap();
+        let json = serde_json::to_value(&by_algo_id).unwrap();
+        assert_eq!(json["algoId"], "987654321");
+        assert!(json.get("algoClOrdId").is_none());
+    }
+
+    #[rstest]
     fn test_ws_post_order_params_serializes_px_usd() {
         use super::WsPostOrderParamsBuilder;
         use crate::common::enums::{OKXOrderType, OKXSide, OKXTradeMode};
@@ -2696,7 +2719,7 @@ mod tests {
             "asks": [["16.7", "100", "1"]],
             "bids": [["16.65", "100", "1"]],
             "ts": "1780044924909",
-            "seqId": 1779935772619784_u64,
+            "seqId": 1_779_935_772_619_784_u64,
         }))
         .unwrap();
         assert_eq!(msg.asks[0].price, "16.7");

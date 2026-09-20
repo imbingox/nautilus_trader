@@ -53,10 +53,10 @@ for name in ("pyproject.toml", "uv.lock"):
 site = Path(sysconfig.get_path("purelib"))
 (site / "editable.pth").write_text(str(project) + "\n", encoding="utf-8")
 (site / "dependency_example.py").write_text("VALUE = 83\n", encoding="utf-8")
-metadata = site / "nautilus_trader-1.0.dist-info"
+metadata = site / "nautilus_trader_papi-1.0.dist-info"
 metadata.mkdir()
-(metadata / "METADATA").write_text("Name: nautilus-trader\nVersion: 1.0\n", encoding="utf-8")
-(metadata / "RECORD").write_text("nautilus_trader-1.0.dist-info/METADATA,,\n", encoding="utf-8")
+(metadata / "METADATA").write_text("Name: nautilus-trader-papi\nVersion: 1.0\n", encoding="utf-8")
+(metadata / "RECORD").write_text("nautilus_trader_papi-1.0.dist-info/METADATA,,\n", encoding="utf-8")
 PY
 )
 
@@ -80,7 +80,7 @@ import nautilus_trader
 
 assert nautilus_trader.VALUE == 37
 assert dependency_example.VALUE == 83
-assert importlib.metadata.version("nautilus-trader") == "1.0"
+assert importlib.metadata.version("nautilus-trader-papi") == "1.0"
 assert Path(nautilus_trader.__file__).is_relative_to(sys.prefix)
 assert importlib.util.find_spec("tests") is None
 result = subprocess.run([sys.executable, "-c", "import tests"], capture_output=True, text=True)

@@ -1352,11 +1352,7 @@ impl OrderEmulator {
 
             let original_events = order.events();
 
-            // Insert each event at the beginning in reverse
-            // to preserve the correct order of events.
-            for event in original_events.into_iter().rev() {
-                transformed.events.insert(0, event.clone());
-            }
+            transformed.prepend_events(original_events.into_iter().cloned());
 
             let add_result = {
                 let mut cache = self.cache.borrow_mut();
@@ -1490,11 +1486,7 @@ impl OrderEmulator {
 
             let original_events = order.events();
 
-            // Insert each event at the beginning in reverse
-            // to preserve the correct order of events.
-            for event in original_events.into_iter().rev() {
-                transformed.events.insert(0, event.clone());
-            }
+            transformed.prepend_events(original_events.into_iter().cloned());
 
             let add_result = {
                 let mut cache = self.cache.borrow_mut();
@@ -1842,7 +1834,7 @@ mod tests {
 
     use nautilus_common::{
         cache::Cache,
-        clock::TestClock,
+        clock::VirtualClock,
         messages::data::{DataCommand, SubscribeCommand, UnsubscribeCommand},
         msgbus::{
             MessagingSwitchboard,
@@ -1883,7 +1875,7 @@ mod tests {
         Rc<RefCell<Cache>>,
         Rc<RefCell<OrderEmulator>>,
     ) {
-        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         let emulator = Rc::new(RefCell::new(OrderEmulator::new(
             clock.clone(),

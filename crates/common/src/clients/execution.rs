@@ -30,13 +30,16 @@ use nautilus_model::{
 };
 use rust_decimal::Decimal;
 
-use super::log_not_implemented;
-use crate::messages::execution::{
-    BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-    GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
-    GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
-    GeneratePositionStatusReportsBuilder, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
-    SubmitOrderList,
+use super::{capital::NativeCapitalCheck, log_not_implemented};
+use crate::messages::{
+    ExecutionReport,
+    execution::{
+        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
+        GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
+        GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
+        GeneratePositionStatusReportsBuilder, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
+        SubmitOrderList,
+    },
 };
 
 /// Default maximum absolute position difference tolerated during reconciliation.
@@ -57,6 +60,20 @@ pub trait ExecutionClient {
     fn venue(&self) -> Venue;
     fn oms_type(&self) -> OmsType;
     fn get_account(&self) -> Option<AccountAny>;
+
+    /// Returns an account- and route-bound replacement for unavailable native capital checks.
+    ///
+    /// The risk engine invokes this only for a totals-only margin account after all ordinary
+    /// instrument, order, routing, and trading-state checks. Clients return `None` by default.
+    fn native_capital_check(&self) -> Option<NativeCapitalCheck> {
+        None
+    }
+
+    /// Observes a reconciliation report after the execution engine has applied it.
+    ///
+    /// Implementations must verify any adapter-specific application expectations against their
+    /// shared cache before advancing durable or trading-sensitive checkpoints.
+    fn on_execution_report_applied(&self, _report: &ExecutionReport) {}
 
     /// Returns the maximum absolute position difference tolerated during reconciliation.
     fn position_reconciliation_tolerance(&self) -> Decimal {
@@ -317,59 +334,12 @@ pub trait ExecutionClient {
         &self,
         lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
-        let ts_init = get_atomic_clock_realtime().get_time_ns();
-        let start = lookback_mins
-            .map(DurationNanos::try_from_mins)
-            .transpose()?
-            .map(|lookback| ts_init.saturating_sub(lookback));
-
-        let order_cmd = GenerateOrderStatusReportsBuilder::default()
-            .ts_init(ts_init)
-            .open_only(false)
-            .start(start)
-            .build()
-            .context("failed to build order status reports command")?;
-        let fill_cmd = GenerateFillReportsBuilder::default()
-            .ts_init(ts_init)
-            .start(start)
-            .build()
-            .context("failed to build fill reports command")?;
-        let position_cmd = GeneratePositionStatusReportsBuilder::default()
-            .ts_init(ts_init)
-            .start(start)
-            .build()
-            .context("failed to build position status reports command")?;
-
-        let (order_reports, fill_reports, position_reports) = futures::try_join!(
-            async {
-                self.generate_order_status_reports(&order_cmd)
-                    .await
-                    .context("failed to generate order status reports")
-            },
-            async {
-                self.generate_fill_reports(fill_cmd)
-                    .await
-                    .context("failed to generate fill reports")
-            },
-            async {
-                self.generate_position_status_reports(&position_cmd)
-                    .await
-                    .context("failed to generate position status reports")
-            },
-        )?;
-
-        let mut mass_status = ExecutionMassStatus::new(
-            self.client_id(),
-            self.account_id(),
-            self.venue(),
-            ts_init,
-            None,
-        );
-        mass_status.add_order_reports(order_reports);
-        mass_status.add_fill_reports(fill_reports);
-        mass_status.add_position_reports(position_reports);
-
-        Ok(Some(mass_status))
+        generate_mass_status(
+            self,
+            lookback_mins,
+            get_atomic_clock_realtime().get_time_ns(),
+        )
+        .await
     }
 
     /// Registers an external order for tracking by the execution client.
@@ -420,6 +390,73 @@ pub trait ExecutionClient {
     ) -> anyhow::Result<Option<Money>> {
         Ok(None)
     }
+}
+
+/// Composes an execution mass status using the supplied client clock timestamp.
+///
+/// # Errors
+///
+/// Returns an error if the lookback cannot be represented or a report source fails.
+pub async fn generate_mass_status<C: ExecutionClient + ?Sized>(
+    client: &C,
+    lookback_mins: Option<u64>,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Option<ExecutionMassStatus>> {
+    let start = lookback_mins
+        .map(DurationNanos::try_from_mins)
+        .transpose()?
+        .map(|lookback| ts_init.saturating_sub(lookback));
+
+    let order_cmd = GenerateOrderStatusReportsBuilder::default()
+        .ts_init(ts_init)
+        .open_only(false)
+        .start(start)
+        .build()
+        .context("failed to build order status reports command")?;
+    let fill_cmd = GenerateFillReportsBuilder::default()
+        .ts_init(ts_init)
+        .start(start)
+        .build()
+        .context("failed to build fill reports command")?;
+    let position_cmd = GeneratePositionStatusReportsBuilder::default()
+        .ts_init(ts_init)
+        .start(start)
+        .build()
+        .context("failed to build position status reports command")?;
+
+    let (order_reports, fill_reports, position_reports) = futures::try_join!(
+        async {
+            client
+                .generate_order_status_reports(&order_cmd)
+                .await
+                .context("failed to generate order status reports")
+        },
+        async {
+            client
+                .generate_fill_reports(fill_cmd)
+                .await
+                .context("failed to generate fill reports")
+        },
+        async {
+            client
+                .generate_position_status_reports(&position_cmd)
+                .await
+                .context("failed to generate position status reports")
+        },
+    )?;
+
+    let mut mass_status = ExecutionMassStatus::new(
+        client.client_id(),
+        client.account_id(),
+        client.venue(),
+        ts_init,
+        None,
+    );
+    mass_status.add_order_reports(order_reports);
+    mass_status.add_fill_reports(fill_reports);
+    mass_status.add_position_reports(position_reports);
+
+    Ok(Some(mass_status))
 }
 
 #[cfg(test)]
@@ -768,6 +805,25 @@ mod tests {
         assert!(position_cmd.instrument_id.is_none());
         assert!(position_cmd.end.is_none());
         assert!(position_cmd.params.is_none());
+    }
+
+    #[rstest]
+    fn generate_mass_status_uses_supplied_clock_for_all_sources() {
+        let client = MassStatusExecutionClient::new(false);
+        let timestamp = UnixNanos::from(900_000_000_123);
+
+        let report = futures::executor::block_on(generate_mass_status(&client, Some(3), timestamp))
+            .unwrap()
+            .unwrap();
+
+        let expected_start = Some(UnixNanos::from(720_000_000_123));
+        assert_eq!(report.ts_init, timestamp);
+        assert_eq!(client.order_commands.borrow()[0].ts_init, timestamp);
+        assert_eq!(client.order_commands.borrow()[0].start, expected_start);
+        assert_eq!(client.fill_requests.borrow()[0].ts_init, timestamp);
+        assert_eq!(client.fill_requests.borrow()[0].start, expected_start);
+        assert_eq!(client.position_queries.borrow()[0].ts_init, timestamp);
+        assert_eq!(client.position_queries.borrow()[0].start, expected_start);
     }
 
     #[rstest]

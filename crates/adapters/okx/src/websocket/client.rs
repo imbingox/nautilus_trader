@@ -39,7 +39,6 @@ use futures_util::Stream;
 use nautilus_common::live::dst::time;
 use nautilus_core::{
     AtomicMap, AtomicTime, UnixNanos,
-    consts::NAUTILUS_USER_AGENT,
     env::{get_env_var, get_or_env_var},
     string::secret::{REDACTED, SecretString},
     time::get_atomic_clock_realtime,
@@ -56,7 +55,7 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 use nautilus_network::{
-    http::USER_AGENT,
+    http::create_standard_nautilus_headers,
     mode::ConnectionMode,
     ratelimiter::quota::Quota,
     websocket::{
@@ -73,7 +72,7 @@ use ustr::Ustr;
 use super::{
     enums::OKXWsChannel,
     error::OKXWsError,
-    handler::{HandlerCommand, OKXWsFeedHandler},
+    handler::{HandlerCommand, OKXWsFeedHandler, SnapshotGate},
     messages::{
         OKXAuthentication, OKXAuthenticationArg, OKXSubscriptionArg, OKXWsMessage, OKXWsRequest,
         WsAmendOrderParamsBuilder, WsAttachAlgoOrdParams, WsCancelOrderParamsBuilder,
@@ -208,6 +207,10 @@ pub static OKX_RATE_LIMIT_KEY_ALGO_CANCEL: LazyLock<[Ustr; 1]> =
 /// Fields are read in `python/websocket.rs` (behind the `python` feature gate).
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "fields follow the codebase-wide trader_id/strategy_id/instrument_id naming family"
+)]
 pub(crate) struct PendingOrderInfo {
     pub trader_id: TraderId,
     pub strategy_id: StrategyId,
@@ -487,13 +490,13 @@ impl OKXWebSocketClient {
 
     /// Returns the public API key being used by the client.
     pub fn api_key(&self) -> Option<&str> {
-        self.credential.as_ref().map(|c| c.api_key())
+        self.credential.as_ref().map(Credential::api_key)
     }
 
     /// Returns a masked version of the API key for logging purposes.
     #[must_use]
     pub fn api_key_masked(&self) -> Option<String> {
-        self.credential.as_ref().map(|c| c.api_key_masked())
+        self.credential.as_ref().map(Credential::api_key_masked)
     }
 
     /// Returns a value indicating whether the client is active.
@@ -682,7 +685,7 @@ impl OKXWebSocketClient {
         // Inbound Ping frames are answered by the transport, so no ping handler is needed;
         // the reader routes them away from the message channel and the handler never sees them.
 
-        let headers = vec![(USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string())];
+        let headers = create_standard_nautilus_headers();
 
         let config = WebSocketConfig {
             url: self.url.clone(),
@@ -889,7 +892,7 @@ impl OKXWebSocketClient {
                         }
                         None => {
                             if handler.is_stopped() {
-                                log::debug!("Stop signal received, ending message processing",);
+                                log::debug!("Stop signal received, ending message processing");
                                 break;
                             }
                             log::debug!("WebSocket stream closed");
@@ -1133,7 +1136,12 @@ impl OKXWebSocketClient {
                 OKXWsError::ClientError(format!("Failed to send subscribe command: {e}"))
             })?;
 
-        for arg in &args {
+        self.record_subscriptions(&args);
+        Ok(())
+    }
+
+    fn record_subscriptions(&self, args: &[OKXSubscriptionArg]) {
+        for arg in args {
             let topic = topic_from_subscription_arg(arg);
             self.subscriptions_state.mark_subscribe(&topic);
 
@@ -1163,8 +1171,6 @@ impl OKXWebSocketClient {
                 }
             }
         }
-
-        Ok(())
     }
 
     #[expect(clippy::collapsible_if)]
@@ -1341,15 +1347,6 @@ impl OKXWebSocketClient {
         self.subscribe_book_with_depth(instrument_id, 0).await
     }
 
-    /// Subscribes to the standard books channel (internal method).
-    pub(crate) async fn subscribe_books_channel(
-        &self,
-        instrument_id: InstrumentId,
-    ) -> Result<(), OKXWsError> {
-        self.subscribe_inst_id(OKXWsChannel::Books, instrument_id.symbol.inner())
-            .await
-    }
-
     /// Subscribes to the Retail Price Improvement order book channel.
     ///
     /// # Errors
@@ -1360,26 +1357,78 @@ impl OKXWebSocketClient {
             .await
     }
 
+    pub(crate) async fn subscribe_book_channel(
+        &self,
+        instrument_id: InstrumentId,
+        channel: OKXBookChannel,
+        cancel: CancellationToken,
+        gate: SnapshotGate,
+    ) -> Result<(), OKXWsError> {
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+        let sender = self.cmd_tx.read().await;
+
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+
+        let subscription = OKXSubscriptionArg {
+            channel: ws_channel_for_book(channel),
+            inst_type: None,
+            inst_family: None,
+            inst_id: Some(instrument_id.symbol.inner()),
+        };
+
+        self.record_subscriptions(std::slice::from_ref(&subscription));
+        sender
+            .send(HandlerCommand::SubscribeBook {
+                subscription,
+                cancel: cancel.clone(),
+                gate,
+                completion,
+            })
+            .map_err(|e| OKXWsError::HandlerUnavailable(e.to_string()))?;
+
+        drop(sender);
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Ok(()),
+            result = receiver => result.map_err(|e| OKXWsError::HandlerUnavailable(e.to_string()))?,
+        }
+    }
+
     /// Requests a fresh snapshot by replacing the current incremental book subscription.
     pub(crate) async fn resubscribe_book_channel(
         &self,
         instrument_id: InstrumentId,
         channel: OKXBookChannel,
+        cancel: CancellationToken,
+        gate: SnapshotGate,
     ) -> Result<(), OKXWsError> {
-        let channel = ws_channel_for_book(channel);
-        self.resubscribe_ws_channel(instrument_id, channel).await
-    }
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+        let sender = self.cmd_tx.read().await;
 
-    /// Replaces an instrument subscription on the specified WebSocket channel.
-    pub(crate) async fn resubscribe_ws_channel(
-        &self,
-        instrument_id: InstrumentId,
-        channel: OKXWsChannel,
-    ) -> Result<(), OKXWsError> {
-        self.unsubscribe_inst_id(channel.clone(), instrument_id.symbol.inner())
-            .await?;
-        self.subscribe_inst_id(channel, instrument_id.symbol.inner())
+        if cancel.is_cancelled() {
+            return Err(OKXWsError::ClientError("Book recovery canceled".into()));
+        }
+
+        sender
+            .send(HandlerCommand::Resubscribe {
+                subscription: OKXSubscriptionArg {
+                    channel: ws_channel_for_book(channel),
+                    inst_type: None,
+                    inst_family: None,
+                    inst_id: Some(instrument_id.symbol.inner()),
+                },
+                cancel,
+                gate,
+                completion,
+            })
+            .map_err(|e| OKXWsError::HandlerUnavailable(e.to_string()))?;
+
+        drop(sender);
+        receiver
             .await
+            .map_err(|e| OKXWsError::HandlerUnavailable(e.to_string()))?
     }
 
     /// Subscribes to 5-level order book snapshot data for an instrument.
@@ -1444,8 +1493,8 @@ impl OKXWebSocketClient {
     /// Selects the optimal channel based on user's VIP tier and requested depth:
     /// - depth 50: Requires VIP4+, subscribes to `books50-l2-tbt`
     /// - depth 0 or 400:
-    ///   - VIP5+: subscribes to `books-l2-tbt` (400 depth, fastest)
-    ///   - Below VIP5: subscribes to `books` (standard depth)
+    ///   - VIP4+: subscribes to `books-l2-tbt` (400 depth, fastest)
+    ///   - Below VIP4: subscribes to `books` (standard depth)
     ///
     /// # Errors
     ///
@@ -1759,6 +1808,11 @@ impl OKXWebSocketClient {
     /// # Errors
     ///
     /// Returns an error if the unsubscription request fails.
+    #[allow(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "async signature is kept for parity with the other unsubscribe methods and callers"
+    )]
     pub async fn unsubscribe_instrument(
         &self,
         instrument_id: InstrumentId,
@@ -3676,7 +3730,7 @@ async fn retry_reconnect_authentication(
     }
 }
 
-fn ws_channel_for_book(channel: OKXBookChannel) -> OKXWsChannel {
+pub(crate) fn ws_channel_for_book(channel: OKXBookChannel) -> OKXWsChannel {
     match channel {
         OKXBookChannel::Book => OKXWsChannel::Books,
         OKXBookChannel::BookL2Tbt => OKXWsChannel::BooksTbt,

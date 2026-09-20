@@ -32,7 +32,7 @@ use std::{
     time::SystemTime,
 };
 
-use ahash::AHashSet;
+use ahash::{AHashMap, AHashSet};
 use config::ExecutionEngineConfig;
 use futures::future::join_all;
 use indexmap::{IndexMap, IndexSet};
@@ -115,8 +115,9 @@ pub struct ExecutionEngine {
     cache: Rc<RefCell<Cache>>,
     clients: IndexMap<ClientId, ExecutionClientAdapter>,
     default_client_id: Option<ClientId>,
-    routing_map: HashMap<Venue, ClientId>,
-    oms_overrides: HashMap<StrategyId, OmsType>,
+    routing_map: AHashMap<Venue, ClientId>,
+    instrument_venues: AHashSet<Venue>,
+    oms_overrides: AHashMap<StrategyId, OmsType>,
     external_clients: HashSet<ClientId>,
     pos_id_generator: PositionIdGenerator,
     config: ExecutionEngineConfig,
@@ -148,8 +149,9 @@ impl ExecutionEngine {
             cache,
             clients: IndexMap::new(),
             default_client_id: None,
-            routing_map: HashMap::new(),
-            oms_overrides: HashMap::new(),
+            routing_map: AHashMap::new(),
+            instrument_venues: AHashSet::new(),
+            oms_overrides: AHashMap::new(),
             external_clients: config
                 .as_ref()
                 .and_then(|c| c.external_clients.clone())
@@ -244,18 +246,23 @@ impl ExecutionEngine {
     /// Subscribes to instrument updates for a venue via the message bus.
     ///
     /// When instruments are published by the `DataEngine`, the handler routes
-    /// them to the execution client registered for that venue.
+    /// them to every client whose own venue matches, plus the client routed to that
+    /// venue, if any. Repeated subscriptions for the same venue are ignored.
     pub fn subscribe_venue_instruments(engine: &Rc<RefCell<Self>>, venue: Venue) {
+        if !engine.borrow_mut().instrument_venues.insert(venue) {
+            return;
+        }
+
         let weak = WeakCell::from(Rc::downgrade(engine));
         let pattern = switchboard::get_instruments_pattern(venue);
 
         let handler = TypedHandler::from(move |instrument: &InstrumentAny| {
             if let Some(rc) = weak.upgrade() {
                 let venue = instrument.id().venue;
-                let client_id = rc.borrow().routing_map.get(&venue).copied();
-                if let Some(client_id) = client_id {
-                    let mut engine = rc.borrow_mut();
-                    if let Some(adapter) = engine.get_client_adapter_mut(&client_id) {
+                let mut engine = rc.borrow_mut();
+                let routed_client = engine.routing_map.get(&venue).copied();
+                for adapter in engine.clients.values_mut() {
+                    if adapter.venue == venue || Some(adapter.client_id) == routed_client {
                         adapter.on_instrument(instrument.clone());
                     }
                 }
@@ -347,14 +354,16 @@ impl ExecutionEngine {
         self.cache.borrow().external_order_claim(instrument_id)
     }
 
-    /// Registers a new execution client.
+    /// Registers a new execution client without assigning venue or default routing.
+    ///
+    /// Callers configure venue and fallback routing separately with
+    /// [`Self::register_venue_routing`] and [`Self::set_default_client`].
     ///
     /// # Errors
     ///
     /// Returns an error if a client with the same ID is already registered.
     pub fn register_client(&mut self, client: Box<dyn ExecutionClient>) -> anyhow::Result<()> {
         let client_id = client.client_id();
-        let venue = client.venue();
 
         if self.clients.contains_key(&client_id) {
             anyhow::bail!("Client already registered with ID {client_id}");
@@ -362,14 +371,6 @@ impl ExecutionEngine {
 
         let adapter = ExecutionClientAdapter::new(client);
 
-        if let Some(existing_client_id) = self.routing_map.get(&venue) {
-            anyhow::bail!(
-                "Venue {venue} already routed to {existing_client_id}, \
-                 cannot register {client_id} for the same venue"
-            );
-        }
-
-        self.routing_map.insert(venue, client_id);
         log::debug!("Registered client {client_id}");
         self.clients.insert(client_id, adapter);
         Ok(())
@@ -540,7 +541,8 @@ impl ExecutionEngine {
     ///
     /// # Errors
     ///
-    /// Returns an error if the client ID is not registered.
+    /// Returns an error if the client ID is not registered or the venue already
+    /// routes to a different client.
     pub fn register_venue_routing(
         &mut self,
         client_id: ClientId,
@@ -1025,6 +1027,23 @@ impl ExecutionEngine {
                 self.reconcile_execution_mass_status(mass_status);
             }
         }
+
+        let client_id = match report {
+            ExecutionReport::MassStatus(mass_status) => Some(mass_status.client_id),
+            ExecutionReport::Order(report) | ExecutionReport::OrderWithFills(report, _) => {
+                self.source_client_id_for_account(report.account_id, &report.instrument_id)
+            }
+            ExecutionReport::Fill(report) => {
+                self.source_client_id_for_account(report.account_id, &report.instrument_id)
+            }
+            ExecutionReport::Position(report) => {
+                self.source_client_id_for_account(report.account_id, &report.instrument_id)
+            }
+        };
+
+        if let Some(client) = client_id.and_then(|client_id| self.get_client(&client_id)) {
+            client.on_execution_report_applied(report);
+        }
     }
 
     /// Reconciles an order status report received at runtime.
@@ -1037,6 +1056,10 @@ impl ExecutionEngine {
     /// This handles exchange-generated orders (liquidation, ADL, settlement) that were
     /// not submitted locally.
     pub fn reconcile_order_status_report(&mut self, report: &OrderStatusReport) {
+        self.handle_order_status_report(report, false);
+    }
+
+    fn handle_order_status_report(&mut self, report: &OrderStatusReport, is_snapshot: bool) {
         msgbus::publish_any(
             MessagingSwitchboard::reconciliation_raw_order_status_report_topic(),
             report,
@@ -1059,8 +1082,17 @@ impl ExecutionEngine {
 
         if let Some(order) = order {
             let ts_now = self.clock.borrow().timestamp_ns();
-            let events =
-                generate_reconciliation_order_events(&order, report, instrument.as_ref(), ts_now);
+
+            let events = if is_snapshot {
+                generate_reconciliation_order_snapshot_events(
+                    &order,
+                    report,
+                    instrument.as_ref(),
+                    ts_now,
+                )
+            } else {
+                generate_reconciliation_order_events(&order, report, instrument.as_ref(), ts_now)
+            };
 
             for event in &events {
                 self.handle_event(event);
@@ -1756,6 +1788,9 @@ impl ExecutionEngine {
     /// Processes all order reports, fill reports, and position reports contained
     /// in the mass status. Order reports are paired with their companion fills so
     /// real trade IDs and commissions are applied before any residual inferred fill.
+    /// Filled-quantity decreases generate fill voids even when no companion fills are present.
+    /// Order snapshots are skipped when cached fill activity is initialized at or after
+    /// collection starts (`mass_status.ts_init`); companion trades still reconcile.
     pub fn reconcile_execution_mass_status(&mut self, mass_status: &ExecutionMassStatus) {
         self.report_count += 1;
 
@@ -1771,13 +1806,26 @@ impl ExecutionEngine {
         let mut paired_venue_ids = AHashSet::new();
 
         for order_report in order_reports.values() {
+            if self.is_order_snapshot_stale(order_report, mass_status.ts_init) {
+                msgbus::publish_any(
+                    MessagingSwitchboard::reconciliation_raw_order_status_report_topic(),
+                    order_report,
+                );
+
+                log::debug!(
+                    "Skipping snapshot for {} after concurrent fill activity",
+                    order_report.venue_order_id,
+                );
+                continue;
+            }
+
             if let Some(fills) = fill_reports.get(&order_report.venue_order_id)
                 && !fills.is_empty()
             {
                 self.reconcile_order_with_fills(order_report, fills);
                 paired_venue_ids.insert(order_report.venue_order_id);
             } else {
-                self.reconcile_order_status_report(order_report);
+                self.handle_order_status_report(order_report, true);
             }
         }
 
@@ -1811,6 +1859,27 @@ impl ExecutionEngine {
                 .map(Vec::len)
                 .sum::<usize>()
         );
+    }
+
+    fn is_order_snapshot_stale(&self, report: &OrderStatusReport, ts_snapshot: UnixNanos) -> bool {
+        let cache = self.cache.borrow();
+
+        let order = report
+            .client_order_id
+            .and_then(|id| cache.order(&id))
+            .or_else(|| {
+                cache
+                    .client_order_id(&report.venue_order_id)
+                    .and_then(|id| cache.order(id))
+            });
+
+        order.is_some_and(|order| {
+            order.events().into_iter().any(|event| match event {
+                OrderEventAny::Filled(fill) => fill.ts_init >= ts_snapshot,
+                OrderEventAny::FillVoided(void) => void.ts_init >= ts_snapshot,
+                _ => false,
+            })
+        })
     }
 
     /// Executes a trading command by routing it to the appropriate execution client.
@@ -2909,6 +2978,17 @@ impl ExecutionEngine {
                 };
 
                 if validation.is_ok() {
+                    if apply_position
+                        && !self.validate_fill_for_external_position(
+                            &order_before_fill,
+                            &fill,
+                            oms_type,
+                            position_id,
+                        )
+                    {
+                        return;
+                    }
+
                     let event = OrderEventAny::Filled(fill.clone());
                     let Some(order) =
                         self.update_cached_order(client_order_id, &event, apply_position)
@@ -3118,8 +3198,8 @@ impl ExecutionEngine {
                 .orderless_hedging_leg_position_id(fill)
                 .or(fill.position_id)
                 .unwrap_or_else(|| self.pos_id_generator.generate(fill.strategy_id, false)),
-            OmsType::Netting => self.determine_netting_position_id(fill),
-            _ => self.determine_netting_position_id(fill),
+            OmsType::Netting => self.determine_netting_position_id(fill, None),
+            _ => self.determine_netting_position_id(fill, None),
         }
     }
 
@@ -3176,29 +3256,24 @@ impl ExecutionEngine {
     }
 
     fn determine_oms_type(&self, fill: &OrderFilled) -> OmsType {
-        if let Some(oms_type) = self.oms_overrides.get(&fill.strategy_id)
-            && *oms_type != OmsType::Unspecified
-        {
-            return *oms_type;
-        }
+        let client_id = self
+            .cache
+            .borrow()
+            .client_id(&fill.client_order_id)
+            .copied();
 
-        if let Some(client_id) = self.routing_map.get(&fill.instrument_id.venue)
-            && let Some(client) = self.clients.get(client_id)
-        {
-            return client.oms_type;
-        }
+        let client = client_id.and_then(|id| self.get_client(&id)).or_else(|| {
+            self.source_client_id_for_account(fill.account_id, &fill.instrument_id)
+                .and_then(|id| self.get_client(&id))
+        });
 
-        if let Some(client) = self.default_client_id.and_then(|id| self.clients.get(&id)) {
-            return client.oms_type;
-        }
-
-        OmsType::Netting // Default fallback
+        self.resolve_oms_type_for_client(fill.strategy_id, client)
     }
 
     fn resolve_oms_type_for_client(
         &self,
         strategy_id: StrategyId,
-        client: &dyn ExecutionClient,
+        client: Option<&dyn ExecutionClient>,
     ) -> OmsType {
         if let Some(oms_type) = self.oms_overrides.get(&strategy_id)
             && *oms_type != OmsType::Unspecified
@@ -3206,7 +3281,8 @@ impl ExecutionEngine {
             return *oms_type;
         }
 
-        client.oms_type()
+        // Missing or ambiguous ownership retains the origin-free NETTING fallback
+        client.map_or(OmsType::Netting, ExecutionClient::oms_type)
     }
 
     fn check_position_id_against_oms(
@@ -3218,7 +3294,7 @@ impl ExecutionEngine {
     ) -> Option<OrderDeniedReason> {
         let position_id = position_id?;
 
-        if self.resolve_oms_type_for_client(strategy_id, client) != OmsType::Netting {
+        if self.resolve_oms_type_for_client(strategy_id, Some(client)) != OmsType::Netting {
             return None;
         }
 
@@ -3291,8 +3367,8 @@ impl ExecutionEngine {
         let position_id = match (oms_type, fill.position_id) {
             (OmsType::Hedging, Some(position_id)) => position_id,
             (OmsType::Hedging, None) => self.determine_hedging_position_id(fill, order),
-            (OmsType::Netting, _) => self.determine_netting_position_id(fill),
-            _ => self.determine_netting_position_id(fill),
+            (OmsType::Netting, _) => self.determine_netting_position_id(fill, order),
+            _ => self.determine_netting_position_id(fill, order),
         };
 
         if !self.validate_fill_for_position(position_id, fill) {
@@ -3370,6 +3446,40 @@ impl ExecutionEngine {
                 fill.trade_id,
                 position.instrument_id,
                 fill.instrument_id
+            );
+            return false;
+        }
+
+        true
+    }
+
+    fn validate_fill_for_external_position(
+        &self,
+        order: &OrderAny,
+        fill: &OrderFilled,
+        oms_type: OmsType,
+        position_id: PositionId,
+    ) -> bool {
+        if oms_type != OmsType::Netting || !order.is_reduce_only() {
+            return true;
+        }
+
+        let cache = self.cache.borrow();
+
+        let Some(position) = cache.position_ref(&position_id) else {
+            return true;
+        };
+
+        if position.strategy_id.is_external()
+            && position.strategy_id != fill.strategy_id
+            && (position.account_id != fill.account_id
+                || !position.is_opposite_side(fill.order_side)
+                || fill.last_qty > position.quantity)
+        {
+            log::error!(
+                "Cannot apply reduce-only fill {} to external NETTING position {position_id}: \
+                 account, side, or quantity does not match the open position",
+                fill.trade_id,
             );
             return false;
         }
@@ -3484,8 +3594,45 @@ impl ExecutionEngine {
         position_id
     }
 
-    fn determine_netting_position_id(&self, fill: &OrderFilled) -> PositionId {
-        PositionId::new(format!("{}-{}", fill.instrument_id, fill.strategy_id))
+    fn determine_netting_position_id(
+        &self,
+        fill: &OrderFilled,
+        order: Option<&OrderAny>,
+    ) -> PositionId {
+        let position_id = PositionId::new(format!("{}-{}", fill.instrument_id, fill.strategy_id));
+        let cache = self.cache.borrow();
+        if order.is_none_or(|order| !order.is_reduce_only())
+            || cache
+                .position_ref(&position_id)
+                .is_some_and(|position| position.is_open())
+        {
+            return position_id;
+        }
+
+        let mut candidates = cache
+            .positions_open(
+                None,
+                Some(&fill.instrument_id),
+                Some(&StrategyId::external()),
+                Some(&fill.account_id),
+                None,
+            )
+            .into_iter()
+            .filter(|position| {
+                position.is_opposite_side(fill.order_side)
+                    && cache.oms_type(&position.id) == Some(OmsType::Netting)
+            });
+
+        let candidate = candidates.next();
+
+        if let Some(position) = candidate
+            && candidates.next().is_none()
+            && fill.last_qty <= position.quantity
+        {
+            return position.id;
+        }
+
+        position_id
     }
 
     fn validate_fill_for_order(&self, order: &OrderAny, fill: &OrderFilled) -> anyhow::Result<()> {
@@ -3686,31 +3833,16 @@ impl ExecutionEngine {
         let topic = switchboard::get_event_order_topic(event.strategy_id());
         msgbus::publish_order_event(topic, event);
 
+        #[rustfmt::skip]
         let topic = match event {
-            OrderEventAny::Submitted(_) => {
-                switchboard::get_order_submitted_topic(event.instrument_id())
-            }
-            OrderEventAny::Rejected(_) => {
-                switchboard::get_order_rejected_topic(event.instrument_id())
-            }
-            OrderEventAny::PendingUpdate(_) => {
-                switchboard::get_order_pending_update_topic(event.instrument_id())
-            }
-            OrderEventAny::PendingCancel(_) => {
-                switchboard::get_order_pending_cancel_topic(event.instrument_id())
-            }
-            OrderEventAny::ModifyRejected(_) => {
-                switchboard::get_order_modify_rejected_topic(event.instrument_id())
-            }
-            OrderEventAny::CancelRejected(_) => {
-                switchboard::get_order_cancel_rejected_topic(event.instrument_id())
-            }
-            OrderEventAny::Canceled(_) => {
-                switchboard::get_order_canceled_topic(event.instrument_id())
-            }
-            OrderEventAny::FillVoided(_) => {
-                switchboard::get_order_fill_voided_topic(event.instrument_id())
-            }
+            OrderEventAny::Submitted(_) => switchboard::get_order_submitted_topic(event.instrument_id()),
+            OrderEventAny::Rejected(_) => switchboard::get_order_rejected_topic(event.instrument_id()),
+            OrderEventAny::PendingUpdate(_) => switchboard::get_order_pending_update_topic(event.instrument_id()),
+            OrderEventAny::PendingCancel(_) => switchboard::get_order_pending_cancel_topic(event.instrument_id()),
+            OrderEventAny::ModifyRejected(_) => switchboard::get_order_modify_rejected_topic(event.instrument_id()),
+            OrderEventAny::CancelRejected(_) => switchboard::get_order_cancel_rejected_topic(event.instrument_id()),
+            OrderEventAny::Canceled(_) => switchboard::get_order_canceled_topic(event.instrument_id()),
+            OrderEventAny::FillVoided(_) => switchboard::get_order_fill_voided_topic(event.instrument_id()),
             // Keep Filled out of this generic fanout: handle_order_fill publishes the instrument
             // topic, while leg fills stay on the strategy topic.
             _ => return,
@@ -3813,6 +3945,10 @@ impl ExecutionEngine {
             )
         };
 
+        if !position_events.is_empty() {
+            self.index_external_position_reduction(order, &fill, oms_type, position.as_ref());
+        }
+
         // Handle contingent orders for both spread and non-spread instruments
         // For spread instruments, contingent orders work without position linkage
         if matches!(order.contingency_type(), Some(ContingencyType::Oto)) {
@@ -3865,6 +4001,28 @@ impl ExecutionEngine {
         position_events
     }
 
+    fn index_external_position_reduction(
+        &self,
+        order: &OrderAny,
+        fill: &OrderFilled,
+        oms_type: OmsType,
+        position: Option<&Position>,
+    ) {
+        if oms_type == OmsType::Netting
+            && order.is_reduce_only()
+            && let Some(position) = position
+            && position.strategy_id.is_external()
+            && let Err(e) = self.cache.borrow_mut().add_position_id(
+                &position.id,
+                &fill.instrument_id.venue,
+                &fill.client_order_id,
+                &position.strategy_id,
+            )
+        {
+            log::error!("Failed to index external position for reducing order: {e}");
+        }
+    }
+
     fn prepare_order_fill_void_positions(
         &self,
         order: &OrderAny,
@@ -3883,11 +4041,22 @@ impl ExecutionEngine {
 
         let positions: Vec<Position> = {
             let cache = self.cache.borrow();
+
+            let strategy_id = event
+                .position_id
+                .and_then(|id| cache.position_ref(&id))
+                .filter(|position| {
+                    order.is_reduce_only()
+                        && position.strategy_id.is_external()
+                        && cache.oms_type(&position.id) == Some(OmsType::Netting)
+                })
+                .map_or(event.strategy_id, |position| position.strategy_id);
+
             cache
                 .positions(
                     None,
                     Some(&event.instrument_id),
-                    Some(&event.strategy_id),
+                    Some(&strategy_id),
                     Some(&event.account_id),
                     None,
                 )
@@ -4122,8 +4291,8 @@ impl ExecutionEngine {
     ) -> Vec<PositionEvent> {
         enum Action {
             Open,
-            Reopen(Position),
-            Flip(Position),
+            Reopen,
+            Flip(Box<Position>),
             Update,
         }
 
@@ -4139,9 +4308,9 @@ impl ExecutionEngine {
 
             match cache.position(&position_id) {
                 None => Action::Open,
-                Some(position) if position.is_closed() => Action::Reopen(position.clone()),
+                Some(position) if position.is_closed() => Action::Reopen,
                 Some(position) if self.will_flip_position(&position, &fill) => {
-                    Action::Flip(position.clone())
+                    Action::Flip(Box::new(position.clone()))
                 }
                 Some(_) => Action::Update,
             }
@@ -4153,15 +4322,15 @@ impl ExecutionEngine {
                     return Vec::new();
                 }
 
-                self.open_position(instrument, None, fill, oms_type)
+                self.open_position(instrument, None, true, fill, oms_type)
                     .unwrap_or_default()
             }
-            Action::Reopen(position) => {
+            Action::Reopen => {
                 if self.reject_reduce_only_position_open(&fill, oms_type) {
                     return Vec::new();
                 }
 
-                self.open_position(instrument, Some(&position), fill, oms_type)
+                self.open_position(instrument, Some(position_id), true, fill, oms_type)
                     .unwrap_or_default()
             }
             Action::Flip(mut position) => {
@@ -4222,46 +4391,51 @@ impl ExecutionEngine {
     fn open_position(
         &self,
         instrument: &InstrumentAny,
-        position: Option<&Position>,
+        prior_position_id: Option<PositionId>,
+        archive_prior: bool,
         fill: OrderFilled,
         oms_type: OmsType,
     ) -> anyhow::Result<Vec<PositionEvent>> {
-        if let Some(position) = position {
-            if Self::is_duplicate_closed_fill(position, &fill) {
-                log::warn!(
-                    "Ignoring duplicate fill {} for closed position {}; no position reopened (side={:?}, qty={}, px={})",
-                    fill.trade_id,
-                    position.id,
-                    fill.order_side,
-                    fill.last_qty,
-                    fill.last_px
-                );
-                return Ok(Vec::new());
+        if let Some(position_id) = prior_position_id {
+            let prior_snapshot = {
+                let cache = self.cache.borrow();
+                let position = cache
+                    .position(&position_id)
+                    .ok_or_else(|| anyhow::anyhow!("position {position_id} is not cached"))?;
+
+                if archive_prior && position.has_replay_trade_id(fill.trade_id) {
+                    log::warn!(
+                        "Ignoring duplicate fill {} for closed position {}; no position reopened (side={:?}, qty={}, px={})",
+                        fill.trade_id,
+                        position.id,
+                        fill.order_side,
+                        fill.last_qty,
+                        fill.last_px
+                    );
+                    return Ok(Vec::new());
+                }
+
+                archive_prior.then(|| position.clone_for_snapshot())
+            };
+
+            if let Some(position) = prior_snapshot {
+                self.reopen_position(&position, oms_type)?;
             }
-            self.reopen_position(position, oms_type)?;
         }
 
-        // The prior-position clone exists only to carry replay state across the reopen
-        let prior_position = if self.config.carry_replay_events_on_reopen {
-            position.cloned().or_else(|| {
-                fill.position_id
-                    .and_then(|position_id| self.cache.borrow().position_owned(&position_id))
-            })
-        } else {
-            None
-        };
-        let mut position = Position::new(instrument, fill.clone());
-        if let Some(prior) = prior_position
-            && prior.id == position.id
-        {
-            let current_replay = position.replay_events.clone();
-            position.replay_events = prior.replay_events;
-            position.replay_events.extend(current_replay);
-            position.fill_voids = prior.fill_voids;
-        }
+        let position = Position::new(instrument, fill.clone());
         let is_orderless_leg = self.is_leg_fill(&fill)
             && !self.cache.borrow().order_exists(&position.opening_order_id);
-        if is_orderless_leg {
+        if let Some(position_id) = prior_position_id {
+            debug_assert_eq!(position_id, position.id);
+
+            self.cache.borrow_mut().replace_position(
+                &position,
+                oms_type,
+                !is_orderless_leg,
+                self.config.carry_replay_events_on_reopen,
+            )?;
+        } else if is_orderless_leg {
             self.cache
                 .borrow_mut()
                 .add_position_without_order(&position, oms_type)?;
@@ -4269,23 +4443,25 @@ impl ExecutionEngine {
             self.cache.borrow_mut().add_position(&position, oms_type)?;
         }
 
-        if self.config.snapshot_positions {
-            self.create_position_state_snapshot(&position, true);
+        let (position, snapshot_position) = {
+            let cache = self.cache.borrow();
+            let position = cache
+                .position(&fill.position_id.expect("Opening fill has no position ID"))
+                .expect("Opened position is no longer cached");
+            (
+                position.clone_for_snapshot(),
+                self.config.snapshot_positions.then(|| position.clone()),
+            )
+        };
+
+        if let Some(snapshot_position) = snapshot_position {
+            self.create_position_state_snapshot(&snapshot_position, true);
         }
 
         let ts_init = self.clock.borrow().timestamp_ns();
         let event = PositionOpened::create(&position, &fill, UUID4::new(), ts_init);
 
         Ok(vec![PositionEvent::PositionOpened(event)])
-    }
-
-    fn is_duplicate_closed_fill(position: &Position, fill: &OrderFilled) -> bool {
-        position.replay_events.iter().any(|event| {
-            matches!(
-                event,
-                PositionReplayEvent::Filled(replayed) if replayed.trade_id == fill.trade_id
-            )
-        })
     }
 
     fn reopen_position(&self, position: &Position, oms_type: OmsType) -> anyhow::Result<()> {
@@ -4484,7 +4660,10 @@ impl ExecutionEngine {
         }
 
         // Open flipped position
-        match self.open_position(instrument, None, fill_split2, oms_type) {
+        let prior_position_id =
+            (fill_split2.position_id == Some(position.id)).then_some(position.id);
+
+        match self.open_position(instrument, prior_position_id, false, fill_split2, oms_type) {
             Ok(opened_events) => position_events.extend(opened_events),
             Err(e) => log::error!("Failed to open flipped position: {e:?}"),
         }
@@ -4563,18 +4742,147 @@ enum SubmissionValidationResult {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_common::clock::TestClock;
+    use nautilus_common::{
+        clients::ExecutionClient,
+        clock::VirtualClock,
+        messages::ExecutionReport,
+        msgbus::{MessageBus, set_message_bus},
+    };
+    use nautilus_core::Params;
     use nautilus_model::{
+        accounts::AccountAny,
         enums::{LiquiditySide, OrderSide, OrderType, PositionSide},
-        events::order::spec::OrderFilledSpec,
-        identifiers::{AccountId, ClientOrderId, TradeId, VenueOrderId},
+        events::{OrderFillVoided, order::spec::OrderFilledSpec},
+        identifiers::{AccountId, ClientId, ClientOrderId, TradeId, Venue, VenueOrderId},
         instruments::{InstrumentAny, stubs::audusd_sim},
         orders::builder::OrderTestBuilder,
-        types::Price,
+        position::PositionFillVoid,
+        types::{AccountBalance, MarginBalance, Price},
     };
     use rstest::*;
 
     use super::*;
+
+    #[derive(Debug)]
+    struct ApplicationRecordingClient {
+        client_id: ClientId,
+        account_id: AccountId,
+        venue: Venue,
+        cache: Rc<RefCell<Cache>>,
+        application_states: Rc<RefCell<Vec<bool>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl ExecutionClient for ApplicationRecordingClient {
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn client_id(&self) -> ClientId {
+            self.client_id
+        }
+
+        fn account_id(&self) -> AccountId {
+            self.account_id
+        }
+
+        fn venue(&self) -> Venue {
+            self.venue
+        }
+
+        fn oms_type(&self) -> OmsType {
+            OmsType::Netting
+        }
+
+        fn get_account(&self) -> Option<AccountAny> {
+            None
+        }
+
+        fn on_execution_report_applied(&self, report: &ExecutionReport) {
+            let applied = match report {
+                ExecutionReport::Order(report) | ExecutionReport::OrderWithFills(report, _) => self
+                    .cache
+                    .borrow()
+                    .client_order_id(&report.venue_order_id)
+                    .is_some(),
+                _ => false,
+            };
+            self.application_states.borrow_mut().push(applied);
+        }
+
+        fn generate_account_state(
+            &self,
+            _balances: Vec<AccountBalance>,
+            _margins: Vec<MarginBalance>,
+            _reported: bool,
+            _ts_event: UnixNanos,
+            _info: Option<Params>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn start(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[rstest]
+    fn execution_report_application_callback_follows_cache_update_and_exact_route() {
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let instrument_id = instrument.id();
+        cache.borrow_mut().add_instrument(instrument).unwrap();
+        let mut engine = ExecutionEngine::new(clock, Rc::clone(&cache), None);
+        let matched_states = Rc::new(RefCell::new(Vec::new()));
+        let unmatched_states = Rc::new(RefCell::new(Vec::new()));
+        engine
+            .register_client(Box::new(ApplicationRecordingClient {
+                client_id: ClientId::from("MATCHED"),
+                account_id: AccountId::from("SIM-001"),
+                venue: instrument_id.venue,
+                cache: Rc::clone(&cache),
+                application_states: Rc::clone(&matched_states),
+            }))
+            .unwrap();
+        engine
+            .register_client(Box::new(ApplicationRecordingClient {
+                client_id: ClientId::from("UNMATCHED"),
+                account_id: AccountId::from("OTHER-001"),
+                venue: Venue::from("OTHER"),
+                cache: Rc::clone(&cache),
+                application_states: Rc::clone(&unmatched_states),
+            }))
+            .unwrap();
+        let venue_order_id = VenueOrderId::from("V-APPLICATION-1");
+        let report = OrderStatusReport::new(
+            AccountId::from("SIM-001"),
+            instrument_id,
+            None,
+            venue_order_id,
+            Some(OrderSide::Buy),
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Accepted,
+            Quantity::from(10_000),
+            Quantity::zero(0),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            None,
+        )
+        .with_price(Price::from("1.00000"));
+
+        engine.reconcile_execution_report(&ExecutionReport::Order(Box::new(report)));
+
+        assert_eq!(&*matched_states.borrow(), &[true]);
+        assert!(unmatched_states.borrow().is_empty());
+        assert!(cache.borrow().client_order_id(&venue_order_id).is_some());
+    }
 
     #[rstest]
     fn netting_positions_open_for_report_scopes_positions_by_account() {
@@ -4697,7 +5005,7 @@ mod tests {
             .add_venue_order_id(&owner_id, &venue_order_id, false)
             .unwrap();
         let engine = ExecutionEngine::new(
-            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(VirtualClock::new())),
             Rc::clone(&cache),
             None,
         );
@@ -4732,6 +5040,206 @@ mod tests {
             Some(&owner_id)
         );
         assert_eq!(cache.borrow().venue_order_id(&claimant_id), None);
+    }
+
+    #[rstest]
+    fn carry_replay_reopen_transfers_history_allocations() {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let position_id = PositionId::from("P-REOPEN-TRANSFER");
+        let opening = position_fill(
+            &instrument,
+            position_id,
+            "O-OPEN",
+            "T-OPEN",
+            OrderSide::Buy,
+            10,
+            1,
+        );
+        let closing = position_fill(
+            &instrument,
+            position_id,
+            "O-CLOSE",
+            "T-CLOSE",
+            OrderSide::Sell,
+            10,
+            2,
+        );
+        let reopening = position_fill(
+            &instrument,
+            position_id,
+            "O-REOPEN",
+            "T-REOPEN",
+            OrderSide::Buy,
+            10,
+            3,
+        );
+        let mut position = Position::new(&instrument, opening.clone());
+        position.apply(&closing);
+
+        let fill_voided = OrderFillVoided::new(
+            opening.trader_id,
+            opening.strategy_id,
+            opening.instrument_id,
+            opening.client_order_id,
+            opening.venue_order_id,
+            opening.account_id,
+            "C-TRANSFER".into(),
+            opening.trade_id,
+            Quantity::from(1),
+            None,
+            opening.order_side,
+            opening.order_type,
+            opening.last_px,
+            opening.currency,
+            opening.liquidity_side,
+            opening.position_id,
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::from(4),
+            UnixNanos::from(4),
+            false,
+            false,
+        );
+        position.fill_voids.push(PositionFillVoid {
+            event: fill_voided,
+            voided_qty: Quantity::from(1),
+            commission_voided: None,
+        });
+
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+        {
+            let mut cached = cache.borrow_mut();
+            let mut position = cached.position_mut(&position_id).unwrap();
+            position.replay_events.reserve(8);
+            position.fill_voids.reserve(4);
+        }
+        let (replay_ptr, void_ptr, replay_len, void_len, replay_before, voids_before) = {
+            let cache = cache.borrow();
+            let position = cache.position(&position_id).unwrap();
+            (
+                position.replay_events.as_ptr(),
+                position.fill_voids.as_ptr(),
+                position.replay_events.len(),
+                position.fill_voids.len(),
+                serde_json::to_value(&position.replay_events).unwrap(),
+                serde_json::to_value(&position.fill_voids).unwrap(),
+            )
+        };
+        let config = ExecutionEngineConfig::builder()
+            .carry_replay_events_on_reopen(true)
+            .build()
+            .unwrap();
+        let mut engine = ExecutionEngine::new(
+            Rc::new(RefCell::new(VirtualClock::new())),
+            Rc::clone(&cache),
+            Some(config),
+        );
+
+        let events = engine.handle_position_update(&instrument, reopening, OmsType::Netting);
+
+        assert_eq!(events.len(), 1);
+        let cache = cache.borrow();
+        let position = cache.position(&position_id).unwrap();
+        assert_eq!(position.replay_events.as_ptr(), replay_ptr);
+        assert_eq!(position.fill_voids.as_ptr(), void_ptr);
+        assert_eq!(position.replay_events.len(), replay_len + 1);
+        assert_eq!(position.fill_voids.len(), void_len);
+        assert_eq!(
+            serde_json::to_value(&position.replay_events[..replay_len]).unwrap(),
+            replay_before,
+        );
+        assert_eq!(
+            serde_json::to_value(&position.fill_voids).unwrap(),
+            voids_before
+        );
+        assert!(matches!(
+            &position.replay_events[0],
+            PositionReplayEvent::Filled(fill) if fill.event_id == opening.event_id
+        ));
+    }
+
+    #[rstest]
+    fn position_opened_uses_state_captured_before_snapshot_subscriber() {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let position_id = PositionId::from("P-SNAPSHOT-SUBSCRIBER");
+        let fill = position_fill(
+            &instrument,
+            position_id,
+            "O-SNAPSHOT-SUBSCRIBER",
+            "T-SNAPSHOT-SUBSCRIBER",
+            OrderSide::Buy,
+            10,
+            1,
+        );
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let config = ExecutionEngineConfig::builder()
+            .snapshot_positions(true)
+            .build()
+            .unwrap();
+        let engine = ExecutionEngine::new(
+            Rc::new(RefCell::new(VirtualClock::new())),
+            Rc::clone(&cache),
+            Some(config),
+        );
+        set_message_bus(Rc::new(RefCell::new(MessageBus::default())));
+        let subscriber_cache = Rc::clone(&cache);
+        let topic = switchboard::get_snapshot_position_topic(position_id);
+        msgbus::subscribe_any(
+            topic.as_str().into(),
+            TypedHandler::from_typed::<PositionStateSnapshot, _>(move |_| {
+                subscriber_cache
+                    .borrow_mut()
+                    .position_mut(&position_id)
+                    .unwrap()
+                    .quantity = Quantity::from(99);
+            }),
+            None,
+        );
+
+        let events = engine
+            .open_position(&instrument, None, true, fill.clone(), OmsType::Netting)
+            .unwrap();
+
+        assert_eq!(
+            cache.borrow().position(&position_id).unwrap().quantity,
+            Quantity::from(99)
+        );
+        let [PositionEvent::PositionOpened(opened)] = events.as_slice() else {
+            panic!("Expected one position-opened event");
+        };
+        assert_eq!(opened.position_id, position_id);
+        assert_eq!(opened.opening_order_id, fill.client_order_id);
+        assert_eq!(opened.quantity, fill.last_qty);
+        assert_eq!(opened.last_px, fill.last_px);
+    }
+
+    fn position_fill(
+        instrument: &InstrumentAny,
+        position_id: PositionId,
+        order_id: &str,
+        trade_id: &str,
+        order_side: OrderSide,
+        quantity: u32,
+        ts_event: u64,
+    ) -> OrderFilled {
+        OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from(order_id))
+            .venue_order_id(VenueOrderId::from(order_id))
+            .trade_id(TradeId::from(trade_id))
+            .order_side(order_side)
+            .last_qty(Quantity::from(quantity))
+            .last_px(Price::from("1.00000"))
+            .currency(instrument.quote_currency())
+            .liquidity_side(LiquiditySide::Maker)
+            .position_id(position_id)
+            .ts_event(UnixNanos::from(ts_event))
+            .build()
     }
 
     fn position_for_account(

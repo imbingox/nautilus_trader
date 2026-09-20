@@ -29,6 +29,6 @@ from nautilus_trader._libnautilus import *  # noqa: F403 (undefined-local-with-i
 # Derive the version from installed distribution metadata so it always matches the built
 # wheel. `_metadata` is underscore-aliased so the star import above cannot shadow it.
 try:
-    __version__ = _metadata.version("nautilus-trader")
+    __version__ = _metadata.version("nautilus-trader-papi")
 except _metadata.PackageNotFoundError:  # pragma: no cover
     __version__ = "unknown"

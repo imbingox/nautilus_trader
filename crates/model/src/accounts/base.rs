@@ -23,12 +23,12 @@ use indexmap::IndexMap;
 use nautilus_core::{
     DurationNanos, UnixNanos,
     correctness::{
-        CorrectnessError, CorrectnessResult, FAILED, check_equal, check_predicate_false,
-        check_predicate_true,
+        CorrectnessError, CorrectnessResult, CorrectnessResultExt, FAILED, check_equal,
+        check_predicate_false, check_predicate_true,
     },
 };
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 
 use crate::{
     enums::{AccountType, LiquiditySide, OrderSide},
@@ -41,6 +41,7 @@ use crate::{
 
 /// Represents the account state shared by every account type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "BaseAccountValues")]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
@@ -63,19 +64,48 @@ pub struct BaseAccount {
     pub balances: IndexMap<Currency, AccountBalance>,
     /// The total balances the account started with, keyed by currency.
     pub balances_starting: IndexMap<Currency, Money>,
+    /// Reported totals with unavailable free and locked components, keyed by currency.
+    #[serde(default)]
+    pub total_only_balances: IndexMap<Currency, Money>,
 }
 
 impl BaseAccount {
     /// Creates a new [`BaseAccount`] instance.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the balance representations are invalid or unsupported.
     #[must_use]
     pub fn new(event: AccountState, calculate_account_state: bool) -> Self {
+        Self::new_checked(event, calculate_account_state).expect_display(FAILED)
+    }
+
+    /// Creates an account after validating its balance representations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for duplicate or overlapping currencies, or totals-only balances
+    /// outside a margin account with local calculation disabled.
+    pub fn new_checked(
+        event: AccountState,
+        calculate_account_state: bool,
+    ) -> CorrectnessResult<Self> {
+        Self::validate_event_balances(&event, calculate_account_state)?;
         let mut balances_starting: IndexMap<Currency, Money> = IndexMap::new();
         let mut balances: IndexMap<Currency, AccountBalance> = IndexMap::new();
         event.balances.iter().for_each(|balance| {
             balances_starting.insert(balance.currency, balance.total);
             balances.insert(balance.currency, *balance);
         });
-        Self {
+        let total_only_balances = event
+            .total_only_balances
+            .iter()
+            .map(|balance| {
+                balances_starting.insert(balance.currency, *balance);
+                (balance.currency, *balance)
+            })
+            .collect();
+        Ok(Self {
             id: event.account_id,
             account_type: event.account_type,
             base_currency: event.base_currency,
@@ -83,8 +113,9 @@ impl BaseAccount {
             events: vec![event],
             commissions: AHashMap::new(),
             balances,
+            total_only_balances,
             balances_starting,
-        }
+        })
     }
 
     #[must_use]
@@ -97,6 +128,7 @@ impl BaseAccount {
             events: Vec::new(),
             commissions: self.commissions.clone(),
             balances: self.balances.clone(),
+            total_only_balances: self.total_only_balances.clone(),
             balances_starting: self.balances_starting.clone(),
         }
     }
@@ -121,7 +153,13 @@ impl BaseAccount {
     /// Panics if `currency` is `None` and `self.base_currency` is `None`.
     #[must_use]
     pub fn base_balance_total(&self, currency: Option<Currency>) -> Option<Money> {
-        self.base_balance(currency).map(|balance| balance.total)
+        let currency = currency
+            .or(self.base_currency)
+            .expect("Currency must be specified");
+        self.balances
+            .get(&currency)
+            .map(|balance| balance.total)
+            .or_else(|| self.total_only_balances.get(&currency).copied())
     }
 
     #[must_use]
@@ -129,6 +167,11 @@ impl BaseAccount {
         self.balances
             .iter()
             .map(|(currency, balance)| (*currency, balance.total))
+            .chain(
+                self.total_only_balances
+                    .iter()
+                    .map(|(currency, balance)| (*currency, *balance)),
+            )
             .collect()
     }
 
@@ -181,6 +224,7 @@ impl BaseAccount {
     /// - `CashAccount`: rejects negative unless `allow_borrowing` is true
     pub fn update_balances(&mut self, balances: &[AccountBalance]) {
         for balance in balances {
+            self.total_only_balances.shift_remove(&balance.currency);
             self.balances.insert(balance.currency, *balance);
         }
     }
@@ -248,15 +292,61 @@ impl BaseAccount {
         Ok(())
     }
 
+    /// Checks supported balance representations before any account mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for duplicate or overlapping currencies, or unsupported totals-only balances.
+    pub(crate) fn check_event_balances(&self, event: &AccountState) -> anyhow::Result<()> {
+        Self::validate_event_balances(event, self.calculate_account_state)?;
+        check_predicate_true(
+            event.total_only_balances.is_empty() || self.account_type == AccountType::Margin,
+            "totals-only balances require a margin account",
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_event_balances(
+        event: &AccountState,
+        calculate_account_state: bool,
+    ) -> CorrectnessResult<()> {
+        event.validate_balances()?;
+        check_predicate_true(
+            event.total_only_balances.is_empty() || !calculate_account_state,
+            "totals-only balances require local account-state calculation to be disabled",
+        )
+    }
+
+    pub(crate) fn deserialize_full_balances<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        let account = Self::deserialize(deserializer)?;
+        check_predicate_true(
+            account.total_only_balances.is_empty(),
+            "this account type does not support totals-only balances",
+        )
+        .map_err(de::Error::custom)?;
+        Ok(account)
+    }
+
     /// Applies an [`AccountState`] event, updating balances.
     ///
     /// # Panics
     ///
-    /// Panics if `event.account_id` does not match this account's ID. Every account rejects a
-    /// foreign event before reaching here, so this remains an internal invariant.
+    /// Panics if the account identity or balance representations are invalid. Concrete
+    /// accounts validate the event before reaching here.
     pub fn base_apply(&mut self, event: AccountState) {
         check_equal(&event.account_id, &self.id, "event.account_id", "self.id").expect(FAILED);
+        self.check_event_account_id(&event)
+            .expect("Invalid account event identity");
+        self.check_event_balances(&event)
+            .expect("Invalid account balance representations");
         self.update_balances(&event.balances);
+
+        for balance in &event.total_only_balances {
+            self.balances.shift_remove(&balance.currency);
+            self.total_only_balances.insert(balance.currency, *balance);
+        }
         self.events.push(event);
     }
 
@@ -409,6 +499,55 @@ impl BaseAccount {
             .ok_or_else(|| anyhow::anyhow!("commission calculation overflow"))?;
 
         Ok(Money::from_decimal(commission, notional.currency)?)
+    }
+}
+
+#[derive(Deserialize)]
+struct BaseAccountValues {
+    id: AccountId,
+    account_type: AccountType,
+    base_currency: Option<Currency>,
+    calculate_account_state: bool,
+    events: Vec<AccountState>,
+    commissions: AHashMap<Currency, Money>,
+    balances: IndexMap<Currency, AccountBalance>,
+    balances_starting: IndexMap<Currency, Money>,
+    #[serde(default)]
+    total_only_balances: IndexMap<Currency, Money>,
+}
+
+impl TryFrom<BaseAccountValues> for BaseAccount {
+    type Error = CorrectnessError;
+
+    fn try_from(value: BaseAccountValues) -> CorrectnessResult<Self> {
+        check_predicate_true(
+            value.total_only_balances.is_empty()
+                || (value.account_type == AccountType::Margin && !value.calculate_account_state),
+            "totals-only balances require a margin account with local calculation disabled",
+        )?;
+
+        for (currency, balance) in &value.total_only_balances {
+            check_predicate_true(
+                *currency == balance.currency,
+                "totals-only balance currency differs from its map key",
+            )?;
+            check_predicate_true(
+                !value.balances.contains_key(currency),
+                &format!("overlapping balance currency: {currency}"),
+            )?;
+        }
+
+        Ok(Self {
+            id: value.id,
+            account_type: value.account_type,
+            base_currency: value.base_currency,
+            calculate_account_state: value.calculate_account_state,
+            events: value.events,
+            commissions: value.commissions,
+            balances: value.balances,
+            total_only_balances: value.total_only_balances,
+            balances_starting: value.balances_starting,
+        })
     }
 }
 
@@ -668,6 +807,22 @@ mod tests {
     }
 
     #[rstest]
+    fn test_base_purge_account_events_drops_event_exactly_at_cutoff() {
+        let mut account = BaseAccount::new(cash_account_state(), true);
+        let mut at_cutoff = cash_account_state();
+        at_cutoff.ts_event = UnixNanos::from(200_000_000_000);
+        account.base_apply(at_cutoff);
+        let mut after_cutoff = cash_account_state();
+        after_cutoff.ts_event = UnixNanos::from(200_000_000_001);
+        account.base_apply(after_cutoff);
+
+        account.base_purge_account_events(UnixNanos::from(300_000_000_000), 100);
+
+        assert_eq!(account.events.len(), 1);
+        assert_eq!(account.events[0].ts_event, UnixNanos::from(200_000_000_001));
+    }
+
+    #[rstest]
     fn test_base_purge_account_events_retains_future_event_without_overflow() {
         let mut event = cash_account_state();
         event.ts_event = UnixNanos::from(u64::MAX - 1);
@@ -763,6 +918,28 @@ mod tests {
     }
 
     #[rstest]
+    fn test_balance_from_locks_clamps_reservations_to_total() {
+        let usd = Currency::USD();
+        let total = Money::from("100 USD");
+        let current = AccountBalance::new(total, Money::zero(usd), total);
+        let mut balances_locked = AHashMap::new();
+        balances_locked.insert(
+            (InstrumentId::from("AUD/USD.SIM"), usd),
+            Money::from("60 USD"),
+        );
+        balances_locked.insert(
+            (InstrumentId::from("EUR/USD.SIM"), usd),
+            Money::from("60 USD"),
+        );
+
+        let balance = balance_from_locks(current, &balances_locked).unwrap();
+
+        assert_eq!(balance.total, total);
+        assert_eq!(balance.locked, total);
+        assert_eq!(balance.free, Money::zero(usd));
+    }
+
+    #[rstest]
     #[case::positive_total("1000 USD", "1000 USD", "0 USD")]
     #[case::negative_total("-1000 USD", "0 USD", "-1000 USD")]
     fn test_recalculate_balance_degrades_to_non_spendable_for_invalid_reservation(
@@ -812,6 +989,25 @@ mod tests {
         account.update_commissions(Money::from_raw(1, usd));
 
         assert!(account.commission(&usd).is_none());
+    }
+
+    #[rstest]
+    fn test_commissions_returns_every_currency() {
+        let mut account = BaseAccount::new(cash_account_state(), true);
+        account.update_commissions(Money::from("2.50 USD"));
+        account.update_commissions(Money::from("1.25 AUD"));
+
+        let commissions = account.commissions();
+
+        assert_eq!(commissions.len(), 2);
+        assert_eq!(
+            commissions.get(&Currency::USD()),
+            Some(&Money::from("2.50 USD"))
+        );
+        assert_eq!(
+            commissions.get(&Currency::AUD()),
+            Some(&Money::from("1.25 AUD"))
+        );
     }
 
     #[rstest]

@@ -1,0 +1,15 @@
+[
+  {
+    "entryPrice": "0.00000",
+    "leverage": "10",
+    "markPrice": "6679.50671178",
+    "maxNotionalValue": "20000000",
+    "positionAmt": "0.000",
+    "notional": "0",
+    "symbol": "BTCUSDT",
+    "unRealizedProfit": "0.00000000",
+    "liquidationPrice": "6170.20509059",
+    "positionSide": "BOTH",
+    "updateTime": 1625474304765
+  }
+]

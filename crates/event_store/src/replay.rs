@@ -2006,10 +2006,10 @@ mod tests {
     use nautilus_common::msgbus::{self, BusTap, Endpoint, MStr, Topic as BusTopic};
     use nautilus_core::{UUID4, UnixNanos};
     use nautilus_model::{
-        accounts::AccountAny,
+        accounts::{Account, AccountAny},
         data::{Bar, BarSpecification, BarType, FundingRateUpdate, QuoteTick, TradeTick},
         enums::{
-            AggregationSource, AggressorSide, BarAggregation, OrderSide, OrderStatus,
+            AccountType, AggregationSource, AggressorSide, BarAggregation, OrderSide, OrderStatus,
             PositionAdjustmentType, PositionSide, PriceType,
         },
         events::{
@@ -2528,6 +2528,11 @@ mod tests {
         ),
         cache_mutation(
             "add_position_without_order",
+            CacheMutationRecoveryClass::EventStoreCapturedAndReplayed,
+            &[PAYLOAD_TYPE_ORDER_FILLED],
+        ),
+        cache_mutation(
+            "replace_position",
             CacheMutationRecoveryClass::EventStoreCapturedAndReplayed,
             &[PAYLOAD_TYPE_ORDER_FILLED],
         ),
@@ -3209,6 +3214,97 @@ mod tests {
         assert_eq!(bus_calls.get(), 0);
         assert_eq!(account.last_event(), Some(state));
         assert_eq!(account.base_currency(), Some(Currency::USD()));
+    }
+
+    #[rstest]
+    fn replay_preserves_totals_only_account_balances() {
+        let account_id = AccountId::from("BINANCE-PAPI-001");
+        let usd = Currency::USD();
+        let usdt = Currency::USDT();
+        let mut state = cash_account_state();
+        state.account_id = account_id;
+        state.account_type = AccountType::Margin;
+        state.base_currency = None;
+        state.balances.clear();
+        let state = state
+            .with_total_only_balances(vec![Money::from("-19.23 USD"), Money::from("0 USDT")])
+            .unwrap();
+        let mut next = state.clone();
+        next.event_id = UUID4::new();
+        next.total_only_balances = vec![Money::zero(usd)];
+        let reader = reader_with_entries(
+            "run-totals-only-replay",
+            &[
+                append_account_state(1, &state),
+                append_account_state(2, &next),
+            ],
+        );
+        let mut cache = Cache::default();
+        let report =
+            replay_cache_snapshot_tail(&mut cache, &reader).expect("replay totals-only account");
+        let account = cache.account_owned(&account_id).expect("account replayed");
+
+        assert_eq!(report.applied_entries, 2);
+        assert_eq!(report.ignored_entries, 0);
+        assert_eq!(account.balance_total(Some(usd)), Some(Money::zero(usd)));
+        assert_eq!(account.balance_total(Some(usdt)), Some(Money::zero(usdt)));
+        assert_eq!(account.balance_free(Some(usd)), None);
+        assert_eq!(
+            account.starting_balances().get(&usd),
+            Some(&Money::from("-19.23 USD"))
+        );
+        assert_eq!(account.event_count(), 2);
+        assert_eq!(
+            account.last_event().unwrap().total_only_balances,
+            next.total_only_balances
+        );
+    }
+
+    #[rstest]
+    fn replay_reads_legacy_account_payload_without_totals_only() {
+        struct LegacyAccountState<'a>(&'a AccountState);
+
+        impl Serialize for LegacyAccountState<'_> {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                use serde::ser::SerializeStruct;
+
+                let mut record = serializer.serialize_struct("AccountState", 9)?;
+                record.serialize_field("account_id", &self.0.account_id)?;
+                record.serialize_field("account_type", &self.0.account_type)?;
+                record.serialize_field("base_currency", &self.0.base_currency)?;
+                record.serialize_field("balances", &self.0.balances)?;
+                record.serialize_field("margins", &self.0.margins)?;
+                record.serialize_field("is_reported", &self.0.is_reported)?;
+                record.serialize_field("event_id", &self.0.event_id)?;
+                record.serialize_field("ts_event", &self.0.ts_event)?;
+                record.serialize_field("ts_init", &self.0.ts_init)?;
+                record.end()
+            }
+        }
+
+        let state = cash_account_state();
+        let legacy = LegacyAccountState(&state);
+        let payload = Bytes::from(rmp_serde::to_vec_named(&legacy).unwrap());
+        let reader = reader_with_entries(
+            "run-legacy-account-replay",
+            &[append_payload(1, PAYLOAD_TYPE_ACCOUNT_STATE, payload)],
+        );
+        let mut cache = Cache::default();
+        let report =
+            replay_cache_snapshot_tail(&mut cache, &reader).expect("replay legacy account");
+        let account = cache
+            .account_owned(&state.account_id)
+            .expect("account replayed");
+
+        assert_eq!(report.applied_entries, 1);
+        assert!(account.total_only_balances().is_empty());
+        assert_eq!(
+            account.balances_total(),
+            AccountAny::from(state).balances_total()
+        );
     }
 
     #[rstest]

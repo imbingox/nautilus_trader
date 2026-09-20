@@ -1,0 +1,18 @@
+[
+  {
+    "symbol": "BTCUSDT",
+    "id": 67880589,
+    "orderId": 270093109,
+    "side": "SELL",
+    "price": "28511.00",
+    "qty": "0.010",
+    "realizedPnl": "2.58500000",
+    "quoteQty": "285.11000",
+    "commission": "0.11404400",
+    "commissionAsset": "USDT",
+    "time": 1680688557875,
+    "buyer": false,
+    "maker": false,
+    "positionSide": "BOTH"
+  }
+]

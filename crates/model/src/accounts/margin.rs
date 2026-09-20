@@ -35,7 +35,9 @@ use std::{
 
 use ahash::AHashMap;
 use indexmap::IndexMap;
-use nautilus_core::correctness::{CorrectnessResultExt, FAILED, check_positive_decimal};
+use nautilus_core::correctness::{
+    CorrectnessResult, CorrectnessResultExt, FAILED, check_positive_decimal,
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -86,18 +88,35 @@ pub struct MarginAccount {
 
 impl MarginAccount {
     /// Creates a new [`MarginAccount`] instance.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the balance representations are invalid or unsupported.
     #[must_use]
     pub fn new(event: AccountState, calculate_account_state: bool) -> Self {
+        Self::new_checked(event, calculate_account_state).expect_display(FAILED)
+    }
+
+    /// Creates a margin account after validating its balance representations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for duplicate or overlapping currencies, or totals-only balances
+    /// with local calculation enabled or a non-margin account type.
+    pub fn new_checked(
+        event: AccountState,
+        calculate_account_state: bool,
+    ) -> CorrectnessResult<Self> {
         let (margins, account_margins) = split_event_margins(&event);
 
-        Self {
-            base: BaseAccount::new(event, calculate_account_state),
+        Ok(Self {
+            base: BaseAccount::new_checked(event, calculate_account_state)?,
             leverages: AHashMap::new(),
             margins,
             account_margins,
             default_leverage: Decimal::ONE,
             margin_model: MarginModelHandle::default(),
-        }
+        })
     }
 
     #[must_use]
@@ -564,8 +583,11 @@ impl Account for MarginAccount {
 
     fn apply(&mut self, event: AccountState) -> anyhow::Result<()> {
         self.check_event_account_id(&event)?;
+        self.check_event_balances(&event)?;
 
-        let skip_margin_routing = event.balances.is_empty() && event.margins.is_empty();
+        let skip_margin_routing = event.balances.is_empty()
+            && event.total_only_balances.is_empty()
+            && event.margins.is_empty();
         let (per_instrument, per_currency) = split_event_margins(&event);
         self.base_apply(event);
 
@@ -672,7 +694,7 @@ mod tests {
 
     use crate::{
         accounts::{
-            Account, MarginAccount,
+            Account, AccountAny, MarginAccount,
             margin_model::{MarginModel, MarginModelHandle},
             stubs::*,
         },
@@ -695,6 +717,195 @@ mod tests {
     };
 
     struct CustomMarginModel;
+
+    fn totals_only_state(balances: Vec<Money>) -> AccountState {
+        let mut state = margin_account_state();
+        state.balances.clear();
+        state.margins.clear();
+        state.base_currency = None;
+        state.with_total_only_balances(balances).unwrap()
+    }
+
+    #[rstest]
+    #[case("123.45 USD")]
+    #[case("-12.34 USD")]
+    #[case("0 USD")]
+    fn test_totals_only_initialization_and_reads(#[case] amount: &str) {
+        let total = Money::from(amount);
+        let account = MarginAccount::new_checked(totals_only_state(vec![total]), false).unwrap();
+
+        assert_eq!(account.balance_total(Some(total.currency)), Some(total));
+        assert_eq!(
+            account.balances_total(),
+            IndexMap::from([(total.currency, total)])
+        );
+        assert_eq!(
+            account.starting_balances(),
+            IndexMap::from([(total.currency, total)])
+        );
+        assert_eq!(account.currencies(), vec![total.currency]);
+        assert_eq!(account.balance(Some(total.currency)), None);
+        assert_eq!(account.balance_free(Some(total.currency)), None);
+        assert_eq!(account.balance_locked(Some(total.currency)), None);
+        assert!(account.balances().is_empty());
+        assert!(account.balances_free().is_empty());
+        assert!(account.balances_locked().is_empty());
+        assert_eq!(
+            account.total_only_balances(),
+            IndexMap::from([(total.currency, total)])
+        );
+    }
+
+    #[rstest]
+    fn test_totals_only_mixed_reads_and_representation_switches() {
+        let mut account = MarginAccount::new(margin_account_state(), false);
+        let usd = Currency::USD();
+        let usdt = Currency::USDT();
+        let initial_usd = account.balance_total(Some(usd)).unwrap();
+        let usdt_total = Money::from("42.12345678 USDT");
+        account.apply(totals_only_state(vec![usdt_total])).unwrap();
+
+        assert_eq!(account.balance_total(Some(usd)), Some(initial_usd));
+        assert_eq!(account.balance_total(Some(usdt)), Some(usdt_total));
+        assert!(account.balance_free(Some(usd)).is_some());
+        assert_eq!(account.balance_free(Some(usdt)), None);
+        assert_eq!(account.currencies(), vec![usd, usdt]);
+        assert_eq!(account.balances_total().len(), 2);
+        assert_eq!(account.balances().len(), 1);
+
+        account.apply(totals_only_state(vec![initial_usd])).unwrap();
+
+        assert_eq!(account.balance_total(Some(usd)), Some(initial_usd));
+        assert_eq!(account.balance_free(Some(usd)), None);
+        assert!(account.balances().is_empty());
+        assert_eq!(account.balance_total(Some(usdt)), Some(usdt_total));
+        assert!(account.margins.is_empty());
+        assert!(account.account_margins.is_empty());
+
+        let full_state = margin_account_state();
+        let full_balance = full_state.balances[0];
+        account.apply(full_state).unwrap();
+
+        assert_eq!(account.balance(Some(usd)), Some(&full_balance));
+        assert_eq!(account.balance_free(Some(usd)), Some(full_balance.free));
+        assert_eq!(account.balance_locked(Some(usd)), Some(full_balance.locked));
+        assert!(!account.total_only_balances.contains_key(&usd));
+        assert_eq!(account.total_only_balances.get(&usdt), Some(&usdt_total));
+        assert_eq!(
+            account.starting_balances(),
+            IndexMap::from([(usd, initial_usd)])
+        );
+    }
+
+    #[rstest]
+    fn test_totals_only_omission_preserves_and_explicit_zero_updates() {
+        let usd = Currency::USD();
+        let mut account =
+            MarginAccount::new(totals_only_state(vec![Money::from("17.89 USD")]), false);
+        account.apply(totals_only_state(vec![])).unwrap();
+
+        assert_eq!(
+            account.balance_total(Some(usd)),
+            Some(Money::from("17.89 USD"))
+        );
+
+        account
+            .apply(totals_only_state(vec![Money::zero(usd)]))
+            .unwrap();
+
+        assert_eq!(account.balance_total(Some(usd)), Some(Money::zero(usd)));
+        assert_eq!(account.balance_free(Some(usd)), None);
+    }
+
+    #[rstest]
+    #[case::duplicate_full(2, 0)]
+    #[case::duplicate_totals(0, 2)]
+    #[case::overlapping(1, 1)]
+    fn test_invalid_balance_event_is_atomic(#[case] full_count: usize, #[case] total_count: usize) {
+        let initial = margin_account_state();
+        let mut account = MarginAccount::new(initial.clone(), false);
+        let before = serde_json::to_value(&account).unwrap();
+        let mut event = initial.clone();
+        event.balances = vec![initial.balances[0]; full_count];
+        event.total_only_balances = vec![Money::from("19.23 USD"); total_count];
+        event.margins.clear();
+
+        assert!(account.apply(event.clone()).is_err());
+        assert_eq!(serde_json::to_value(&account).unwrap(), before);
+        assert!(MarginAccount::new_checked(event, false).is_err());
+    }
+
+    #[rstest]
+    fn test_totals_only_rejects_local_calculation() {
+        let event = totals_only_state(vec![Money::from("19.23 USD")]);
+        assert!(MarginAccount::new_checked(event.clone(), true).is_err());
+
+        let mut account = MarginAccount::new(margin_account_state(), true);
+        let before = serde_json::to_value(&account).unwrap();
+
+        assert!(account.apply(event).is_err());
+        assert_eq!(serde_json::to_value(&account).unwrap(), before);
+    }
+
+    #[rstest]
+    fn test_totals_only_copy_serialization_and_replay() {
+        let initial = totals_only_state(vec![Money::from("-17.89 USD"), Money::from("0 USDT")]);
+        let next = totals_only_state(vec![Money::from("42.12345678 USDT")]);
+        let mut account = AccountAny::try_from_state(initial.clone()).unwrap();
+        account.apply(next.clone()).unwrap();
+        let cloned = account.clone_without_events();
+        let restored: AccountAny =
+            serde_json::from_str(&serde_json::to_string(&account).unwrap()).unwrap();
+        let replayed = AccountAny::from_events(&[initial, next]).unwrap();
+
+        for copy in [&cloned, &restored, &replayed] {
+            assert_eq!(copy.total_only_balances(), account.total_only_balances());
+            assert_eq!(copy.balances_total(), account.balances_total());
+            assert_eq!(copy.starting_balances(), account.starting_balances());
+            assert!(copy.balances_free().is_empty());
+        }
+        assert_eq!(cloned.event_count(), 0);
+        assert_eq!(restored.event_count(), 2);
+        assert_eq!(replayed.event_count(), 2);
+    }
+
+    #[rstest]
+    fn test_totals_only_deserialization_rejects_invalid_combinations() {
+        let account = MarginAccount::new(totals_only_state(vec![Money::from("19.23 USD")]), false);
+        let mut value = serde_json::to_value(&account).unwrap();
+        value["base"]["calculate_account_state"] = serde_json::json!(true);
+
+        assert!(serde_json::from_value::<MarginAccount>(value).is_err());
+
+        let mut value = serde_json::to_value(&account).unwrap();
+        value["base"]["account_type"] = serde_json::json!("CASH");
+
+        assert!(serde_json::from_value::<MarginAccount>(value).is_err());
+
+        let mut value = serde_json::to_value(&account).unwrap();
+        let full = MarginAccount::new(margin_account_state(), false);
+        value["base"]["balances"] = serde_json::to_value(&full.base.balances).unwrap();
+
+        assert!(serde_json::from_value::<MarginAccount>(value).is_err());
+    }
+
+    #[rstest]
+    fn test_legacy_account_deserialization_defaults_totals_only_to_empty() {
+        let account = MarginAccount::new(margin_account_state(), false);
+        let mut value = serde_json::to_value(&account).unwrap();
+        value["base"]
+            .as_object_mut()
+            .unwrap()
+            .remove("total_only_balances");
+        for event in value["base"]["events"].as_array_mut().unwrap() {
+            event.as_object_mut().unwrap().remove("total_only_balances");
+        }
+        let restored: MarginAccount = serde_json::from_value(value).unwrap();
+
+        assert!(restored.total_only_balances.is_empty());
+        assert_eq!(restored.balances_total(), account.balances_total());
+        assert_eq!(restored.starting_balances(), account.starting_balances());
+    }
 
     impl MarginModel for CustomMarginModel {
         fn name(&self) -> &'static str {
@@ -1052,6 +1263,61 @@ mod tests {
             Money::from("25000 USD")
         );
         assert!(margin_account.margin(&old_instrument_id).is_none());
+    }
+
+    #[rstest]
+    fn test_account_type_predicates(margin_account: MarginAccount) {
+        assert!(!margin_account.is_cash_account());
+        assert!(margin_account.is_margin_account());
+        assert!(!Account::is_cash_account(&margin_account));
+        assert!(Account::is_margin_account(&margin_account));
+    }
+
+    #[rstest]
+    fn test_equality_compares_account_ids(margin_account_state: AccountState) {
+        let account = MarginAccount::new(margin_account_state.clone(), true);
+        let same = MarginAccount::new(margin_account_state.clone(), true);
+        let mut other_state = margin_account_state;
+        other_state.account_id = AccountId::from("OTHER-001");
+        let other = MarginAccount::new(other_state, true);
+
+        assert_eq!(account, same);
+        assert_ne!(account, other);
+    }
+
+    #[rstest]
+    fn test_apply_routes_account_margins_when_event_has_no_balances(
+        mut margin_account: MarginAccount,
+        margin_account_state: AccountState,
+    ) {
+        let usd = Currency::USD();
+
+        let event = AccountState::new(
+            margin_account_state.account_id,
+            AccountType::Margin,
+            vec![],
+            vec![MarginBalance::new(
+                Money::from("12500 USD"),
+                Money::from("25000 USD"),
+                None,
+            )],
+            true,
+            uuid4(),
+            1.into(),
+            1.into(),
+            margin_account_state.base_currency,
+        );
+
+        margin_account.apply(event).unwrap();
+
+        assert_eq!(
+            margin_account.account_initial_margins(),
+            IndexMap::from([(usd, Money::from("12500 USD"))])
+        );
+        assert_eq!(
+            margin_account.account_maintenance_margins(),
+            IndexMap::from([(usd, Money::from("25000 USD"))])
+        );
     }
 
     #[rstest]

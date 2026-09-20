@@ -27,7 +27,7 @@ use ustr::Ustr;
 use crate::common::{
     enums::{
         PolymarketLiquiditySide, PolymarketOrderSide, PolymarketOrderStatus, PolymarketOrderType,
-        PolymarketOutcome, PolymarketTradeStatus, SignatureType,
+        PolymarketOutcome, PolymarketSignatureType, PolymarketTradeStatus,
     },
     models::PolymarketMakerOrder,
     parse::{
@@ -94,7 +94,7 @@ pub struct PolymarketOrder {
     )]
     pub taker_amount: Decimal,
     pub side: PolymarketOrderSide,
-    pub signature_type: SignatureType,
+    pub signature_type: PolymarketSignatureType,
     /// Unix seconds timestamp when a GTD order auto-expires. `"0"` for non-GTD.
     /// Not included in the EIP-712 signed hash; protocol enforces this value.
     pub expiration: String,
@@ -651,28 +651,30 @@ pub struct ClobMarketResponse {
     pub tags: Option<Vec<String>>,
 }
 
-/// A position from the Polymarket Data API `GET /positions` endpoint.
+/// A position row from the Polymarket Data API v2 `GET /v2/positions` endpoint.
+///
+/// References: <https://docs.polymarket.com/api-reference/data-api/migrating-from-v1>
 #[derive(Clone, Debug, Deserialize)]
 pub struct DataApiPosition {
+    #[serde(rename = "token_id")]
     pub asset: String,
-    #[serde(alias = "conditionId", alias = "condition_id")]
     pub condition_id: String,
-    #[serde(deserialize_with = "deserialize_decimal_from_json")]
-    pub size: Decimal,
     #[serde(
-        default,
-        alias = "avgPrice",
-        alias = "avg_price",
-        deserialize_with = "deserialize_optional_decimal_from_json"
+        rename = "current_size",
+        deserialize_with = "deserialize_decimal_from_json"
     )]
+    pub size: Decimal,
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_from_json")]
     pub avg_price: Option<Decimal>,
 }
 
-/// A trade from the Polymarket Data API `GET /trades` endpoint.
+/// A trade row from the Polymarket Data API v2 `GET /v2/trades` endpoint.
+///
+/// References: <https://docs.polymarket.com/api-reference/data-api/migrating-from-v1>
 #[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct DataApiTrade {
     pub proxy_wallet: Option<String>,
+    #[serde(rename = "token_id")]
     pub asset: String,
     pub condition_id: String,
     pub side: PolymarketOrderSide,
@@ -695,13 +697,46 @@ pub struct DataApiTrade {
     pub transaction_hash: String,
 }
 
+/// The `pagination` object shared by every paginated Data API v2 response.
+#[derive(Clone, Debug, Deserialize)]
+pub struct DataApiPagination {
+    /// Exact: `true` iff another page exists, never inferred from page fullness.
+    pub has_more: bool,
+    /// Opaque cursor for the next page; `null` on the last page.
+    pub next_cursor: Option<String>,
+}
+
+/// The `{ data, pagination }` envelope shared by every Data API v2 response.
+///
+/// A documented miss is `data: null` or an empty list, never an error.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(bound = "T: Deserialize<'de>")]
+pub struct DataApiPage<T> {
+    #[serde(
+        default = "Vec::new",
+        deserialize_with = "deserialize_nullable_vec_as_empty"
+    )]
+    pub data: Vec<T>,
+    pub pagination: DataApiPagination,
+}
+
+fn deserialize_nullable_vec_as_empty<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
     use rust_decimal_macros::dec;
 
     use super::*;
-    use crate::common::enums::{PolymarketOrderStatus, PolymarketTradeStatus, SignatureType};
+    use crate::common::enums::{
+        PolymarketOrderStatus, PolymarketSignatureType, PolymarketTradeStatus,
+    };
 
     fn load<T: serde::de::DeserializeOwned>(filename: &str) -> T {
         let path = format!("test_data/{filename}");
@@ -877,7 +912,7 @@ mod tests {
             "0x0000000000000000000000000000000000000000000000000000000000000000"
         );
         assert_eq!(order.side, PolymarketOrderSide::Buy);
-        assert_eq!(order.signature_type, SignatureType::Eoa);
+        assert_eq!(order.signature_type, PolymarketSignatureType::Eoa);
         assert!(debug.contains(REDACTED));
         assert!(!debug.contains(order.signature.expose_secret()));
     }
@@ -954,7 +989,7 @@ mod tests {
         assert_eq!(order.maker_amount, dec!(1000000));
         assert_eq!(order.taker_amount, dec!(2000000));
         assert_eq!(order.side, PolymarketOrderSide::Buy);
-        assert_eq!(order.signature_type, SignatureType::PolyProxy);
+        assert_eq!(order.signature_type, PolymarketSignatureType::PolyProxy);
         assert_eq!(order.expiration, "0");
         assert_eq!(order.timestamp, "1713398400000");
 
@@ -1507,7 +1542,8 @@ mod tests {
 
     #[rstest]
     fn test_data_api_position_deserialization() {
-        let positions: Vec<DataApiPosition> = load("data_api_positions_response.json");
+        let positions: Vec<DataApiPosition> =
+            load::<DataApiPage<DataApiPosition>>("data_api_positions_response.json").data;
 
         assert_eq!(positions.len(), 4);
         assert_eq!(
@@ -1539,8 +1575,28 @@ mod tests {
     }
 
     #[rstest]
+    fn test_data_api_page_deserializes_null_and_missing_data_as_empty() {
+        // A documented miss is `data: null` or an empty list, never an error.
+        let null_data = r#"{
+            "data": null,
+            "pagination": {"limit": 500, "offset": 0, "has_more": false, "next_cursor": null}
+        }"#;
+        let page: DataApiPage<DataApiTrade> = serde_json::from_str(null_data).unwrap();
+        assert!(page.data.is_empty());
+        assert!(!page.pagination.has_more);
+        assert!(page.pagination.next_cursor.is_none());
+
+        let missing_data = r#"{
+            "pagination": {"limit": 500, "offset": 0, "has_more": false, "next_cursor": null}
+        }"#;
+        let page: DataApiPage<DataApiTrade> = serde_json::from_str(missing_data).unwrap();
+        assert!(page.data.is_empty());
+    }
+
+    #[rstest]
     fn test_data_api_trade_deserialization() {
-        let trades: Vec<DataApiTrade> = load("data_api_trades_captured_response.json");
+        let trades: Vec<DataApiTrade> =
+            load::<DataApiPage<DataApiTrade>>("data_api_trades_captured_response.json").data;
 
         assert_eq!(trades.len(), 3);
         assert_eq!(
@@ -1622,13 +1678,13 @@ mod tests {
     #[rstest]
     fn test_data_api_trade_decimal_fields_preserve_precision() {
         let json = r#"{
-            "asset":"token-1",
-            "conditionId":"0xcondition",
+            "token_id":"token-1",
+            "condition_id":"0xcondition",
             "side":"BUY",
             "price":0.1234567890123456789012345678,
             "size":123456789.1234567890123456789,
             "timestamp":1786179735,
-            "transactionHash":"0xtransaction"
+            "transaction_hash":"0xtransaction"
         }"#;
         let trade: DataApiTrade = serde_json::from_str(json).unwrap();
 

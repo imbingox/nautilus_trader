@@ -1456,7 +1456,7 @@ pub fn parse_order_status_report(
         BybitTimeInForce::Gtc => TimeInForce::Gtc,
         BybitTimeInForce::Ioc => TimeInForce::Ioc,
         BybitTimeInForce::Fok => TimeInForce::Fok,
-        BybitTimeInForce::PostOnly => TimeInForce::Gtc,
+        BybitTimeInForce::PostOnly | BybitTimeInForce::Rpi => TimeInForce::Gtc,
     };
 
     let quantity =
@@ -1564,7 +1564,10 @@ pub fn parse_order_status_report(
         report = report.with_reduce_only(true);
     }
 
-    if order.time_in_force == BybitTimeInForce::PostOnly {
+    if matches!(
+        order.time_in_force,
+        BybitTimeInForce::PostOnly | BybitTimeInForce::Rpi
+    ) {
         report = report.with_post_only(true);
     }
 
@@ -3175,17 +3178,30 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_http_corporate_action_fill_report() {
+    #[case::corporate_action("CorporateAction", BybitExecType::CorporateAction, true)]
+    #[case::forward_split_settle("ForwardSplitSettle", BybitExecType::ForwardSplitSettle, true)]
+    #[case::reverse_split_settle("ReverseSplitSettle", BybitExecType::ReverseSplitSettle, true)]
+    #[case::dividend("Dividend", BybitExecType::Dividend, true)]
+    #[case::unknown_literal("UNKNOWN", BybitExecType::Unknown, false)]
+    #[case::unrecognized("StockMerger", BybitExecType::Unknown, false)]
+    fn test_parse_http_exec_type_fill_report(
+        #[case] exec_type: &str,
+        #[case] expected: BybitExecType,
+        #[case] exchange_generated: bool,
+    ) {
         let instrument = linear_instrument();
         let json = load_test_json("http_get_executions.json");
         let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        value["result"]["list"][0]["execType"] = json!("CorporateAction");
+        value["result"]["list"][0]["execType"] = json!(exec_type);
         let response: BybitTradeHistoryResponse = serde_json::from_value(value).unwrap();
         let execution = &response.result.list[0];
         let account_id = AccountId::new("BYBIT-001");
 
-        assert_eq!(execution.exec_type, BybitExecType::CorporateAction);
-        assert!(execution.exec_type.is_exchange_generated());
+        assert_eq!(execution.exec_type, expected);
+        assert_eq!(
+            execution.exec_type.is_exchange_generated(),
+            exchange_generated
+        );
 
         let report = parse_fill_report(execution, account_id, &instrument, TS).unwrap();
 

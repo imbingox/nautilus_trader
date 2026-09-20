@@ -29,7 +29,7 @@ cp "$pkg_dir/pyproject.toml" "$pkg_dir/uv.lock" "$wheel_project/"
 
 wheel_project_native="$(native_path "$wheel_project")"
 wheel_path="$(native_path "$1")"
-uv sync --project "$wheel_project_native" --python "$project_python" --frozen --group test --no-install-package nautilus-trader
+uv sync --project "$wheel_project_native" --python "$project_python" --frozen --group test --no-install-package nautilus-trader-papi
 wheel_python="$(uv run --project "$wheel_project_native" --no-sync python -c 'import sys; print(sys.executable)')"
 uv pip install --python "$wheel_python" --reinstall "${wheel_path}[visualization]"
 

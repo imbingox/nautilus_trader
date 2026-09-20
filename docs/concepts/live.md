@@ -30,6 +30,42 @@ systems outside the process boundary.
 - **Reconciliation**: Startup and runtime checks align retained local state with venue reports. See
   [Execution reconciliation](execution/reconciliation.md).
 
+## Execution client routing
+
+A live node can register independently named execution clients for the same venue. A command's
+`client_id` selects a registered client directly. Venue and default routes select a client when
+neither the command's `client_id` nor account-based routing resolves one.
+
+:::warning[Account isolation]
+Registering multiple clients for a venue does not provide end-to-end account isolation for risk,
+positions, and order management across same-venue accounts.
+:::
+
+### Order routing
+
+Configure venue and default routes through each client's `RoutingConfig`:
+
+- `venues` assigns the listed venues to that client. These explicit routes take precedence over
+  automatic venue routes and the default client.
+- `default=True` selects the fallback client when no venue route applies.
+
+The only client registered for a venue automatically routes that venue unless another client
+explicitly routes it. Multiple clients for the same venue require an explicit venue route or a
+default client, even when strategies supply a `client_id` for each command. Duplicate client IDs,
+conflicting venue routes, and multiple defaults fail during node construction.
+
+### Instrument updates
+
+Instrument updates reach every client whose own venue matches, plus the client routed to that
+venue, if any. Each matching client receives the update once. Receiving an instrument update does
+not select that client as the recipient of order commands.
+
+### Direct Rust callers
+
+`ExecutionEngine::register_client` registers a client without assigning routing. Call
+`register_venue_routing` or `set_default_client` afterward to configure venue or fallback routing.
+Alternatively, `register_default_client` registers a client and makes it the default.
+
 ## Live node lifecycle
 
 Rust `LiveNode::run()` prepares cached and venue state before starting trader components, then owns
@@ -153,7 +189,8 @@ handling with processes that do not construct a trading node.
 
 A node configured with a cache database backing is rejected on a host loop. Those backings wait for
 their worker task by blocking the calling thread, which stalls the host loop rather than slowing it.
-Use `run()` for a database-backed node.
+Native-only nodes can use `run()` for database backing. Custom Python clients drive asyncio in
+both launch modes, so neither supports cache database backing.
 
 ## Configuration
 
@@ -180,6 +217,8 @@ portfolio economics.
 
 See [Execution reconciliation](execution/reconciliation.md) for configuration, recovery procedures,
 runtime checks, scenarios, and invariants.
+For runtime protection against stale snapshots and the distinction from genuine corrections and explicit fill-void events,
+see [Snapshot freshness and fill corrections](execution/reconciliation.md#snapshot-freshness-and-fill-corrections).
 
 ## Rust live runner metrics
 

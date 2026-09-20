@@ -37,7 +37,7 @@ use nautilus_model::defi::{
 use nautilus_model::{
     data::{
         Bar, BarType, CustomData, DataType, FundingRateUpdate, IndexPriceUpdate, InstrumentStatus,
-        MarkPriceUpdate, OrderBookDelta, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
+        MarkPriceUpdate, OrderBookDelta, OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick,
         close::InstrumentClose,
         option_chain::{OptionChainSlice, OptionGreeks},
     },
@@ -68,7 +68,7 @@ use crate::{
     },
     cache::Cache,
     clock::Clock,
-    component::{Component, with_component_registry},
+    component::{Component, ComponentAccessError, with_component_registry},
     enums::ComponentState,
     logging::{CMD, RECV},
     messages::{
@@ -478,10 +478,10 @@ impl PyDataActorInner {
         Ok(())
     }
 
-    fn dispatch_on_book_depth(&mut self, depth: &OrderBookDepth10) -> PyResult<()> {
+    fn dispatch_on_book_depth(&mut self, depth: &OrderBookDepth) -> PyResult<()> {
         if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
-                py_self.call_method1(py, "on_book_depth", ((*depth).into_py_any(py)?,))
+                py_self.call_method1(py, "on_book_depth", (depth.clone().into_py_any(py)?,))
             })?;
         }
         Ok(())
@@ -579,7 +579,7 @@ impl PyDataActorInner {
         Ok(())
     }
 
-    fn dispatch_on_historical_book_depth(&mut self, depths: Vec<OrderBookDepth10>) -> PyResult<()> {
+    fn dispatch_on_historical_book_depth(&mut self, depths: Vec<OrderBookDepth>) -> PyResult<()> {
         if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 let py_depths = depths
@@ -1119,7 +1119,7 @@ impl DataActor for PyDataActorInner {
             .map_err(|e| anyhow::anyhow!("Python on_book_deltas failed: {e}"))
     }
 
-    fn on_book_depth(&mut self, depth: &OrderBookDepth10) -> anyhow::Result<()> {
+    fn on_book_depth(&mut self, depth: &OrderBookDepth) -> anyhow::Result<()> {
         self.dispatch_on_book_depth(depth)
             .map_err(|e| anyhow::anyhow!("Python on_book_depth failed: {e}"))
     }
@@ -1219,7 +1219,7 @@ impl DataActor for PyDataActorInner {
             .map_err(|e| anyhow::anyhow!("Python on_historical_book_deltas failed: {e}"))
     }
 
-    fn on_historical_book_depth(&mut self, depths: &[OrderBookDepth10]) -> anyhow::Result<()> {
+    fn on_historical_book_depth(&mut self, depths: &[OrderBookDepth]) -> anyhow::Result<()> {
         self.dispatch_on_historical_book_depth(depths.to_vec())
             .map_err(|e| anyhow::anyhow!("Python on_historical_book_depth failed: {e}"))
     }
@@ -1618,7 +1618,7 @@ impl PyDataActor {
 
     #[allow(unused_variables)]
     #[pyo3(name = "on_book_depth")]
-    fn py_on_book_depth(&mut self, depth: &OrderBookDepth10) {}
+    fn py_on_book_depth(&mut self, depth: &OrderBookDepth) {}
 
     #[allow(unused_variables)]
     #[pyo3(name = "on_book")]
@@ -1669,9 +1669,14 @@ impl PyDataActor {
 
     #[pyo3(name = "subscribe_signal")]
     #[pyo3(signature = (name="", priority=None))]
-    fn py_subscribe_signal(&mut self, name: &str, priority: Option<u32>) -> PyResult<()> {
-        self.ensure_registered()?;
-        DataActor::subscribe_signal(self.inner_mut(), name, priority);
+    fn py_subscribe_signal(
+        slf: &Bound<'_, Self>,
+        name: &str,
+        priority: Option<u32>,
+    ) -> PyResult<()> {
+        let actor = borrow_actor_mut(slf, "subscribe_signal")?;
+        actor.ensure_registered()?;
+        DataActor::subscribe_signal(actor.inner_mut(), name, priority);
         Ok(())
     }
 
@@ -1758,9 +1763,9 @@ impl PyDataActor {
         Ok(())
     }
 
-    #[pyo3(name = "subscribe_book_depth10")]
+    #[pyo3(name = "subscribe_book_depth")]
     #[pyo3(signature = (instrument_id, book_type, client_id=None, managed=false, params=None))]
-    fn py_subscribe_book_depth10(
+    fn py_subscribe_book_depth(
         &mut self,
         py: Python<'_>,
         instrument_id: InstrumentId,
@@ -1771,7 +1776,7 @@ impl PyDataActor {
     ) -> PyResult<()> {
         self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
-        DataActor::subscribe_book_depth10(
+        DataActor::subscribe_book_depth(
             self.inner_mut(),
             instrument_id,
             book_type,
@@ -1989,9 +1994,10 @@ impl PyDataActor {
 
     #[pyo3(name = "unsubscribe_signal")]
     #[pyo3(signature = (name=""))]
-    fn py_unsubscribe_signal(&mut self, name: &str) -> PyResult<()> {
-        self.ensure_registered()?;
-        DataActor::unsubscribe_signal(self.inner_mut(), name);
+    fn py_unsubscribe_signal(slf: &Bound<'_, Self>, name: &str) -> PyResult<()> {
+        let actor = borrow_actor_mut(slf, "unsubscribe_signal")?;
+        actor.ensure_registered()?;
+        DataActor::unsubscribe_signal(actor.inner_mut(), name);
         Ok(())
     }
 
@@ -2060,9 +2066,9 @@ impl PyDataActor {
         Ok(())
     }
 
-    #[pyo3(name = "unsubscribe_book_depth10")]
+    #[pyo3(name = "unsubscribe_book_depth")]
     #[pyo3(signature = (instrument_id, client_id=None, params=None))]
-    fn py_unsubscribe_book_depth10(
+    fn py_unsubscribe_book_depth(
         &mut self,
         py: Python<'_>,
         instrument_id: InstrumentId,
@@ -2071,7 +2077,7 @@ impl PyDataActor {
     ) -> PyResult<()> {
         self.ensure_registered()?;
         let params = dict_to_params(py, params)?;
-        DataActor::unsubscribe_book_depth10(self.inner_mut(), instrument_id, client_id, params);
+        DataActor::unsubscribe_book_depth(self.inner_mut(), instrument_id, client_id, params);
         Ok(())
     }
 
@@ -2545,7 +2551,7 @@ impl PyDataActor {
 
     #[allow(unused_variables, clippy::needless_pass_by_value)]
     #[pyo3(name = "on_historical_book_depth")]
-    fn py_on_historical_book_depth(&mut self, depths: Vec<OrderBookDepth10>) {}
+    fn py_on_historical_book_depth(&mut self, depths: Vec<OrderBookDepth>) {}
 
     #[allow(unused_variables, clippy::needless_pass_by_value)]
     #[pyo3(name = "on_historical_quotes")]
@@ -2948,6 +2954,18 @@ fn extract_bool_config_attr(config: &Bound<'_, PyAny>, attr: &str) -> Option<boo
         .and_then(|value| value.extract::<bool>().ok())
 }
 
+fn borrow_actor_mut<'py>(
+    actor: &Bound<'py, PyDataActor>,
+    operation: &'static str,
+) -> PyResult<PyRefMut<'py, PyDataActor>> {
+    actor.try_borrow_mut().map_err(|_| {
+        to_pyruntime_err(ComponentAccessError::WriteConflict {
+            resource: "Python actor",
+            operation,
+        })
+    })
+}
+
 /// Returns whether the config retained by the actor supplies an actor ID.
 ///
 /// The config is read through Python rather than the extracted [`DataActorConfig`] so that a
@@ -2986,7 +3004,7 @@ mod tests {
     use nautilus_model::{
         data::{
             Bar, BarType, CustomData, DataType, FundingRateUpdate, IndexPriceUpdate,
-            InstrumentStatus, MarkPriceUpdate, OrderBookDelta, OrderBookDeltas, OrderBookDepth10,
+            InstrumentStatus, MarkPriceUpdate, OrderBookDelta, OrderBookDeltas, OrderBookDepth,
             QuoteTick, TradeTick,
             close::InstrumentClose,
             greeks::OptionGreekValues,
@@ -3013,7 +3031,7 @@ mod tests {
     use crate::{
         actor::{DataActor, data_actor::DataActorConfig, registry::actor_exists},
         cache::Cache,
-        clock::TestClock,
+        clock::VirtualClock,
         component::{Component, get_component},
         enums::ComponentState,
         live::runner::replace_system_command_sender,
@@ -3032,8 +3050,8 @@ mod tests {
     };
 
     #[fixture]
-    fn clock() -> Rc<RefCell<TestClock>> {
-        Rc::new(RefCell::new(TestClock::new()))
+    fn clock() -> Rc<RefCell<VirtualClock>> {
+        Rc::new(RefCell::new(VirtualClock::new()))
     }
 
     #[fixture]
@@ -3071,7 +3089,7 @@ mod tests {
     }
 
     fn create_registered_actor(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) -> PyDataActor {
@@ -3233,7 +3251,7 @@ class PreparedActor(DataActor):
 
     #[rstest]
     fn test_registration_success(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -3245,7 +3263,7 @@ class PreparedActor(DataActor):
 
     #[rstest]
     fn test_registered_actor_basic_properties(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -3263,7 +3281,7 @@ class PreparedActor(DataActor):
 
     #[rstest]
     fn test_basic_subscription_methods_compile(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
         data_type: DataType,
@@ -3300,7 +3318,7 @@ class PreparedActor(DataActor):
 
     #[rstest]
     fn test_shutdown_system_passes_through(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -3316,7 +3334,7 @@ class PreparedActor(DataActor):
 
     #[rstest]
     fn test_publish_data_delivers_to_any_subscriber(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -3348,7 +3366,7 @@ class PreparedActor(DataActor):
 
     #[rstest]
     fn test_publish_signal_delivers_to_customdata_subscriber(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -3400,7 +3418,7 @@ class PreparedActor(DataActor):
 
     #[rstest]
     fn test_publish_signal_accepts_numeric_py_values(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -3449,7 +3467,7 @@ class PreparedActor(DataActor):
 
     #[rstest]
     fn test_subscribe_and_unsubscribe_signal_compile(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -3457,16 +3475,20 @@ class PreparedActor(DataActor):
 
         *get_message_bus().borrow_mut() = MessageBus::default();
 
-        let mut actor = create_registered_actor(clock, cache, trader_id);
-        actor.py_subscribe_signal("example", None).unwrap();
-        actor.py_unsubscribe_signal("example").unwrap();
-        actor.py_subscribe_signal("", None).unwrap();
-        actor.py_unsubscribe_signal("").unwrap();
+        let actor = create_registered_actor(clock, cache, trader_id);
+        Python::initialize();
+        Python::attach(|py| {
+            let actor = Bound::new(py, actor).unwrap();
+            PyDataActor::py_subscribe_signal(&actor, "example", None).unwrap();
+            PyDataActor::py_unsubscribe_signal(&actor, "example").unwrap();
+            PyDataActor::py_subscribe_signal(&actor, "", None).unwrap();
+            PyDataActor::py_unsubscribe_signal(&actor, "").unwrap();
+        });
     }
 
     #[rstest]
     fn test_py_subscribe_signal_forwards_priority(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -3474,19 +3496,23 @@ class PreparedActor(DataActor):
 
         *get_message_bus().borrow_mut() = MessageBus::default();
 
-        let mut actor = create_registered_actor(clock, cache, trader_id);
-        actor.py_subscribe_signal("trigger", Some(50)).unwrap();
+        let actor = create_registered_actor(clock, cache, trader_id);
+        Python::initialize();
+        Python::attach(|py| {
+            let actor = Bound::new(py, actor).unwrap();
+            PyDataActor::py_subscribe_signal(&actor, "trigger", Some(50)).unwrap();
 
-        // The PyO3 binding must forward the priority to the bus unchanged.
-        let topic = get_signal_topic("trigger");
-        let subs = get_message_bus().borrow_mut().matching_subscriptions(topic);
-        assert_eq!(subs.len(), 1);
-        assert_eq!(subs[0].priority, 50);
+            // The PyO3 binding must forward the priority to the bus unchanged.
+            let topic = get_signal_topic("trigger");
+            let subs = get_message_bus().borrow_mut().matching_subscriptions(topic);
+            assert_eq!(subs.len(), 1);
+            assert_eq!(subs[0].priority, 50);
+        });
     }
 
     #[rstest]
     fn test_register_in_global_registries_retains_python_wrapper(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -3515,7 +3541,7 @@ class PreparedActor(DataActor):
 
     #[rstest]
     fn test_register_in_global_registries_rejects_missing_python_wrapper(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -3541,7 +3567,7 @@ class PreparedActor(DataActor):
 
     #[rstest]
     fn test_publish_data_dispatches_to_python_on_data(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -3575,7 +3601,7 @@ class PreparedActor(DataActor):
 
     #[rstest]
     fn test_publish_signal_dispatches_to_python_on_signal(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -3594,7 +3620,9 @@ class PreparedActor(DataActor):
             rust_actor.register_in_global_registries().unwrap();
             rust_actor.py_start().unwrap();
 
-            rust_actor.py_subscribe_signal("example", None).unwrap();
+            let bound_actor = Bound::new(py, rust_actor).unwrap();
+            PyDataActor::py_subscribe_signal(&bound_actor, "example", None).unwrap();
+            let rust_actor = bound_actor.borrow_mut();
             let val1: Py<PyAny> = "1.5".into_py_any_unwrap(py);
             let val2: Py<PyAny> = 2.0_f64.into_py_any_unwrap(py);
             rust_actor
@@ -3611,7 +3639,7 @@ class PreparedActor(DataActor):
 
     #[rstest]
     fn test_unsubscribe_signal_stops_python_dispatch(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -3630,14 +3658,18 @@ class PreparedActor(DataActor):
             rust_actor.register_in_global_registries().unwrap();
             rust_actor.py_start().unwrap();
 
-            rust_actor.py_subscribe_signal("example", None).unwrap();
+            let bound_actor = Bound::new(py, rust_actor).unwrap();
+            PyDataActor::py_subscribe_signal(&bound_actor, "example", None).unwrap();
+            let rust_actor = bound_actor.borrow_mut();
             let val1: Py<PyAny> = "1".into_py_any_unwrap(py);
             let val2: Py<PyAny> = "2".into_py_any_unwrap(py);
             rust_actor
                 .py_publish_signal(py, "example", val1, 0)
                 .unwrap();
 
-            rust_actor.py_unsubscribe_signal("example").unwrap();
+            drop(rust_actor);
+            PyDataActor::py_unsubscribe_signal(&bound_actor, "example").unwrap();
+            let rust_actor = bound_actor.borrow_mut();
             rust_actor
                 .py_publish_signal(py, "example", val2, 0)
                 .unwrap();
@@ -3650,7 +3682,7 @@ class PreparedActor(DataActor):
     #[case(None)]
     #[case(Some(SystemChannel::ExecCommands))]
     fn test_queue_state_changed_subscription_dispatches_and_unsubscribes(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
         #[case] channel: Option<SystemChannel>,
@@ -3713,7 +3745,7 @@ class PreparedActor(DataActor):
         Some("binance-futures-market-streams")
     )]
     fn test_socket_state_changed_subscription_dispatches_and_unsubscribes(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
         #[case] client_id: Option<ClientId>,
@@ -3777,7 +3809,7 @@ class PreparedActor(DataActor):
 
     #[rstest]
     fn test_subscribe_signal_wildcard_dispatches_all_names_to_python(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -3796,7 +3828,9 @@ class PreparedActor(DataActor):
             rust_actor.register_in_global_registries().unwrap();
             rust_actor.py_start().unwrap();
 
-            rust_actor.py_subscribe_signal("", None).unwrap();
+            let bound_actor = Bound::new(py, rust_actor).unwrap();
+            PyDataActor::py_subscribe_signal(&bound_actor, "", None).unwrap();
+            let rust_actor = bound_actor.borrow_mut();
             let val1: Py<PyAny> = "1".into_py_any_unwrap(py);
             let val2: Py<PyAny> = "2".into_py_any_unwrap(py);
             let val3: Py<PyAny> = "3".into_py_any_unwrap(py);
@@ -3810,7 +3844,7 @@ class PreparedActor(DataActor):
 
     #[rstest]
     fn test_signal_customdata_unwraps_to_python_signal(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -3883,7 +3917,7 @@ class CapturingActor:
 
     #[rstest]
     fn test_add_and_update_synthetic_via_pyo3(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -3945,7 +3979,7 @@ class CapturingActor:
 
     #[rstest]
     fn test_book_at_interval_invalid_interval_ms(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
         audusd_sim: CurrencyPair,
@@ -3980,8 +4014,8 @@ class CapturingActor:
     }
 
     #[rstest]
-    fn test_book_depth10_subscription_methods_manage_handler(
-        clock: Rc<RefCell<TestClock>>,
+    fn test_book_depth_subscription_methods_manage_handler(
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
         audusd_sim: CurrencyPair,
@@ -3992,14 +4026,14 @@ class CapturingActor:
 
         Python::attach(|py| {
             actor
-                .py_subscribe_book_depth10(py, audusd_sim.id, BookType::L2_MBP, None, false, None)
+                .py_subscribe_book_depth(py, audusd_sim.id, BookType::L2_MBP, None, false, None)
                 .unwrap();
-            assert_eq!(actor.inner().depth10_handler_count(), 1);
+            assert_eq!(actor.inner().depth_handler_count(), 1);
 
             actor
-                .py_unsubscribe_book_depth10(py, audusd_sim.id, None, None)
+                .py_unsubscribe_book_depth(py, audusd_sim.id, None, None)
                 .unwrap();
-            assert_eq!(actor.inner().depth10_handler_count(), 0);
+            assert_eq!(actor.inner().depth_handler_count(), 0);
         });
     }
 
@@ -4011,7 +4045,7 @@ class CapturingActor:
 
     #[rstest]
     fn test_data_actor_trait_implementation(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -4022,7 +4056,7 @@ class CapturingActor:
 
     #[rstest]
     fn test_python_reconnect_socket_enqueues_typed_command(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -4166,7 +4200,7 @@ class CapturingActor:
         OrderBookDeltas::new(instrument.id, vec![delta])
     }
 
-    fn sample_book_depth() -> OrderBookDepth10 {
+    fn sample_book_depth() -> OrderBookDepth {
         stub_depth10()
     }
 
@@ -4654,7 +4688,7 @@ class IndicatorEventActor:
 
     fn assert_python_dispatch<F>(
         py: Python<'_>,
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
         method_name: &str,
@@ -4687,7 +4721,7 @@ class IndicatorEventActor:
     #[case("on_degrade")]
     #[case("on_fault")]
     fn test_python_dispatch_lifecycle_matrix(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
         #[case] method_name: &str,
@@ -4714,7 +4748,7 @@ class IndicatorEventActor:
     #[case("on_save")]
     #[case("on_load")]
     fn test_python_dispatch_persistence_matrix(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
         #[case] method_name: &str,
@@ -4745,7 +4779,7 @@ class IndicatorEventActor:
 
     #[rstest]
     fn test_python_persistence_methods_convert_state(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -4835,7 +4869,7 @@ class IndicatorEventActor:
 
     #[rstest]
     fn test_registered_indicators_receive_quote_trade_and_bar_before_actor_callbacks(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -4901,7 +4935,7 @@ class IndicatorEventActor:
 
     #[rstest]
     fn test_registered_indicators_receive_live_data_when_actor_not_running(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -5033,7 +5067,7 @@ class IndicatorEventActor:
 
     #[rstest]
     fn test_duplicate_indicator_registration_does_not_duplicate_callbacks(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -5092,7 +5126,7 @@ class IndicatorEventActor:
 
     #[rstest]
     fn test_indicator_error_prevents_actor_callback(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -5140,7 +5174,7 @@ class IndicatorEventActor:
     #[case("on_option_greeks")]
     #[case("on_option_chain")]
     fn test_python_dispatch_typed_callback_matrix(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
         #[case] method_name: &str,
@@ -5243,7 +5277,7 @@ class IndicatorEventActor:
     #[case("on_historical_mark_prices")]
     #[case("on_historical_index_prices")]
     fn test_python_dispatch_historical_callback_matrix(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
         #[case] method_name: &str,
@@ -5303,7 +5337,7 @@ class IndicatorEventActor:
 
     #[rstest]
     fn test_python_dispatch_historical_book_deltas_preserves_batch(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -5334,7 +5368,7 @@ class IndicatorEventActor:
 
     #[rstest]
     fn test_python_dispatch_historical_book_depth_preserves_batch(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -5342,7 +5376,7 @@ class IndicatorEventActor:
 
         Python::attach(|py| {
             let first = stub_depth10();
-            let mut second = first;
+            let mut second = first.clone();
             second.sequence = 17;
             second.ts_event = UnixNanos::from(18);
             second.ts_init = UnixNanos::from(19);
@@ -5361,7 +5395,7 @@ class IndicatorEventActor:
                 .bind(py)
                 .get_item(0)
                 .unwrap()
-                .extract::<Vec<OrderBookDepth10>>()
+                .extract::<Vec<OrderBookDepth>>()
                 .unwrap();
 
             assert_eq!(actual, expected);
@@ -5377,7 +5411,7 @@ class IndicatorEventActor:
     #[case("on_pool_fee_collect")]
     #[case("on_pool_flash")]
     fn test_python_dispatch_defi_callback_matrix(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
         #[case] method_name: &str,
@@ -5419,7 +5453,7 @@ class IndicatorEventActor:
 
     #[rstest]
     fn test_python_dispatch_multiple_calls_tracked(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
         audusd_sim: CurrencyPair,
@@ -5453,7 +5487,7 @@ class IndicatorEventActor:
 
     #[rstest]
     fn test_python_dispatch_historical_custom_data_preserves_payload_shape(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
         client_id: ClientId,
@@ -5562,7 +5596,7 @@ class IndicatorEventActor:
 
     #[rstest]
     fn test_python_dispatch_no_call_when_py_self_not_set(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {
@@ -5580,7 +5614,7 @@ class IndicatorEventActor:
 
     #[rstest]
     fn test_python_on_historical_data_rejects_non_custom_data(
-        clock: Rc<RefCell<TestClock>>,
+        clock: Rc<RefCell<VirtualClock>>,
         cache: Rc<RefCell<Cache>>,
         trader_id: TraderId,
     ) {

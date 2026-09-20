@@ -85,12 +85,12 @@ namespace.
 
 ## Product support
 
-| Product type      | Data feed | Trading | Notes                                                        |
-| ----------------- | --------- | ------- | ------------------------------------------------------------ |
-| Spot              | ✓         | ✓       | Spot markets using Lighter market indexes 2048-4094.         |
-| Perpetual futures | ✓         | ✓       | Linear perpetual markets using Lighter market indexes 0-254. |
-| Dated futures     | -         | -       | *Not supported*.                                             |
-| Options           | -         | -       | *Not supported*.                                             |
+| Product type      | Data feed | Trading | Notes                                                     |
+| ----------------- | --------- | ------- | --------------------------------------------------------- |
+| Spot              | ✓         | ✓       | Spot markets; new listings use 64-bit ids from 4095.      |
+| Perpetual futures | ✓         | ✓       | Linear perpetuals; new listings use 64-bit ids from 4095. |
+| Dated futures     | -         | -       | *Not supported*.                                          |
+| Options           | -         | -       | *Not supported*.                                          |
 
 ## Limitations
 
@@ -100,9 +100,10 @@ The current adapter scope is deliberately narrower than the venue's full transac
   not implemented. Batch submit does not use `CreateGroupedOrders`.
 - Order-list submit and batch cancel fan out independent transactions sequentially over WebSocket.
   Both operations are capped at 15 transactions per command.
-- The execution client implements `CancelAllOrders` from cached open orders for the requested
-  instrument. It does not use the native account-wide transaction because that can affect unrelated
-  markets.
+- The execution client implements `CancelAllOrders` from cached open orders filtered by the requested
+  instrument and optional `order_side`, across strategies. Each cancellation retains the order's
+  owning strategy. The execution client uses individual cancellations because its local cancel-all signing
+  schema has no market restriction or side filter.
 - Spot trading supports market and limit orders. Conditional stop-loss and take-profit orders are
   limited to perpetual markets.
 - Account state and position reports come from private WebSocket streams. `query_account` and
@@ -112,7 +113,10 @@ The current adapter scope is deliberately narrower than the venue's full transac
 
 ## Symbology
 
-Lighter identifies markets by numeric `market_index` values. The adapter bootstraps the mapping from
+Lighter identifies markets by numeric `market_index` values in the venue's 64-bit allocation.
+Legacy markets keep their range-partitioned ids, while markets listed after the September 2026
+upgrade take the next free index from `4095` for either product type. Product type always comes
+from the venue's `market_type` field, never from the index. The adapter bootstraps the mapping from
 `GET /api/v1/orderBookDetails`, then converts the raw venue symbol into a Nautilus `InstrumentId`.
 
 | Deployment product  | Nautilus symbol format                  | Example                            | Notes                    |
@@ -286,7 +290,7 @@ binding does not prompt: review the active env vars yourself before calling.
 | Trade ticks          | ✓            | -        | ✓     | `TradeTick`         | WebSocket trades; public `recentTrades` REST history.    |
 | Quote ticks          | ✓            | -        | -     | `QuoteTick`         | Best bid and ask ticker stream.                          |
 | Order book deltas    | ✓            | ✓        | -     | `OrderBookDeltas`   | `L2_MBP` only.                                           |
-| Order book depth10   | ✓            | -        | -     | `OrderBookDepth10`  | Live top-10 view from maintained book; no REST snapshot. |
+| Order book depth     | ✓            | -        | -     | `OrderBookDepth`    | Live top-10 view from maintained book; no REST snapshot. |
 | Order book snapshots | -            | ✓        | -     | `OrderBook`         | REST snapshot, max depth 250.                            |
 | Mark prices          | ✓            | -        | -     | `MarkPriceUpdate`   | Perp market stats stream.                                |
 | Index prices         | ✓            | -        | -     | `IndexPriceUpdate`  | Market and spot stats streams.                           |
@@ -294,14 +298,14 @@ binding does not prompt: review the active env vars yourself before calling.
 | Bars                 | ✓            | -        | ✓     | `Bar`               | WebSocket candle stream; REST history for backfill.      |
 | Instrument status    | REST         | ✓        | -     | `InstrumentStatus`  | `active` / `inactive` snapshots.                         |
 
-Only `BookType::L2_MBP` is accepted for book-delta and depth10 subscriptions. Other book types
+Only `BookType::L2_MBP` is accepted for book-delta and depth subscriptions. Other book types
 return an error before subscribing.
 
 The WebSocket order book initializes only from `subscribed/order_book`. If an `update/order_book`
 arrives before that snapshot, the adapter drops it and waits for the real snapshot because
 incremental updates do not contain the full visible book.
 
-Depth10 subscriptions use the same WebSocket `order_book` stream as deltas. The adapter emits a
+Depth subscriptions use the same WebSocket `order_book` stream as deltas. The adapter emits a
 refreshed top-10 view after each accepted snapshot or incremental update.
 
 Bar subscriptions use the venue's `candle/{market_id}/{resolution}` WebSocket channel. Lighter
@@ -331,8 +335,52 @@ WebSocket `ticker` stream, but the REST endpoints available to the adapter do no
 timestamped quote snapshot or quote history that can map safely to `QuoteTick`.
 
 `request_book_depth` is not implemented. The documented REST book endpoints do not provide a
-venue event timestamp for `OrderBookDepth10.ts_event`; use `subscribe_book_depth10` for a live
-depth10 stream or `request_book_snapshot` for a REST `OrderBook` snapshot.
+venue event timestamp for `OrderBookDepth.ts_event`; use `subscribe_book_depth` for a live
+depth stream or `request_book_snapshot` for a REST `OrderBook` snapshot.
+
+## Order book recovery
+
+### Sequence validation
+
+The adapter checks each incremental update's `begin_nonce` against the previous book's `nonce`.
+A mismatch suppresses book output and starts an unsubscribe/subscribe replacement.
+
+The venue's `offset` is not a continuity counter: it can skip values and change across servers on
+reconnect. See the [Lighter order book contract](https://apidocs.lighter.xyz/docs/websocket-reference#order-book).
+
+### Snapshot requirements
+
+Initial and replacement subscriptions wait up to `book_snapshot_timeout_secs` (default **10 seconds**)
+for a typed `subscribed/order_book` snapshot after the subscription write completes. Set it to `0`
+to disable snapshot deadlines. A missing snapshot starts or retries recovery, including when a
+control acknowledgement or `Already Subscribed` response arrives without a book.
+Control acknowledgements release subscription slots but do not complete book recovery.
+
+Book output resumes only after a matching snapshot replaces the cached levels. An empty snapshot
+clears the book too.
+
+### Retry limits and reconnects
+
+Each recovery episode permits **at most eight replacement attempts within 180 seconds**, with
+exponential backoff and jitter. Replacement unsubscribe and subscribe writes target the same
+connection.
+
+Reconnect retires obsolete subscription generations and preserves an active recovery's remaining
+budget.
+
+### Consumers and terminal failure
+
+Deltas and depth share a recovery episode for each market:
+
+- Removing one consumer preserves the other.
+- Removing the final consumer cancels pending writes and snapshot waits.
+- Shutdown cancels all owned work.
+
+Exhaustion or permanent rejection suppresses book output until reconnect or an explicit
+unsubscribe/subscribe cycle. Other markets continue independently.
+
+See [Order book recovery ownership](../developer_guide/adapters.md#order-book-recovery-ownership)
+for the shared recovery machinery and adapter responsibilities.
 
 ## Orders capability
 
@@ -417,7 +465,7 @@ quote is denied. Override the slippage with `SubmitOrder.params["market_order_sl
 | -------------- | ---------- | ---- | ----------------------------------------------------------------------------- |
 | `GTC`          | ✓          | ✓    | Limit-style uses `GoodTillTime`; market-style uses `IOC`.                     |
 | `DAY`          | ✓          | ✓    | Limit-style and conditional orders use a positive order expiry.               |
-| `GTD`          | ✓          | ✓    | Supplied expiry must be 5 minutes to 30 days from submission.                 |
+| `GTD`          | ✓          | ✓    | Native expiry is 5 minutes to 30 days; see the managed-GTD policy below.      |
 | `IOC`          | ✓          | ✓    | Plain `MARKET`/`LIMIT` use expiry `0`; conditional limit uses trigger expiry. |
 | `FOK`          | -          | -    | *Not supported*.                                                              |
 | `AT_THE_OPEN`  | -          | -    | *Not supported*.                                                              |
@@ -431,11 +479,24 @@ post-trigger execution. Conditional limit orders can use `IOC`: their trigger re
 expiry, then the child uses `ImmediateOrCancel`.
 
 Without an explicit GTD expiry, limit-style `GTC`, `DAY`, and `GTD` orders default to the current
-time plus 28 days; conditional `GTC`, `DAY`, and limit-style `IOC` use the same default. Lighter
-rejects `-1` and accepts expiries from 5 minutes to 30 days after submission. The adapter enforces
-that window with a one-second signing and transport margin, so an expiry of exactly 5 minutes is
-denied locally before signing; tester configurations expressed in whole minutes should use at least
-6 minutes.
+time plus 28 days; conditional `GTC`, `DAY`, and limit-style `IOC` use the same default. The
+adapter uses this explicit 28-day expiry because the venue has rejected `-1` in these paths with
+`21711 invalid expiry`. Explicit native GTD expiries are currently validated from 5 minutes to 30
+days after submission, with a one-second signing and transport margin on the lower bound.
+
+#### GTD policy
+
+Use local management for short-lived orders and venue-native GTD for longer-lived orders.
+`use_gtd=True` is the default. The strategy `expire_time` becomes the venue `GoodTillTime` expiry
+and must lie within the adapter's current 5-minute to 30-day validation window.
+
+Set `use_gtd=False` only when the submitting strategy has `manage_gtd_expiry=True`. Lighter exposes
+no `GoodTillCancel` time-in-force, so the opt-out cannot switch the wire time-in-force the way the
+Binance adapter does: the order still rests as `GoodTillTime` on the venue's default 28-day
+fallback window, while Nautilus cancels it locally at the strategy expiry. The native 5-minute
+lower bound is not applied in this mode, but local strategy expiries beyond 28 days are rejected;
+use native GTD for those orders. Venue cancel latency still bounds how quickly a locally managed
+order is removed.
 
 ### Execution instructions
 
@@ -471,7 +532,7 @@ them as `INFLIGHT_TIMEOUT` rather than a venue-supplied rejection reason.
 | Submit order list   | ✓          | ✓    | Sequential fanout of up to 15 independent create transactions. |
 | Modify order        | ✓          | ✓    | Sends a signed `ModifyOrder`; reports may restate accepts.     |
 | Cancel order        | ✓          | ✓    | Sends a signed `L2CancelOrder` transaction.                    |
-| Cancel all orders   | ✓          | ✓    | Iterates cached open orders for the requested instrument.      |
+| Cancel all orders   | ✓          | ✓    | Cancels cached orders by instrument and optional side.         |
 | Set leverage        | ✓          | -    | Perp only; submits a signed `UpdateLeverage` tx.               |
 | Batch cancel orders | ✓          | ✓    | Sequential fanout of up to 15 independent cancel transactions. |
 | Query order         | ✓          | ✓    | Requires credentials and REST lookup.                          |
@@ -490,7 +551,7 @@ initial_margin_fraction, margin_mode)`. The `initial_margin_fraction` is in venu
 
 `UpdateLeverage`, `CancelAllOrders`, modify orders with integrator attributes, and conditional
 create orders are byte-pinned against the signer distributed with the official `lighter-python`
-SDK version 1.1.2.
+SDK version 1.1.4.
 
 ### Order querying and reconciliation
 
@@ -796,6 +857,7 @@ endpoints.
 | `http_timeout_secs`                | `60`      | HTTP request timeout in seconds.                              |
 | `ws_timeout_secs`                  | `30`      | WebSocket connection and reconnection timeout.                |
 | `update_instruments_interval_mins` | `60`      | Instrument metadata refresh interval in minutes.              |
+| `book_snapshot_timeout_secs`       | `10`      | Initial, reconnect, and recovery snapshot wait.               |
 | `rest_quota_per_min`               | `None`    | REST quota override; unset keeps 60 req/min.                  |
 | `transport_backend`                | Default   | WebSocket transport backend.                                  |
 
@@ -819,6 +881,7 @@ endpoints.
 | `rest_quota_per_min`        | `None`        | REST quota override; unset keeps 60 req/min.                  |
 | `sendtx_quota_per_min`      | `None`        | Transaction quota override; unset keeps 60 req/min.           |
 | `transport_backend`         | Default       | WebSocket transport backend.                                  |
+| `use_gtd`                   | `True`        | Use venue-native GTD; see [GTD policy](#gtd-policy).          |
 
 ### Configuration example
 
