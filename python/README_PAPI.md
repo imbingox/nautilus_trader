@@ -11,7 +11,7 @@ and copyright holder of the upstream project. Report fork-specific issues to the
 
 ## Supported wheel
 
-The initial `2.0.0rc6` release supports only:
+The initial `2.0.0rc7` release supports only:
 
 - CPython 3.14 with the GIL enabled
 - Linux x86_64 with a `manylinux_2_34` baseline
@@ -24,14 +24,14 @@ Install the exact binary release in a new virtual environment:
 
 ```bash
 python3.14 -m venv .venv
-.venv/bin/python -m pip install --only-binary=:all: nautilus-trader-papi==2.0.0rc6
+.venv/bin/python -m pip install --only-binary=:all: nautilus-trader-papi==2.0.0rc7
 ```
 
 Do not install `nautilus-trader` and `nautilus-trader-papi` together. Both distributions provide
 the same `nautilus_trader` package and `_libnautilus` extension. Remove the official distribution,
 or preferably create a fresh environment, before installing this fork.
 
-The fork uses its own PEP 440 version sequence. `2.0.0rc6` is the first PAPI release candidate;
+The fork uses its own PEP 440 version sequence. `2.0.0rc7` is the first published PAPI candidate;
 future PAPI changes receive a new public version even when the tracked upstream version is
 unchanged. A matching number does not imply that the two distributions are interchangeable.
 

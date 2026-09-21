@@ -29,7 +29,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = REPO_ROOT / "scripts/papi-release/verify_wheel.py"
 MANIFEST_SCRIPT = REPO_ROOT / "scripts/papi-release/generate-manifest.py"
-WHEEL_NAME = "nautilus_trader_papi-2.0.0rc6-cp314-cp314-manylinux_2_34_x86_64.whl"
+WHEEL_NAME = "nautilus_trader_papi-2.0.0rc7-cp314-cp314-manylinux_2_34_x86_64.whl"
 
 
 def _load_script(path: Path, name: str) -> ModuleType:
@@ -57,17 +57,18 @@ def _wheel(
     homepage: str = "https://github.com/imbingox/nautilus_trader",
     os_classifier: str = "Operating System :: POSIX :: Linux",
     requires_python: str = ">=3.14, <3.15",
+    include_stub: bool = True,
 ) -> Path:
     """
     Create the smallest archive that satisfies the PAPI wheel content contract.
     """
     path = tmp_path / filename
-    dist_info = "nautilus_trader_papi-2.0.0rc6.dist-info"
+    dist_info = "nautilus_trader_papi-2.0.0rc7.dist-info"
     metadata = "\n".join(
         [
             "Metadata-Version: 2.4",
             "Name: nautilus-trader-papi",
-            "Version: 2.0.0rc6",
+            "Version: 2.0.0rc7",
             "Summary: Unofficial NautilusTrader PAPI distribution",
             f"Home-Page: {homepage}",
             f"Requires-Python: {requires_python}",
@@ -86,7 +87,6 @@ def _wheel(
     )
     members = {
         "nautilus_trader/__init__.py": b"",
-        "nautilus_trader/_libnautilus.pyi": b"",
         "nautilus_trader/_libnautilus.cpython-314-x86_64-linux-gnu.so": b"extension",
         "nautilus_trader/adapters/binance_papi/__init__.py": facade,
         "nautilus_trader/adapters/binance_papi/__init__.pyi": b"",
@@ -95,6 +95,9 @@ def _wheel(
         f"{dist_info}/RECORD": b"",
         f"{dist_info}/licenses/LICENSE": b"LGPL-3.0-only",
     }
+
+    if include_stub:
+        members["nautilus_trader/_libnautilus/__init__.pyi"] = b""
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, value in members.items():
             archive.writestr(name, value)
@@ -108,16 +111,27 @@ def test_verify_wheel_accepts_frozen_release_contract(tmp_path: Path) -> None:
     report = _load_verifier().validate_wheel(_wheel(tmp_path))
 
     assert report["distribution"] == "nautilus-trader-papi"
-    assert report["version"] == "2.0.0rc6"
+    assert report["version"] == "2.0.0rc7"
     assert report["platform_tag"] == "manylinux_2_34_x86_64"
     assert report["archive_checks"] == "passed"
     assert report["complete"] is False
 
 
+def test_verify_wheel_requires_generated_extension_stub(tmp_path: Path) -> None:
+    """
+    Reject a wheel without the generated stub at its tracked package path.
+    """
+    assert (REPO_ROOT / "python/nautilus_trader/_libnautilus/__init__.pyi").is_file()
+    path = _wheel(tmp_path, include_stub=False)
+
+    with pytest.raises(ValueError, match=r"_libnautilus/__init__\.pyi"):
+        _load_verifier().validate_wheel(path)
+
+
 @pytest.mark.parametrize(
     "requirement",
     [
-        "nautilus-trader==2.0.0rc6",
+        "nautilus-trader==2.0.0rc7",
         "nautilus_trader[visualization]>=2; python_version >= '3.14'",
         "Nautilus.Trader @ https://example.invalid/nautilus-trader.whl",
     ],

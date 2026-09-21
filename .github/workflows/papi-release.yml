@@ -31,7 +31,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          [[ "$RELEASE_TAG" == papi-v2.0.0rc6 ]]
+          [[ "$RELEASE_TAG" == papi-v2.0.0rc7 ]]
           [[ "$(git rev-parse HEAD)" == "$(git rev-parse "${RELEASE_TAG}^{commit}")" ]]
           [[ "$(git cat-file -t "$RELEASE_TAG")" == tag ]]
           tag_object="$(git rev-parse "${RELEASE_TAG}^{tag}")"
