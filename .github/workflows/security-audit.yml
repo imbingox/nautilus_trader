@@ -33,7 +33,7 @@ on:
         default: false
   push:
     branches: [test-security]
-    paths: &security_audit_paths
+    paths:
       - Cargo.lock # Keep in sync with scripts/ci/security-audit-gate.sh.
       - Cargo.toml
       - crates/**/Cargo.toml
