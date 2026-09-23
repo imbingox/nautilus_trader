@@ -5,8 +5,6 @@ permissions: # Principle of least privilege
   actions: read
 
 on:
-  schedule:
-    - cron: "0 14 * * *" # At 14:00 UTC daily
   workflow_dispatch: # Allow manual trigger
 
 jobs:
