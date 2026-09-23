@@ -6,8 +6,6 @@ name: security-audit
 #   - Manual dispatch: every audit job runs unconditionally.
 #   - Calls from build.yml: audit jobs run for audit-relevant changes, while
 #     test-ci and test-pre-commit force every audit job and nightly skips them.
-#   - Pull requests not targeting develop: GitHub path filters create a workflow
-#     run only when audit-relevant paths change.
 #   - Pushes to test-security: GitHub path filters create a workflow run only
 #     when audit-relevant paths change.
 
@@ -33,8 +31,8 @@ on:
         description: Complete the audit gate without running audit jobs
         type: boolean
         default: false
-  pull_request:
-    branches-ignore: [develop]
+  push:
+    branches: [test-security]
     paths: &security_audit_paths
       - Cargo.lock # Keep in sync with scripts/ci/security-audit-gate.sh.
       - Cargo.toml
@@ -79,9 +77,6 @@ on:
       - scripts/ci/validate-wheel-upload.bash
       - .github/actions/**
       - .github/workflows/**
-  push:
-    branches: [test-security]
-    paths: *security_audit_paths
   workflow_dispatch: # Allow manual trigger
 
 # The two audit job names and their "Run ..." step names are checked by
