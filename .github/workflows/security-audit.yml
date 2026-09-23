@@ -3,7 +3,7 @@ name: security-audit
 # Supply chain security checks.
 #
 # Triggers:
-#   - Nightly cron and manual dispatch: every audit job runs unconditionally.
+#   - Manual dispatch: every audit job runs unconditionally.
 #   - Calls from build.yml: audit jobs run for audit-relevant changes, while
 #     test-ci and test-pre-commit force every audit job and nightly skips them.
 #   - Pull requests not targeting develop: GitHub path filters create a workflow
@@ -82,8 +82,6 @@ on:
   push:
     branches: [test-security]
     paths: *security_audit_paths
-  schedule:
-    - cron: "0 12 * * *" # Daily at 12:00 UTC (2hrs prior to nightly-merge)
   workflow_dispatch: # Allow manual trigger
 
 # The two audit job names and their "Run ..." step names are checked by
