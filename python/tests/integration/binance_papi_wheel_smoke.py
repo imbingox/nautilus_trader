@@ -25,7 +25,9 @@ import importlib
 import importlib.metadata
 import json
 import sys
+import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 import nautilus_trader
@@ -113,6 +115,7 @@ def main() -> None:
     config = papi.BinancePapiExecutionClientConfig(account_id=account_id)
     assert config.account_id == account_id
     assert isinstance(config.account_id, AccountId)
+    assert config.trading is None
     assert papi.BinancePapiExecutionClientFactory().name() == "BINANCE_PAPI"
     for name in (
         "BinancePapiAccountSession",
@@ -141,6 +144,39 @@ def main() -> None:
         api_secret="OfflinePapiSecret",
         base_url="http://127.0.0.1:9",
     )
+    with tempfile.TemporaryDirectory() as directory:
+        journal = Path(directory) / "papi-commands.journal"
+        limits = papi.BinancePapiInstrumentTradingConfig(
+            instrument_id=instrument.id,
+            max_order_quantity=Decimal("0.125"),
+            max_order_notional=Decimal("5000.00"),
+            max_position_quantity=Decimal("0.250"),
+            max_instrument_exposure=Decimal("10000.00"),
+        )
+        trading = papi.BinancePapiTradingConfig(
+            command_journal_path=journal,
+            risk_currency=Currency.from_str("USDT"),
+            instrument_limits=[limits],
+            max_account_exposure=Decimal("15000.00"),
+            max_in_flight_operations=4,
+            max_risk_age_ms=10_000,
+            max_risk_collection_span_ms=1_000,
+            max_recovery_requests=32,
+            max_recovery_rounds=3,
+            recovery_recheck_interval_ms=250,
+            market_order_price_buffer_bps=100,
+            fee_buffer_bps=10,
+        )
+        trading_config = papi.BinancePapiExecutionClientConfig(
+            account_id=account_id,
+            read_only=read_only,
+            instrument_ids=[instrument.id],
+            trading=trading,
+        )
+        assert trading_config.trading.command_journal_path == journal
+        assert trading_config.trading.max_account_exposure == Decimal("15000.00")
+        assert trading_config.trading.instrument_limits[0].max_order_quantity == Decimal("0.125")
+        assert not journal.exists()
     session = papi.BinancePapiAccountSession(read_only, [instrument])
     evidence = json.loads(session.evidence_json())
     assert evidence["state"] == "stopped"
@@ -150,7 +186,11 @@ def main() -> None:
     assert not hasattr(session, "submit_order")
     assert not hasattr(session, "modify_order")
     assert not hasattr(session, "cancel_order")
-    asyncio.run(session.stop())
+
+    async def stop_session() -> None:
+        await session.stop()
+
+    asyncio.run(stop_session())
     reader = papi.BinancePapiReadOnlyClient(read_only, [instrument])
     reader.cancel()
 
@@ -161,7 +201,8 @@ def main() -> None:
     with check.assertRaisesRegex(RuntimeError, "canceled"):  # noqa: PT027 - stdlib-only check
         asyncio.run(canceled_query())
     assert "OfflinePapiSecret" not in repr(read_only)
-    assert not hasattr(read_only, "api_secret")
+    for name in ("api_key", "api_secret", "base_url", "websocket_url"):
+        assert not hasattr(read_only, name)
     node = (
         LiveNode.builder("PAPI-WHEEL", trader_id, Environment.LIVE)
         .add_data_client(None, BinanceDataClientFactory(), data_config)

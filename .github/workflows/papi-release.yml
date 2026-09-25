@@ -1,0 +1,178 @@
+name: Publish PAPI wheel
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Signed papi-v* tag to build and publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: papi-release-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and verify frozen wheel
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_tag }}
+          persist-credentials: false
+      - name: Verify release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          [[ "$RELEASE_TAG" == papi-v2.0.0rc7 ]]
+          [[ "$(git rev-parse HEAD)" == "$(git rev-parse "${RELEASE_TAG}^{commit}")" ]]
+          [[ "$(git cat-file -t "$RELEASE_TAG")" == tag ]]
+          tag_object="$(git rev-parse "${RELEASE_TAG}^{tag}")"
+          [[ "$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object}" \
+            --jq '.verification.verified')" == true ]]
+      - name: Set up CPython 3.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.15"
+          enable-cache: false
+      - name: Set up Rust
+        run: |
+          rustup show active-toolchain
+          rustc -Vv
+      - name: Build release wheel
+        env:
+          CARGO_BUILD_JOBS: "2"
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: bash scripts/papi-release/build-wheel.bash "$RELEASE_TAG" dist/papi
+      - name: Verify release wheel
+        run: bash scripts/papi-release/verify-wheel.bash dist/papi
+      - name: Generate release manifest
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          python3 scripts/papi-release/generate-manifest.py \
+            --wheel-dir dist/papi \
+            --source-ref "$RELEASE_TAG" \
+            --tag "$RELEASE_TAG" \
+            --output dist/papi/release-manifest.json
+      - name: Upload frozen candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: papi-release-candidate
+          path: dist/papi
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-testpypi:
+    name: Publish frozen wheel to TestPyPI
+    needs: build
+    runs-on: ubuntu-22.04
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download frozen candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: papi-release-candidate
+          path: candidate
+      - name: Select immutable distribution files
+        run: |
+          mkdir publish
+          cp candidate/*.whl publish/
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: publish
+          repository-url: https://test.pypi.org/legacy/
+          verbose: true
+          print-hash: true
+
+  verify-testpypi:
+    name: Download and verify TestPyPI wheel
+    needs: publish-testpypi
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_tag }}
+          persist-credentials: false
+      - name: Set up CPython 3.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.15"
+          enable-cache: false
+      - name: Download release manifest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: papi-release-candidate
+          path: candidate
+      - name: Verify TestPyPI bytes and installation
+        run: bash scripts/papi-release/verify-index.bash testpypi candidate/release-manifest.json
+
+  publish-pypi:
+    name: Promote identical wheel to PyPI
+    needs: verify-testpypi
+    runs-on: ubuntu-22.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download frozen candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: papi-release-candidate
+          path: candidate
+      - name: Select immutable distribution files
+        run: |
+          mkdir publish
+          cp candidate/*.whl publish/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: publish
+          verbose: true
+          print-hash: true
+
+  verify-pypi:
+    name: Download and verify PyPI wheel
+    needs: publish-pypi
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_tag }}
+          persist-credentials: false
+      - name: Set up CPython 3.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.15"
+          enable-cache: false
+      - name: Download release manifest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: papi-release-candidate
+          path: candidate
+      - name: Verify PyPI bytes and installation
+        run: bash scripts/papi-release/verify-index.bash pypi candidate/release-manifest.json
