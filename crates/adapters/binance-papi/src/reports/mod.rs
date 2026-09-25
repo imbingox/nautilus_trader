@@ -19,10 +19,15 @@ pub(crate) mod history;
 pub(crate) mod models;
 pub(crate) mod parse;
 
+mod current;
+
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use nautilus_binance::common::{
     enums::{BinanceAlgoStatus, BinanceOrderStatus},
@@ -59,17 +64,13 @@ use crate::{
     read_only::BinancePapiReadOnlySnapshot,
 };
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct InstrumentScope {
     instruments: BTreeMap<String, InstrumentAny>,
 }
 
 impl InstrumentScope {
     pub(crate) fn new(instruments: Vec<InstrumentAny>) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            !instruments.is_empty() && instruments.len() <= 256,
-            "PAPI requires 1 to 256 explicitly scoped instruments"
-        );
         let mut result = BTreeMap::new();
 
         for instrument in instruments {
@@ -126,7 +127,7 @@ impl InstrumentScope {
 
 pub(crate) struct ReportCollector<'a> {
     pub(crate) http: &'a PapiHttpClient,
-    pub(crate) scope: &'a InstrumentScope,
+    pub(crate) scope: Cow<'a, InstrumentScope>,
     pub(crate) account_id: AccountId,
     pub(crate) clock: &'a AtomicTime,
     pub(crate) cancel: &'a CancellationToken,
@@ -139,6 +140,10 @@ impl ReportCollector<'_> {
         mut self,
         window: HistoryWindow,
     ) -> anyhow::Result<BinancePapiReadOnlySnapshot> {
+        anyhow::ensure!(
+            !self.scope.instruments.is_empty() && self.scope.instruments.len() <= 256,
+            "PAPI historical reports require 1 to 256 explicitly scoped instruments"
+        );
         self.ensure_mode().await?;
         let symbols = self.scope.symbols(None)?;
         let positions = self.positions_inner(&symbols).await?;
@@ -242,7 +247,7 @@ impl ReportCollector<'_> {
         Ok(snapshot)
     }
 
-    pub(crate) async fn open_orders(
+    async fn scoped_open_orders(
         mut self,
         instrument_id: Option<InstrumentId>,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
@@ -266,7 +271,7 @@ impl ReportCollector<'_> {
         Ok(reports)
     }
 
-    pub(crate) async fn positions(
+    async fn scoped_positions(
         mut self,
         instrument_id: Option<InstrumentId>,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
@@ -348,7 +353,7 @@ impl ReportCollector<'_> {
         for symbol in symbols {
             let response = self
                 .raw(&PapiRequest::Positions {
-                    symbol: symbol.clone(),
+                    symbol: Some(symbol.clone()),
                 })
                 .await?;
             let rows: Vec<JsonObject<PositionRow>> =

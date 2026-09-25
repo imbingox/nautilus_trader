@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Signed PAPI reads with explicit instrument and history coverage.
+//! Signed PAPI account-wide current reads and explicitly scoped historical coverage.
 //!
 //! This query surface does not publish an account, connect a LiveNode, or enable trading.
 //! Historical reports remain incomplete until authenticated venue semantics are verified.
@@ -23,11 +23,13 @@ mod projection;
 mod risk;
 
 #[cfg(test)]
+mod current_tests;
+#[cfg(test)]
 mod engine_tests;
 #[cfg(test)]
 mod tests;
 
-use std::{fmt::Debug, sync::Arc, time::Duration};
+use std::{borrow::Cow, fmt::Debug, sync::Arc, time::Duration};
 
 use nautilus_common::live::dst::time::Instant;
 use nautilus_core::{UnixNanos, time::AtomicTime};
@@ -174,9 +176,10 @@ pub struct BinancePapiReadOnlyClient {
 }
 
 impl BinancePapiReadOnlyClient {
-    /// Constructs a read-only client from explicit credentials and preloaded UM instruments.
+    /// Constructs a read-only client from explicit credentials and optional preloaded UM instruments.
     ///
-    /// Obtain public metadata from the existing Binance adapter without PAPI credentials.
+    /// Current reports load missing metadata from public USD-M exchange information.
+    /// Supplied instruments define the separate historical and trading recovery scope.
     /// Construction performs no network requests and reads no environment variables.
     ///
     /// # Errors
@@ -200,6 +203,10 @@ impl BinancePapiReadOnlyClient {
         gate: Arc<RequestGate>,
         clock: Arc<AtomicTime>,
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            instruments.len() <= config.max_rows,
+            "PAPI instrument metadata exceeds row budget"
+        );
         let scope = InstrumentScope::new(instruments)?;
         let http = PapiHttpClient::new(config, gate, Arc::clone(&clock))?;
         let sources = observation_sources();
@@ -214,6 +221,7 @@ impl BinancePapiReadOnlyClient {
         Ok(Self {
             inner: Arc::new(ReadOnlyInner {
                 http,
+                current_instruments: Mutex::new(scope.clone()),
                 scope,
                 clock,
                 account_id: config.account_id,
@@ -675,7 +683,31 @@ impl BinancePapiReadOnlyClient {
         self.collector()?.mass_status(window).await
     }
 
-    /// Returns all current open or in-flight orders within the requested metadata scope.
+    /// Returns current order reports, optionally filtered by instrument.
+    ///
+    /// With no instrument, ordinary and algo orders are queried across the UM account.
+    /// Missing metadata is loaded from public USD-M exchange information. No partial list
+    /// is returned when a source or report conversion fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for historical requests, unsupported mode, unresolved metadata,
+    /// failed current reads, unresolved algo children or invalid reports.
+    pub async fn generate_order_status_reports(
+        &self,
+        instrument_id: Option<InstrumentId>,
+        open_only: bool,
+    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        anyhow::ensure!(
+            open_only,
+            "PAPI history is incomplete; use the bounded mass status report"
+        );
+        self.collector()?
+            .open_orders(instrument_id, &self.inner.current_instruments)
+            .await
+    }
+
+    /// Returns current open or in-flight orders, querying the whole UM account when no instrument is given.
     ///
     /// Active orders are included regardless of their age. A partial result is never returned.
     ///
@@ -686,13 +718,15 @@ impl BinancePapiReadOnlyClient {
         &self,
         instrument_id: Option<InstrumentId>,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        self.collector()?.open_orders(instrument_id).await
+        self.generate_order_status_reports(instrument_id, true)
+            .await
     }
 
-    /// Returns explicit one-way position rows for every requested instrument.
+    /// Returns current one-way positions, querying the whole UM account when no instrument is given.
     ///
-    /// A successful symbol-scoped empty response is a flat position. Sparse account V2 data is
-    /// never used by itself to infer a flat position.
+    /// Account-wide queries omit zero positions, matching the Binance Futures adapter.
+    /// A successful symbol-scoped empty response is a flat position. Sparse account V2 data
+    /// is never used by itself to infer a flat position.
     ///
     /// # Errors
     ///
@@ -701,7 +735,9 @@ impl BinancePapiReadOnlyClient {
         &self,
         instrument_id: Option<InstrumentId>,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        self.collector()?.positions(instrument_id).await
+        self.collector()?
+            .positions(instrument_id, &self.inner.current_instruments)
+            .await
     }
 
     /// Resolves one order by its encoded venue identity or ordinary client order ID.
@@ -731,7 +767,7 @@ impl BinancePapiReadOnlyClient {
     ) -> anyhow::Result<ReportCollector<'_>> {
         Ok(ReportCollector {
             http: &self.inner.http,
-            scope: &self.inner.scope,
+            scope: Cow::Borrowed(&self.inner.scope),
             account_id: self.inner.account_id,
             clock: &self.inner.clock,
             cancel: &self.inner.cancel,
@@ -755,7 +791,7 @@ impl BinancePapiReadOnlyClient {
     fn collector(&self) -> anyhow::Result<ReportCollector<'_>> {
         Ok(ReportCollector {
             http: &self.inner.http,
-            scope: &self.inner.scope,
+            scope: Cow::Borrowed(&self.inner.scope),
             account_id: self.inner.account_id,
             clock: &self.inner.clock,
             cancel: &self.inner.cancel,
@@ -793,6 +829,7 @@ impl Debug for BinancePapiReadOnlyClient {
 struct ReadOnlyInner {
     http: PapiHttpClient,
     scope: InstrumentScope,
+    current_instruments: Mutex<InstrumentScope>,
     clock: Arc<AtomicTime>,
     account_id: AccountId,
     operation_timeout: Duration,

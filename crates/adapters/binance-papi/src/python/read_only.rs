@@ -37,7 +37,8 @@ use crate::read_only::{
 impl BinancePapiReadOnlyConfig {
     /// Explicit credentials and resource bounds for PAPI read-only queries.
     ///
-    /// No environment variables are read. The supplied instruments define the complete query scope.
+    /// No environment variables are read. Current report queries support the whole UM account;
+    /// supplied instruments define the separate historical and trading recovery scope.
     /// Credentials and the base URL are redacted from Rust and Python representations.
     #[new]
     #[pyo3(signature = (
@@ -211,12 +212,14 @@ impl BinancePapiReadOnlyClient {
     /// other processes require separate coordination. A throttle or ban latches the gate closed.
     /// SDK 69.2.1 discards error headers, so automatic throttle recovery is unavailable.
     #[new]
+    #[pyo3(signature = (config, instruments=None))]
     fn py_new(
         py: Python<'_>,
         config: &BinancePapiReadOnlyConfig,
-        instruments: Vec<Py<PyAny>>,
+        instruments: Option<Vec<Py<PyAny>>>,
     ) -> PyResult<Self> {
         let instruments = instruments
+            .unwrap_or_default()
             .into_iter()
             .map(|instrument| pyobject_to_instrument_any(py, instrument))
             .collect::<PyResult<Vec<_>>>()?;
@@ -356,7 +359,38 @@ impl BinancePapiReadOnlyClient {
         })
     }
 
-    /// Returns all current open or in-flight orders within the requested metadata scope.
+    /// Returns current order reports, optionally filtered by instrument.
+    ///
+    /// With no instrument, ordinary and algo orders are queried across the UM account.
+    /// Missing metadata is loaded from public USD-M exchange information. No partial list
+    /// is returned when a source or report conversion fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for historical requests, unsupported mode, unresolved metadata,
+    /// failed current reads, unresolved algo children or invalid reports.
+    #[pyo3(name = "generate_order_status_reports", signature = (instrument_id=None, open_only=true))]
+    #[gen_stub(override_return_type(
+        type_repr = "typing.Awaitable[list[nautilus_trader.model.OrderStatusReport]]",
+        imports = ("typing", "nautilus_trader.model"),
+    ))]
+    fn py_generate_order_status_reports<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: Option<InstrumentId>,
+        open_only: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .generate_order_status_reports(instrument_id, open_only)
+                .await
+                .map_err(to_pyruntime_err)
+        })
+    }
+
+    /// Returns current open or in-flight orders, querying the whole UM account when no instrument is given.
     ///
     /// Active orders are included regardless of their age. A partial result is never returned.
     ///
@@ -383,10 +417,11 @@ impl BinancePapiReadOnlyClient {
         })
     }
 
-    /// Returns explicit one-way position rows for every requested instrument.
+    /// Returns current one-way positions, querying the whole UM account when no instrument is given.
     ///
-    /// A successful symbol-scoped empty response is a flat position. Sparse account V2 data is
-    /// never used by itself to infer a flat position.
+    /// Account-wide queries omit zero positions, matching the Binance Futures adapter.
+    /// A successful symbol-scoped empty response is a flat position. Sparse account V2 data
+    /// is never used by itself to infer a flat position.
     ///
     /// # Errors
     ///

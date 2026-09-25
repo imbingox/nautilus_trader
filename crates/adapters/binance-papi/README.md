@@ -242,8 +242,11 @@ isolation; it must contain neither `nautilus-binance-papi` nor `binance-sdk`.
 ## Read-only queries
 
 Use `read_only::BinancePapiReadOnlyConfig` with an explicit account ID, HMAC key and secret,
-then construct `BinancePapiReadOnlyClient` with 1 to 256 preloaded Binance linear UM instruments.
-Public metadata can be loaded through the existing Binance adapter without PAPI credentials.
+then construct `BinancePapiReadOnlyClient`. Preloaded Binance linear UM instruments are optional
+for current reports. Missing metadata is loaded from public USD-M exchange information and cached
+across calls and client clones. A newly observed symbol triggers another metadata lookup within
+the operation budget. Historical reports and private-session recovery still require 1 to 256
+explicitly scoped instruments.
 No adapter environment variables are read. HTTPS origins and local HTTP loopback origins are
 supported; redirects and implicit environment proxy configuration are disabled. An explicit
 HTTP or HTTPS `proxy_url` applies to both REST and WebSocket transports.
@@ -277,13 +280,31 @@ The client exposes:
 - `account_snapshot_json(max_receipt_age, max_collection_span)` for an independent native wallet
   projection and PM risk view with explicit validity and source metadata.
 - `query_order_rate_limit` for unprojected quota JSON.
-- `generate_open_order_status_reports` for current ordinary and algo orders.
-- `generate_position_status_reports` for explicit one-way position rows.
+- `generate_order_status_reports(instrument_id=None, open_only=True)` for account-wide current
+  ordinary and algo orders, or one instrument when supplied. `open_only=False` is unsupported;
+  `generate_open_order_status_reports` remains an alias for current orders.
+- `generate_position_status_reports(instrument_id=None)` for account-wide nonzero one-way positions,
+  or an explicit position/flat report for one supplied instrument.
 - `generate_order_status_report` for an exact venue identity or ordinary client order ID.
 - `generate_mass_status(start, end)` for a fixed inclusive history window, current orders,
   positions, response metadata, and coverage issues.
 
-All scoped symbols are scanned, including those with no current exposure. Ordinary venue IDs
+Current queries omit `symbol` to discover the entire UM account, including external positions and
+orders outside the preloaded metadata. They return native `PositionStatusReport` and
+`OrderStatusReport` lists, following the Binance Futures report interface. A failed source,
+unresolved active instrument, unsupported mode, or failed conversion raises an error; no partial
+list or raw-record envelope is returned. A successful empty list means the current account query
+found no positions or open orders. Each endpoint is observed separately, not as an atomic snapshot.
+
+```python
+client = BinancePapiReadOnlyClient(config)
+positions = await client.generate_position_status_reports()
+orders = await client.generate_order_status_reports(open_only=True)
+```
+
+Historical collection scans all explicitly scoped symbols, including those with no current exposure.
+Automatically discovered metadata never extends the historical/recovery scope or trading allowlist.
+Ordinary venue IDs
 use `PAPI:O:SYMBOL:ID`; algo IDs use `PAPI:A:SYMBOL:ID`. Known child orders and fills retain the algo
 parent's lifecycle. Contradictory identities, duplicate client IDs, missing child evidence,
 unsupported states, and inexact domain conversions fail the read. Fees preserve their sign and

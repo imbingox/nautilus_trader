@@ -27,7 +27,7 @@ pub(crate) enum PapiRequest {
     Observation(ObservationSource),
     PositionMode,
     Positions {
-        symbol: String,
+        symbol: Option<String>,
     },
     OpenOrders {
         symbol: String,
@@ -97,8 +97,8 @@ impl PapiRequest {
 
     pub(crate) fn symbol(&self) -> Option<&str> {
         match self {
-            Self::Positions { symbol }
-            | Self::OpenOrders { symbol }
+            Self::Positions { symbol } => symbol.as_deref(),
+            Self::OpenOrders { symbol }
             | Self::Order { symbol, .. }
             | Self::OpenAlgos { symbol }
             | Self::History { symbol, .. }

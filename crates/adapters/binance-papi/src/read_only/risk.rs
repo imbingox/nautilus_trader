@@ -456,7 +456,7 @@ impl BinancePapiReadOnlyClient {
             .http
             .get(
                 &PapiRequest::Positions {
-                    symbol: symbol.to_owned(),
+                    symbol: Some(symbol.to_owned()),
                 },
                 budget,
                 &self.inner.cancel,

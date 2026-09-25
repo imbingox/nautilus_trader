@@ -365,6 +365,10 @@ impl BinancePapiAccountSession {
         incremental_handler: PapiIncrementalHandler,
         risk_refresh_handler: Option<PapiRiskRefreshHandler>,
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            (1..=256).contains(&instruments.len()),
+            "PAPI recovery requires 1 to 256 explicitly scoped instruments"
+        );
         let reader = BinancePapiReadOnlyClient::new(config, instruments.clone())?;
         Self::with_reader(
             config,

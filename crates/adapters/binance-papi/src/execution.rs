@@ -1731,7 +1731,7 @@ impl ExecutionClient for BinancePapiExecutionClient {
         );
         let reports = self
             .reader()?
-            .generate_open_order_status_reports(cmd.instrument_id)
+            .generate_order_status_reports(cmd.instrument_id, cmd.open_only)
             .await?;
         Self::log_report_receipt(reports.len(), "order status", cmd.log_receipt_level);
         Ok(reports)
@@ -2557,6 +2557,15 @@ mod tests {
         let server = MockServer::new(|request| match request.path.as_str() {
             "/papi/v1/um/openOrders" if request.params["symbol"] == "BTCUSDT" => {
                 Reply::json(&json!([testing::order()]))
+            }
+            "/papi/v1/um/positionRisk" if !request.params.contains_key("symbol") => {
+                let mut btc = testing::position("BTCUSDT");
+                btc["positionAmt"] = json!("0.010");
+                btc["entryPrice"] = json!("28511.00");
+                let mut eth = testing::position("ETHUSDT");
+                eth["positionAmt"] = json!("-0.100");
+                eth["entryPrice"] = json!("2000.00");
+                Reply::json(&json!([btc, eth]))
             }
             "/papi/v1/um/order" => Reply::json(&testing::order()),
             _ => testing::quiet(request),

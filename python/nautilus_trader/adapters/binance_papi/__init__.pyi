@@ -86,7 +86,9 @@ class BinancePapiInstrumentTradingConfig:
 @typing.final
 class BinancePapiReadOnlyClient:
     def __init__(
-        self, config: BinancePapiReadOnlyConfig, instruments: typing.Sequence[typing.Any]
+        self,
+        config: BinancePapiReadOnlyConfig,
+        instruments: typing.Sequence[typing.Any] | None = None,
     ) -> None: ...
     def cancel(self) -> None: ...
     @property
@@ -100,6 +102,9 @@ class BinancePapiReadOnlyClient:
     def generate_mass_status(
         self, start: int, end: int
     ) -> typing.Awaitable[BinancePapiReadOnlySnapshot]: ...
+    def generate_order_status_reports(
+        self, instrument_id: model.InstrumentId | None = None, open_only: bool = True
+    ) -> typing.Awaitable[list[model.OrderStatusReport]]: ...
     def generate_open_order_status_reports(
         self, instrument_id: model.InstrumentId | None = None
     ) -> typing.Awaitable[list[model.OrderStatusReport]]: ...

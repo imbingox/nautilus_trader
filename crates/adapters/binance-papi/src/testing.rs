@@ -294,7 +294,10 @@ pub(crate) fn quiet(request: &RecordedRequest) -> Reply {
             Reply::raw(200, "")
         }
         "/papi/v1/um/positionSide/dual" => Reply::json(&json!({"dualSidePosition": false})),
-        "/papi/v1/um/positionRisk" => Reply::json(&json!([position(&request.params["symbol"])])),
+        "/papi/v1/um/positionRisk" => match request.params.get("symbol") {
+            Some(symbol) => Reply::json(&json!([position(symbol)])),
+            None => Reply::json(&json!([])),
+        },
         "/papi/v1/um/openOrders"
         | "/papi/v1/um/algo/openAlgoOrders"
         | "/papi/v1/cm/positionRisk"

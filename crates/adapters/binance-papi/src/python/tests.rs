@@ -122,7 +122,21 @@ fn test_python_read_only_constructors_registry_and_secret_boundaries() {
                 .iter()
                 .all(|row| { row["receipt_status"] == "canceled" && row["observation"].is_null() })
         );
-        assert!(client_type.call1((&read_only, PyList::empty(py))).is_err());
+        assert!(client_type.call1((&read_only, PyList::empty(py))).is_ok());
+        assert!(client_type.call1((&read_only,)).is_ok());
+        assert!(
+            client
+                .getattr("generate_order_status_reports")
+                .unwrap()
+                .is_callable()
+        );
+        assert!(
+            module
+                .getattr("BinancePapiAccountSession")
+                .unwrap()
+                .call1((&read_only, PyList::empty(py)))
+                .is_err()
+        );
         assert!(read_only.getattr("api_key").is_err());
         assert!(read_only.getattr("api_secret").is_err());
         assert!(read_only.getattr("base_url").is_err());

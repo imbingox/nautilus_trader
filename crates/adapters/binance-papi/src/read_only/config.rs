@@ -22,7 +22,8 @@ use url::{Host, Url};
 
 /// Explicit credentials and resource bounds for PAPI read-only queries.
 ///
-/// No environment variables are read. The supplied instruments define the complete query scope.
+/// No environment variables are read. Current report queries support the whole UM account;
+/// supplied instruments define the separate historical and trading recovery scope.
 /// Credentials and the base URL are redacted from Rust and Python representations.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

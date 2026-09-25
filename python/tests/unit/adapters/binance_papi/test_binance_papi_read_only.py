@@ -69,6 +69,9 @@ def _quiet(path: str, params: dict[str, list[str]]) -> Reply:
         return 200, '{"dualSidePosition":false}'
     if path == "/papi/v1/um/positionRisk":
         rows = json.loads((TEST_DATA / "reports/positions.json").read_text(encoding="utf-8"))
+
+        if "symbol" not in params:
+            return 200, "[]"
         rows[0]["symbol"] = params["symbol"][0]
         return 200, json.dumps(rows[:1])
     sources = {
@@ -119,6 +122,7 @@ def _serve(
             requests.append(
                 {
                     "path": target.path,
+                    "params": params,
                     "api_key": self.headers.get("X-MBX-APIKEY"),
                     "signature_valid": hmac.compare_digest(
                         params.get("signature", [""])[0],
@@ -264,13 +268,15 @@ def test_invalid_bounds_fail_without_network(overrides: dict[str, int]) -> None:
 
 def test_python_scope_and_factory_validation_preserve_account_identity() -> None:
     """
-    Require explicit supported metadata and matching account identities.
+    Validate supplied metadata and matching account identities.
     """
     with _serve() as (url, requests):
         config = _config(url)
 
+        papi.BinancePapiReadOnlyClient(config)
+        papi.BinancePapiReadOnlyClient(config, [])
+
         for instruments in (
-            [],
             [TestInstrumentProvider.btcusdt_perp_binance()] * 2,
             [TestInstrumentProvider.btcusdt_binance()],
         ):
@@ -516,3 +522,128 @@ def test_acceptance_script_keeps_exact_private_evidence_and_source_failures(
         assert example.main(argv) == 1
         assert output.read_bytes() == previous
         assert len(requests) == request_count
+
+
+def _current_exchange_info(symbols: list[str]) -> dict[str, Any]:
+    # Synthetic symbol variants of the official USD-M exchange-info fixture
+    fixture = (
+        TEST_DATA.parent.parent / "binance/test_data/futures/http_json/exchange_info_usdm.json"
+    )
+    info = json.loads(fixture.read_text(encoding="utf-8"))
+    definition = info["symbols"][0]
+    info["symbols"] = [
+        {**definition, "symbol": symbol, "pair": symbol, "baseAsset": symbol.removesuffix("USDT")}
+        for symbol in symbols
+    ]
+    return info
+
+
+def test_account_current_reports_use_native_types_without_instrument_allowlist() -> None:
+    """
+    Query external positions and orders as symbols appear and the account becomes empty.
+    """
+    generation = 0
+
+    def reply(path: str, params: dict[str, list[str]]) -> Reply:
+        if path == "/fapi/v1/exchangeInfo":
+            return 200, json.dumps(_current_exchange_info(["BTCUSDT", "BNBUSDT", "ETHUSDT"]))
+        if path == "/papi/v1/um/positionRisk":
+            assert "symbol" not in params
+            symbols = ["BTCUSDT"] if generation == 0 else ["BTCUSDT", "ETHUSDT"]
+            rows = [
+                {
+                    "symbol": symbol,
+                    "positionSide": "BOTH",
+                    "positionAmt": "-0.125",
+                    "entryPrice": "28511.00",
+                    "updateTime": TRADE_TIME,
+                }
+                for symbol in symbols
+            ]
+            return 200, json.dumps([] if generation == 2 else rows)
+        if path == "/papi/v1/um/openOrders":
+            assert "symbol" not in params
+            order = _filled_order()
+            order.update(status="PARTIALLY_FILLED", executedQty="0.005")
+            return 200, json.dumps([] if generation == 2 else [order])
+        if path == "/papi/v1/um/algo/openAlgoOrders":
+            assert "symbol" not in params
+            rows = json.loads((TEST_DATA / "reports/open_algos.json").read_text(encoding="utf-8"))
+            return 200, json.dumps([] if generation == 2 else rows)
+        return _quiet(path, params)
+
+    with _serve(reply) as (url, requests):
+        client = papi.BinancePapiReadOnlyClient(_config(url))
+        assert requests == []
+
+        async def query() -> None:
+            nonlocal generation
+            positions = await client.generate_position_status_reports()
+            assert len(positions) == 1
+            assert isinstance(positions[0], PositionStatusReport)
+            assert positions[0].instrument_id == INSTRUMENT_ID
+            assert positions[0].quantity.as_decimal() == Decimal("0.125")
+            orders = await client.generate_order_status_reports(open_only=True)
+            assert len(orders) == 2
+            assert all(isinstance(order, OrderStatusReport) for order in orders)
+            ordinary = next(order for order in orders if order.instrument_id == INSTRUMENT_ID)
+            assert ordinary.filled_qty.as_decimal() == Decimal("0.005")
+            assert str(ordinary.venue_order_id).startswith("PAPI:O:BTCUSDT:")
+            assert any(str(order.venue_order_id) == "PAPI:A:BNBUSDT:2146760" for order in orders)
+            metadata_reads = sum(request["path"] == "/fapi/v1/exchangeInfo" for request in requests)
+            assert len(await client.generate_position_status_reports()) == 1
+            assert (
+                sum(request["path"] == "/fapi/v1/exchangeInfo" for request in requests)
+                == metadata_reads
+            )
+            generation = 1
+            positions = await client.generate_position_status_reports()
+            assert {str(row.instrument_id) for row in positions} == {
+                "BTCUSDT-PERP.BINANCE",
+                "ETHUSDT-PERP.BINANCE",
+            }
+            generation = 2
+            assert await client.generate_position_status_reports() == []
+            assert await client.generate_order_status_reports() == []
+            with pytest.raises(RuntimeError, match="history is incomplete"):
+                await client.generate_order_status_reports(open_only=False)
+
+        asyncio.run(query())
+
+        for request in requests:
+            if request["path"] == "/fapi/v1/exchangeInfo":
+                assert request["api_key"] is None
+                assert "signature" not in request["params"]
+            else:
+                assert request["signature_valid"]
+
+
+@pytest.mark.parametrize("failure", ["ordinary", "algo", "metadata"])
+def test_account_current_reports_raise_for_failed_sources_and_unresolved_metadata(
+    failure: str,
+) -> None:
+    """
+    Do not turn a failed source or missing metadata into empty or partial success.
+    """
+
+    def reply(path: str, params: dict[str, list[str]]) -> Reply:
+        if path == "/fapi/v1/exchangeInfo":
+            return 200, json.dumps(_current_exchange_info([]))
+        if path == "/papi/v1/um/openOrders":
+            if failure == "ordinary":
+                return 403, '{"code":-2015,"msg":"synthetic permission failure"}'
+            order = _filled_order()
+            order.update(status="PARTIALLY_FILLED", executedQty="0.005")
+            return 200, json.dumps([order])
+        if path == "/papi/v1/um/algo/openAlgoOrders" and failure == "algo":
+            return 403, '{"code":-2015,"msg":"synthetic permission failure"}'
+        return _quiet(path, params)
+
+    with _serve(reply) as (url, _):
+        client = papi.BinancePapiReadOnlyClient(_config(url))
+
+        async def query() -> None:
+            await client.generate_order_status_reports()
+
+        with pytest.raises(RuntimeError):
+            asyncio.run(query())

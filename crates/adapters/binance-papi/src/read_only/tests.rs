@@ -781,12 +781,12 @@ fn test_invalid_origins_fail_before_transport(#[case] url: &str) {
 }
 
 #[rstest]
-fn test_construction_requires_exact_scope_and_redacts_credentials() {
+fn test_construction_accepts_optional_metadata_and_redacts_credentials() {
     let config = testing::config("https://papi.binance.com");
     let rendered = format!("{config:?}");
     assert!(!rendered.contains(testing::API_KEY));
     assert!(!rendered.contains(testing::API_SECRET));
-    assert!(BinancePapiReadOnlyClient::new(&config, vec![]).is_err());
+    assert!(BinancePapiReadOnlyClient::new(&config, vec![]).is_ok());
     assert!(
         BinancePapiReadOnlyClient::new(&config, vec![testing::instrument("BTCUSDT"); 2]).is_err()
     );
@@ -828,7 +828,10 @@ async fn test_scoped_empty_and_explicit_zero_positions_are_flat_reports() {
     })
     .await;
     let client = testing::client(&server, &["BTCUSDT"]);
-    let reports = client.generate_position_status_reports(None).await.unwrap();
+    let reports = client
+        .generate_position_status_reports(Some(InstrumentId::from("BTCUSDT-PERP.BINANCE")))
+        .await
+        .unwrap();
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].position_side, PositionSide::Flat);
     assert_eq!(
@@ -836,7 +839,10 @@ async fn test_scoped_empty_and_explicit_zero_positions_are_flat_reports() {
         rust_decimal_macros::dec!(0)
     );
     missing.store(false, Ordering::Release);
-    let reports = client.generate_position_status_reports(None).await.unwrap();
+    let reports = client
+        .generate_position_status_reports(Some(InstrumentId::from("BTCUSDT-PERP.BINANCE")))
+        .await
+        .unwrap();
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].position_side, PositionSide::Flat);
     assert_eq!(
@@ -1267,9 +1273,19 @@ async fn test_request_and_row_budgets_bound_the_entire_collection() {
 async fn test_client_order_ids_must_be_unique_across_symbols(#[case] mass_status: bool) {
     let server = MockServer::new(|request| {
         if request.path == "/papi/v1/um/openOrders" {
-            let mut row = testing::order();
-            row["symbol"] = json!(request.params["symbol"]);
-            Reply::json(&json!([row]))
+            let symbols = request.params.get("symbol").map_or_else(
+                || vec!["BTCUSDT", "ETHUSDT"],
+                |symbol| vec![symbol.as_str()],
+            );
+            let rows: Vec<_> = symbols
+                .into_iter()
+                .map(|symbol| {
+                    let mut row = testing::order();
+                    row["symbol"] = json!(symbol);
+                    row
+                })
+                .collect();
+            Reply::json(&json!(rows))
         } else {
             testing::quiet(request)
         }
@@ -1287,7 +1303,11 @@ async fn test_client_order_ids_must_be_unique_across_symbols(#[case] mass_status
             .await
             .map(|_| ())
     };
-    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .is::<crate::reports::history::PapiConsistencyError>()
+    );
 }
 
 #[tokio::test]
@@ -1485,10 +1505,10 @@ async fn test_contradictory_algo_lifecycles_fail(#[case] scenario: &'static str)
 }
 
 #[tokio::test]
-async fn test_invalid_scope_fails_before_any_request() {
+async fn test_invalid_venue_fails_before_any_request() {
     let server = MockServer::new(testing::quiet).await;
     let client = testing::client(&server, &["BTCUSDT"]);
-    let outside = Some(InstrumentId::from("ETHUSDT-PERP.BINANCE"));
+    let outside = Some(InstrumentId::from("ETHUSDT-PERP.BYBIT"));
     assert!(
         client
             .generate_open_order_status_reports(outside)
@@ -1521,7 +1541,7 @@ async fn test_invalid_position_coverage_never_synthesizes_flat(#[case] response:
     .await;
     assert!(
         testing::client(&server, &["BTCUSDT"])
-            .generate_position_status_reports(None)
+            .generate_position_status_reports(Some(InstrumentId::from("BTCUSDT-PERP.BINANCE")))
             .await
             .is_err()
     );
