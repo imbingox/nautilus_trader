@@ -200,6 +200,17 @@ def main() -> None:
     check = unittest.TestCase()
     with check.assertRaisesRegex(RuntimeError, "canceled"):  # noqa: PT027 - stdlib-only check
         asyncio.run(canceled_query())
+
+    account_reader = papi.BinancePapiReadOnlyClient(read_only)
+    account_reader.cancel()
+
+    async def canceled_current_reports() -> None:
+        with check.assertRaisesRegex(RuntimeError, "canceled"):  # noqa: PT027 - stdlib-only check
+            await account_reader.generate_position_status_reports()
+        with check.assertRaisesRegex(RuntimeError, "canceled"):  # noqa: PT027 - stdlib-only check
+            await account_reader.generate_order_status_reports(open_only=True)
+
+    asyncio.run(canceled_current_reports())
     assert "OfflinePapiSecret" not in repr(read_only)
     for name in ("api_key", "api_secret", "base_url", "websocket_url"):
         assert not hasattr(read_only, name)

@@ -29,7 +29,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = REPO_ROOT / "scripts/papi-release/verify_wheel.py"
 MANIFEST_SCRIPT = REPO_ROOT / "scripts/papi-release/generate-manifest.py"
-WHEEL_NAME = "nautilus_trader_papi-2.0.0rc7-cp314-cp314-manylinux_2_34_x86_64.whl"
+WHEEL_NAME = "nautilus_trader_papi-2.0.0rc8-cp314-cp314-manylinux_2_34_x86_64.whl"
 
 
 def _load_script(path: Path, name: str) -> ModuleType:
@@ -63,12 +63,12 @@ def _wheel(
     Create the smallest archive that satisfies the PAPI wheel content contract.
     """
     path = tmp_path / filename
-    dist_info = "nautilus_trader_papi-2.0.0rc7.dist-info"
+    dist_info = "nautilus_trader_papi-2.0.0rc8.dist-info"
     metadata = "\n".join(
         [
             "Metadata-Version: 2.4",
             "Name: nautilus-trader-papi",
-            "Version: 2.0.0rc7",
+            "Version: 2.0.0rc8",
             "Summary: Unofficial NautilusTrader PAPI distribution",
             f"Home-Page: {homepage}",
             f"Requires-Python: {requires_python}",
@@ -111,7 +111,7 @@ def test_verify_wheel_accepts_frozen_release_contract(tmp_path: Path) -> None:
     report = _load_verifier().validate_wheel(_wheel(tmp_path))
 
     assert report["distribution"] == "nautilus-trader-papi"
-    assert report["version"] == "2.0.0rc7"
+    assert report["version"] == "2.0.0rc8"
     assert report["platform_tag"] == "manylinux_2_34_x86_64"
     assert report["archive_checks"] == "passed"
     assert report["complete"] is False
@@ -131,7 +131,7 @@ def test_verify_wheel_requires_generated_extension_stub(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "requirement",
     [
-        "nautilus-trader==2.0.0rc7",
+        "nautilus-trader==2.0.0rc8",
         "nautilus_trader[visualization]>=2; python_version >= '3.14'",
         "Nautilus.Trader @ https://example.invalid/nautilus-trader.whl",
     ],

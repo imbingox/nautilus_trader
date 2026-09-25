@@ -11,7 +11,7 @@ and copyright holder of the upstream project. Report fork-specific issues to the
 
 ## Supported wheel
 
-The initial `2.0.0rc7` release supports only:
+The `2.0.0rc8` release supports only:
 
 - CPython 3.14 with the GIL enabled
 - Linux x86_64 with a `manylinux_2_34` baseline
@@ -24,7 +24,7 @@ Install the exact binary release in a new virtual environment:
 
 ```bash
 python3.14 -m venv .venv
-.venv/bin/python -m pip install --only-binary=:all: nautilus-trader-papi==2.0.0rc7
+.venv/bin/python -m pip install --only-binary=:all: nautilus-trader-papi==2.0.0rc8
 ```
 
 Do not install `nautilus-trader` and `nautilus-trader-papi` together. Both distributions provide
@@ -34,6 +34,20 @@ or preferably create a fresh environment, before installing this fork.
 The fork uses its own PEP 440 version sequence. `2.0.0rc7` is the first published PAPI candidate;
 future PAPI changes receive a new public version even when the tracked upstream version is
 unchanged. A matching number does not imply that the two distributions are interchangeable.
+
+## Account-wide current reports
+
+Version `2.0.0rc8` supports current UM positions and ordinary/algo open orders without a manually
+supplied instrument list:
+
+```python
+client = BinancePapiReadOnlyClient(config)
+positions = await client.generate_position_status_reports()
+orders = await client.generate_order_status_reports(open_only=True)
+```
+
+These methods return native Nautilus reports and discover required USD-M instrument metadata.
+Historical reports and trading recovery still require an explicit instrument scope.
 
 ## Safety boundary
 

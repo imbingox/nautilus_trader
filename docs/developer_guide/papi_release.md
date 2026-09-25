@@ -4,12 +4,12 @@ This fork publishes `nautilus-trader-papi` independently from the upstream Nauti
 pipeline. The package intentionally preserves the `nautilus_trader` import path and therefore
 conflicts with the official `nautilus-trader` distribution.
 
-## Frozen first-release contract
+## Frozen release contract
 
 | Field               | Value                                                       |
 | ------------------- | ----------------------------------------------------------- |
 | Distribution        | `nautilus-trader-papi`                                      |
-| Version             | `2.0.0rc7`                                                  |
+| Version             | `2.0.0rc8`                                                  |
 | Python              | CPython 3.14, GIL build                                     |
 | ABI                 | `cp314`                                                     |
 | Platform            | Linux x86_64                                                |
@@ -17,7 +17,7 @@ conflicts with the official `nautilus-trader` distribution.
 | Build profile       | Cargo `release`                                             |
 | Python extension    | Full `nautilus-pyo3` extension with high precision and PAPI |
 | Source distribution | Not published                                               |
-| Release tag         | `papi-v2.0.0rc7`                                            |
+| Release tag         | `papi-v2.0.0rc8`                                            |
 
 The upstream baseline is
 `46a5658a2f66cf0a798d414dc1b63d98cf10fcc1`. The PAPI feature head before upstream integration is
@@ -29,6 +29,20 @@ commit and tag.
 The version belongs to this distribution. Increment it for every changed PAPI release candidate,
 even when the upstream Python version remains unchanged. PyPI files are immutable, so never rebuild
 different bytes under an uploaded version.
+
+## Changes in 2.0.0rc8
+
+Current position and open-order reports can query the whole UM account without supplied
+instruments. The client discovers active instruments from official USD-M exchange metadata and
+returns native Nautilus status reports. Historical reports and trading recovery retain their
+explicit instrument scope.
+
+Read-only live acceptance on 2026-09-25 returned one nonzero position and no ordinary or algo open
+orders in two consecutive rounds. Position direction, quantity, and entry price matched signed
+`positionRisk` and UM V1 account responses exactly. The V1 account contained 907 position rows;
+906 zero positions were omitted from the native account-wide result. Nonempty open orders and an
+algo trigger/child lifecycle were not available for this live acceptance. No orders were placed
+or canceled, and account settings were not changed.
 
 ## Downstream dependency audit
 
@@ -61,7 +75,7 @@ bash scripts/papi-release/verify-wheel.bash dist/papi
 python3 scripts/papi-release/generate-manifest.py \
   --wheel-dir dist/papi \
   --source-ref <release-commit-or-tag> \
-  --tag papi-v2.0.0rc7 \
+  --tag papi-v2.0.0rc8 \
   --output dist/papi/release-manifest.json
 ```
 
@@ -85,12 +99,12 @@ run `binance_papi_wheel_smoke.py disabled`. Never upload it under the release na
 
 ## Capability statement
 
-| Status                           | Scope                                                                                                                                                                                                     |
-| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Implemented and offline verified | Authenticated account observations, scoped reports, durable command journal, bounded recovery, exact fee/quantity handling, explicit admission limits, default-disabled trading                           |
-| Limited live evidence            | BTCUSDT one-way market open/reduce-only close, GTC/GTX targeted cancellation, FOK behavior, live market fills                                                                                             |
-| Not fully live verified          | Partial or multiple fills, direct IOC terminal delivery, every concurrent scheduling case, complete account-flat coverage, retention boundaries, venue throttling, latest dynamic rebaseline optimization |
-| Unsupported and rejected         | Hedge mode, coin-margined or margin products, unspecified instruments, ambiguous credentials or account identity, nonzero unsupported borrowing/interest state, unbounded or stale risk evidence          |
+| Status                           | Scope                                                                                                                                                                                                         |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Implemented and offline verified | Authenticated account observations, account-wide current reports, scoped history, durable command journal, bounded recovery, exact fee/quantity handling, explicit admission limits, default-disabled trading |
+| Limited live evidence            | BTCUSDT one-way market open/reduce-only close, GTC/GTX targeted cancellation, FOK behavior, live market fills                                                                                                 |
+| Not fully live verified          | Partial or multiple fills, direct IOC terminal delivery, every concurrent scheduling case, complete account-flat coverage, retention boundaries, venue throttling, latest dynamic rebaseline optimization     |
+| Unsupported and rejected         | Hedge mode, coin-margined or margin products, unspecified trading instruments, ambiguous credentials or account identity, nonzero unsupported borrowing/interest state, unbounded or stale risk evidence      |
 
 The release does not broaden the adapter's trading scope. Additional live acceptance requires a
 separate operator decision with explicit account, action, and size; packaging work never authorizes
@@ -111,7 +125,7 @@ release tag and require approval where the GitHub plan supports it.
 The promotion sequence is:
 
 1. Merge the validated release branch into `main` without changing the candidate tree.
-2. Create signed tag `papi-v2.0.0rc7` at that exact commit.
+2. Create signed tag `papi-v2.0.0rc8` at that exact commit.
 3. Build and verify the wheel once, then freeze its SHA-256 manifest.
 4. Upload the frozen wheel to TestPyPI through the protected OIDC job.
 5. Run `verify-index.bash testpypi ...`; it downloads the file, compares SHA-256, and repeats the
