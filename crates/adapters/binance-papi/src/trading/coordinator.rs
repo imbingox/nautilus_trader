@@ -27,7 +27,7 @@ use nautilus_core::{UUID4, UnixNanos};
 use nautilus_live::execution::failure::CommandFailure;
 use nautilus_model::{
     enums::{OrderSide, OrderStatus, OrderType, TimeInForce},
-    identifiers::{AccountId, ClientOrderId, InstrumentId},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId},
     reports::OrderStatusReport,
     types::Currency,
 };
@@ -176,6 +176,7 @@ pub(crate) struct PapiCommandCoordinator {
     submit_client_order_ids: HashSet<ClientOrderId>,
     uncertain: bool,
     rebaseline: Option<PapiRebaselineToken>,
+    session: Option<crate::websocket::PapiApplicationAcknowledger>,
 }
 
 impl PapiCommandCoordinator {
@@ -212,7 +213,18 @@ impl PapiCommandCoordinator {
             submit_client_order_ids,
             uncertain,
             rebaseline: None,
+            session: None,
         })
+    }
+
+    pub(crate) fn bind_session(&mut self, session: crate::websocket::PapiApplicationAcknowledger) {
+        self.session = Some(session);
+    }
+
+    fn session_allows_increase_risk(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_none_or(|session| session.increase_risk_allowed())
     }
 
     pub(crate) fn install_evidence(
@@ -235,7 +247,9 @@ impl PapiCommandCoordinator {
             !self.recovered_unresolved.is_empty() || self.uncertain || self.rebaseline.is_some();
 
         PapiCommandPermissions {
-            increase_risk: evidence_current && !recovery_restricted,
+            increase_risk: evidence_current
+                && !recovery_restricted
+                && self.session_allows_increase_risk(),
             verified_reduce_only: evidence_current
                 && self.evidence.as_ref().is_some_and(|evidence| {
                     evidence
@@ -427,7 +441,8 @@ impl PapiCommandCoordinator {
         if !intent_reduce_only(intent)
             && (!self.recovered_unresolved.is_empty()
                 || self.uncertain
-                || self.rebaseline.is_some())
+                || self.rebaseline.is_some()
+                || !self.session_allows_increase_risk())
         {
             return Err(CoordinatorError::RecoveryRestricted);
         }
@@ -983,6 +998,57 @@ impl PapiCommandCoordinator {
         Ok(summary)
     }
 
+    pub(crate) fn recovered_order_strategy(
+        &self,
+        report: &OrderStatusReport,
+    ) -> Result<Option<StrategyId>, CoordinatorError> {
+        let Some(client_order_id) = report.client_order_id else {
+            return Ok(None);
+        };
+        let mut owner = None;
+
+        for recovered in self.journal.operations().values() {
+            let operation = &recovered.operation;
+            let PapiPersistedCommand::Submit(intent) = &operation.command else {
+                continue;
+            };
+
+            if operation.client_order_id != client_order_id {
+                continue;
+            }
+
+            if operation.account_id != report.account_id
+                || operation.instrument_id != report.instrument_id
+                || owner.is_some_and(|strategy| strategy != operation.strategy_id)
+            {
+                return Err(CoordinatorError::ReportIdentityMismatch);
+            }
+
+            if !report_matches_intent(report, intent) {
+                return Err(CoordinatorError::ReportTermsMismatch);
+            }
+            let venue_order_id = decode_ordinary_venue_order_id(report.venue_order_id.as_str())?;
+
+            match recovered.stage {
+                PapiOperationStage::Prepared
+                | PapiOperationStage::Resolved {
+                    resolution:
+                        PapiOperationResolution::NotSent
+                        | PapiOperationResolution::VenueRejected
+                        | PapiOperationResolution::ProvedAbsent,
+                } => return Err(CoordinatorError::ReportBeforeDispatch),
+                PapiOperationStage::Observed {
+                    venue_order_id: expected,
+                } if venue_order_id != expected => {
+                    return Err(CoordinatorError::ReportIdentityMismatch);
+                }
+                _ => {}
+            }
+            owner = Some(operation.strategy_id);
+        }
+        Ok(owner)
+    }
+
     pub(crate) fn journal(&self) -> &PapiCommandJournal {
         &self.journal
     }
@@ -1173,7 +1239,8 @@ impl PapiCommandCoordinator {
                 if !intent_reduce_only(intent)
                     && (!self.recovered_unresolved.is_empty()
                         || self.uncertain
-                        || self.rebaseline.is_some())
+                        || self.rebaseline.is_some()
+                        || !self.session_allows_increase_risk())
                 {
                     return Err(CoordinatorError::RecoveryRestricted);
                 }
@@ -2652,6 +2719,102 @@ mod tests {
                 .unwrap_err(),
             CoordinatorError::InvalidInstrumentRules(id) if id == instrument_id()
         ));
+    }
+
+    #[rstest]
+    #[case("matching")]
+    #[case("external")]
+    #[case("account")]
+    #[case("instrument")]
+    #[case("quantity")]
+    #[case("side")]
+    #[case("reduce_only")]
+    #[case("venue_id")]
+    #[case("prepared")]
+    fn recovered_strategy_requires_durable_matching_submission(#[case] scenario: &str) {
+        let directory = TempDir::new().unwrap();
+        let now = Instant::now();
+        let mut coordinator = PapiCommandCoordinator::open(
+            config(&directory.path().join("commands.journal")),
+            AccountId::from("BINANCE-PAPI-001"),
+        )
+        .unwrap();
+        coordinator
+            .install_evidence(evidence(now, Decimal::ZERO), now)
+            .unwrap();
+        let operation = submit("OWNED", PapiIntentSide::Buy, false);
+        let id = operation.operation_id;
+        coordinator.prepare_submit(operation, now).unwrap();
+
+        if scenario != "prepared" {
+            mark_unknown(&mut coordinator, id);
+            coordinator
+                .apply_order_report(
+                    id,
+                    &report("OWNED", OrderStatus::Accepted),
+                    UnixNanos::from(4),
+                )
+                .unwrap();
+        }
+        let mut observed = report("OWNED", OrderStatus::Accepted);
+
+        match scenario {
+            "external" => observed.client_order_id = Some(ClientOrderId::from("FOREIGN")),
+            "account" => observed.account_id = AccountId::from("BINANCE-PAPI-OTHER"),
+            "instrument" => observed.instrument_id = InstrumentId::from("ETHUSDT-PERP.BINANCE"),
+            "quantity" => observed.quantity = Quantity::from("0.6"),
+            "side" => observed.order_side = Some(OrderSide::Sell),
+            "reduce_only" => observed.reduce_only = true,
+            "venue_id" => observed.venue_order_id = VenueOrderId::from("PAPI:O:BTCUSDT:43"),
+            _ => {}
+        }
+        let result = coordinator.recovered_order_strategy(&observed);
+
+        match scenario {
+            "matching" => assert_eq!(result.unwrap(), Some(StrategyId::from("S-001"))),
+            "external" => assert_eq!(result.unwrap(), None),
+            _ => assert!(result.is_err()),
+        }
+    }
+
+    #[rstest]
+    fn unavailable_session_preserves_separate_reduce_only_and_cancel_permissions() {
+        let directory = TempDir::new().unwrap();
+        let now = Instant::now();
+        let mut coordinator = PapiCommandCoordinator::open(
+            config(&directory.path().join("commands.journal")),
+            AccountId::from("BINANCE-PAPI-001"),
+        )
+        .unwrap();
+        coordinator
+            .install_evidence(evidence(now, dec!(1)), now)
+            .unwrap();
+        let owned = submit("OWNED", PapiIntentSide::Sell, true);
+        let id = owned.operation_id;
+        coordinator.prepare_submit(owned, now).unwrap();
+        mark_unknown(&mut coordinator, id);
+        let mut observed = report("OWNED", OrderStatus::Accepted);
+        observed.order_side = Some(OrderSide::Sell);
+        observed.reduce_only = true;
+        coordinator
+            .apply_order_report(id, &observed, UnixNanos::from(4))
+            .unwrap();
+        let session = crate::websocket::BinancePapiAccountSession::new(
+            &testing::config("http://127.0.0.1:1"),
+            vec![testing::instrument("BTCUSDT")],
+        )
+        .unwrap();
+        coordinator.bind_session(session.application_acknowledger());
+        let increase =
+            coordinator.check_submit(&submit("INCREASE", PapiIntentSide::Buy, false), now);
+        let reduce = coordinator.check_submit(&submit("REDUCE", PapiIntentSide::Sell, true), now);
+        let cancel = coordinator.prepare_cancel(cancel("OWNED"), UnixNanos::from(5));
+        assert!(matches!(
+            increase,
+            Err(CoordinatorError::RecoveryRestricted)
+        ));
+        assert!(reduce.is_ok());
+        assert!(cancel.is_ok());
     }
 
     #[rstest]

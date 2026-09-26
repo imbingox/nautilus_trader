@@ -231,8 +231,14 @@ before changing the cache, so a conflict leaves every existing claim unchanged.
 The `ExecutionManager` and `ExecutionEngine` read the same canonical claim map from the cache when
 they process external reports. They assign an external order to:
 
+- The exact strategy proven by the reporting client's durable submission records, when supported.
 - The strategy identified by the active claim for the report's instrument.
 - The `EXTERNAL` strategy as a default fallback.
+
+A client can implement `recovered_order_strategy` to validate a venue report against its durable
+order identity and terms. A conflict prevents order creation; an unknown order falls through to
+normal external claims. This applies to startup and runtime order-status reconciliation and does
+not reassign orders already present in the cache.
 
 An active-claim update is therefore visible to both components without a coordination message. The
 claim present when an external order is created determines the assignment. Existing cached orders

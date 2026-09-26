@@ -210,6 +210,13 @@ impl ExecutionClient for LiveExecutionClient {
         self.client.borrow().native_capital_check()
     }
 
+    fn recovered_order_strategy(
+        &self,
+        report: &OrderStatusReport,
+    ) -> anyhow::Result<Option<StrategyId>> {
+        self.client.borrow().recovered_order_strategy(report)
+    }
+
     fn on_execution_report_applied(&self, report: &ExecutionReport) {
         self.client.borrow().on_execution_report_applied(report);
     }

@@ -119,7 +119,11 @@ coordinator keeps every unresolved reservation and runs only bounded targeted GE
 connection. A matching authoritative report can advance an operation to observed or terminal.
 Repeated `-2011`/`-2013`, query failures, or an exhausted recovery budget remain ambiguous, retain
 the reservation, and keep increase-risk admission restricted. Recovery never replays an unknown
-POST.
+POST. When a venue report matches a durable submitted order's account, instrument, client order ID,
+terms, and any retained venue order ID, reconciliation restores its original `StrategyId` even
+with an empty cache. This exact ownership takes precedence over instrument-wide external claims;
+orders absent from the journal keep the normal external-order policy. Conflicting reports do not
+materialize an order. This restores order attribution, not arbitrary strategy state.
 
 Offline command verification enforces the authenticated instrument trading state, settlement
 currency, tick/step alignment, quantity, price and notional bounds before durable preparation.
@@ -142,7 +146,11 @@ previous reservation remains charged, so another order can proceed immediately w
 risk and the new reservation remain within every limit. Updates are coalesced after three quiet
 seconds and continuous updates force a refresh within five seconds. Unowned orders, non-order
 account changes, transport uncertainty, conflicts, and failed refresh application immediately
-freeze increase-risk admission. The configured risk evidence age must be at least ten seconds so
+freeze increase-risk admission. Transport changes revoke session authority synchronously, and both
+admission and the final HTTP dispatch barrier check that authority. Queued increase-risk commands
+cannot use a previous connection's authorization. A complete baseline, engine application, and a
+fresh applied risk generation are required before authorization resumes. Reduce-only and targeted
+cancellation retain their separate evidence and ownership checks. The configured risk evidence age must be at least ten seconds so
 the refresh window cannot expire otherwise valid evidence. The worker reuses the risk collection's
 account, scoped position, and open-order responses to publish current state, so it performs no
 historical order or fill scan and does not duplicate current position/order reads. WebSocket order

@@ -4316,10 +4316,25 @@ impl ExecutionManager {
         fill_queue: Option<&mut ReconciliationFillQueue>,
         commission_client: Option<&dyn ExecutionClient>,
     ) -> (Vec<OrderEventAny>, Option<ExternalOrderMetadata>) {
-        let claimed_strategy = self
-            .cache
-            .borrow()
-            .external_order_claim(&report.instrument_id);
+        let recovered_strategy = if is_synthetic {
+            None
+        } else {
+            match commission_client
+                .map(|client| client.recovered_order_strategy(report))
+                .transpose()
+            {
+                Ok(strategy) => strategy.flatten(),
+                Err(e) => {
+                    log::error!("Cannot recover order {}: {e}", report.venue_order_id);
+                    return (Vec::new(), None);
+                }
+            }
+        };
+        let claimed_strategy = recovered_strategy.or_else(|| {
+            self.cache
+                .borrow()
+                .external_order_claim(&report.instrument_id)
+        });
 
         let (strategy_id, tags) = if let Some(claimed_strategy) = claimed_strategy {
             let order_id = report

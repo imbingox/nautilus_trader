@@ -52,7 +52,7 @@ use nautilus_model::{
     accounts::AccountAny,
     enums::{AccountType, LiquiditySide, OmsType},
     events::AccountState,
-    identifiers::{AccountId, ClientId, InstrumentId, Venue, VenueOrderId},
+    identifiers::{AccountId, ClientId, InstrumentId, StrategyId, Venue, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
@@ -118,12 +118,18 @@ struct PapiRiskRefreshControl {
 impl PapiRiskRefreshControl {
     fn mark_dirty(&self, fact_version: u64, hard: bool) {
         let _state = self.state.lock();
-        self.dirty_generation
-            .fetch_max(fact_version, Ordering::AcqRel);
+
+        // A transport gap can invalidate authority without receiving another account fact
+        let generation = self
+            .dirty_generation
+            .load(Ordering::Acquire)
+            .checked_add(1)
+            .expect("PAPI risk refresh generation overflow")
+            .max(fact_version);
+        self.dirty_generation.store(generation, Ordering::Release);
 
         if hard {
-            self.hard_generation
-                .fetch_max(fact_version, Ordering::AcqRel);
+            self.hard_generation.store(generation, Ordering::Release);
         }
         self.notify.notify_one();
     }
@@ -258,7 +264,7 @@ async fn run_risk_refresh_worker(
             .lock()
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("PAPI application acknowledger is unavailable"))
-            .and_then(|acknowledger| acknowledger.refresh_checkpoint())
+            .and_then(|acknowledger| acknowledger.applied_refresh_checkpoint())
         {
             Ok(checkpoint) => checkpoint,
             Err(e) => {
@@ -977,12 +983,16 @@ impl BinancePapiExecutionClient {
             self.risk_refresh.mark_dirty(pending.dirty_generation, true);
 
             if let Some(session) = self.session.as_ref() {
-                session.set_trading_authorized(false);
+                session.revoke_trading_authorization();
             }
             log::warn!("PAPI risk refresh application was rejected: {e}");
         } else if result.is_ok_and(|installed| installed) {
-            if let Some(session) = self.session.as_ref() {
-                session.set_trading_authorized(!self.risk_refresh.hard_refresh_pending());
+            if !self.risk_refresh.hard_refresh_pending()
+                && let Some(acknowledger) = self.application_acknowledger.lock().as_ref()
+                && let Err(e) = acknowledger.authorize_trading(pending.application.checkpoint)
+            {
+                self.risk_refresh.mark_dirty(0, true);
+                log::warn!("PAPI risk authorization was rejected: {e}");
             }
         } else if self.risk_refresh.dirty_generation.load(Ordering::Acquire)
             > self.risk_refresh.clean_generation.load(Ordering::Acquire)
@@ -1053,7 +1063,7 @@ impl BinancePapiExecutionClient {
         self.risk_refresh.mark_dirty(fact_version, true);
 
         if let Some(session) = self.session.as_ref() {
-            session.set_trading_authorized(false);
+            session.revoke_trading_authorization();
         }
 
         if self.risk_refresh.ready.load(Ordering::Acquire)
@@ -1096,6 +1106,18 @@ impl ExecutionClient for BinancePapiExecutionClient {
 
     fn get_account(&self) -> Option<AccountAny> {
         self.core.cache().account_owned(&self.core.account_id)
+    }
+
+    fn recovered_order_strategy(
+        &self,
+        report: &OrderStatusReport,
+    ) -> anyhow::Result<Option<StrategyId>> {
+        let coordinator = self.coordinator.lock();
+
+        match coordinator.as_ref() {
+            Some(coordinator) => Ok(coordinator.recovered_order_strategy(report)?),
+            None => Ok(None),
+        }
     }
 
     fn native_capital_check(&self) -> Option<NativeCapitalCheck> {
@@ -1307,7 +1329,7 @@ impl ExecutionClient for BinancePapiExecutionClient {
 
                     if hard && control.ready.load(Ordering::Acquire) {
                         if let Some(acknowledger) = acknowledger.lock().as_ref() {
-                            acknowledger.set_trading_authorized(false);
+                            acknowledger.revoke_trading_authorization();
                         }
 
                         match ensure_risk_rebaseline_started(&control, &coordinator, &acknowledger)
@@ -1328,7 +1350,14 @@ impl ExecutionClient for BinancePapiExecutionClient {
             incremental_handler,
             risk_refresh_handler,
         )?;
-        *self.application_acknowledger.lock() = Some(session.application_acknowledger());
+        let acknowledger = session.application_acknowledger();
+
+        if let Some(coordinator) = self.coordinator.lock().as_mut() {
+            coordinator.bind_session(acknowledger.clone());
+        }
+        *self.application_acknowledger.lock() = Some(acknowledger.clone());
+        let control = Arc::clone(&self.risk_refresh);
+        session.set_invalidation_handler(Arc::new(move || control.mark_dirty(0, true)));
         session.start().await?;
         let reader = session.read_only_client();
         self.risk_refresh.mark_clean();
@@ -1360,6 +1389,14 @@ impl ExecutionClient for BinancePapiExecutionClient {
                 .trading
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("PAPI trading configuration is unavailable"))?;
+            let risk_checkpoint = match acknowledger.refresh_checkpoint() {
+                Ok(checkpoint) => checkpoint,
+                Err(e) => {
+                    *self.coordinator.lock() = Some(value);
+                    session.stop().await?;
+                    return Err(e);
+                }
+            };
             let risk = match reader.collect_verified_risk_snapshot(trading).await {
                 Ok(risk) => risk,
                 Err(e) => {
@@ -1375,11 +1412,15 @@ impl ExecutionClient for BinancePapiExecutionClient {
                 return Err(e.into());
             }
             *self.coordinator.lock() = Some(value);
-            session.set_trading_authorized(true);
+
+            if let Err(e) = acknowledger.authorize_trading(risk_checkpoint) {
+                session.stop().await?;
+                return Err(e);
+            }
             self.risk_refresh.ready.store(true, Ordering::Release);
 
             if self.risk_refresh.hard_refresh_pending() {
-                session.set_trading_authorized(false);
+                session.revoke_trading_authorization();
 
                 if let Err(e) = ensure_risk_rebaseline_started(
                     &self.risk_refresh,
@@ -1808,7 +1849,9 @@ mod tests {
     };
     use nautilus_core::{UUID4, string::secret::SecretString, time::AtomicTime};
     use nautilus_execution::engine::ExecutionEngine;
-    use nautilus_live::{runner::AsyncRunner, testing::ExecutionHarness};
+    use nautilus_live::{
+        execution::manager::ExecutionManager, runner::AsyncRunner, testing::ExecutionHarness,
+    };
     use nautilus_model::{
         accounts::{AccountAny, MarginAccount},
         enums::{OrderSide, OrderStatus, OrderType, TimeInForce},
@@ -2162,6 +2205,366 @@ mod tests {
             "orderId": 42,
             "clientOrderId": request.params["newClientOrderId"],
         }))
+    }
+
+    async fn recovery_websocket() -> (
+        String,
+        tokio::sync::mpsc::UnboundedSender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let (close_tx, mut close_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+                loop {
+                    tokio::select! {
+                        command = close_rx.recv() => {
+                            if command.is_none() { return; }
+                            websocket.close(None).await.unwrap();
+                            break;
+                        }
+                        message = websocket.next() => {
+                            if message.is_none() { break; }
+                        }
+                    }
+                }
+            }
+        });
+        (url, close_tx, task)
+    }
+
+    fn current_trading_reply(request: &testing::RecordedRequest) -> Reply {
+        let mut reply = testing::supported_trading(request);
+
+        if matches!(
+            request.path.as_str(),
+            "/fapi/v1/premiumIndex" | "/sapi/v1/portfolio/asset-index-price"
+        ) {
+            let mut value: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+            let now = get_atomic_clock_realtime().get_time_ns().as_u64() / 1_000_000;
+
+            if value.is_array() {
+                value[0]["time"] = json!(now);
+            } else {
+                value["time"] = json!(now);
+            }
+            reply = Reply::json(&value);
+        }
+        reply
+    }
+
+    async fn connected_recovery_client(
+        server: &MockServer,
+        websocket_url: String,
+        journal_path: std::path::PathBuf,
+    ) -> (ExecutionHarness, BinancePapiExecutionClient) {
+        let harness = ExecutionHarness::new(
+            TraderId::from("TRADER-001"),
+            ClientId::from("PAPI-RECOVERY"),
+            AccountId::from("BINANCE-PAPI-001"),
+            testing::instrument("BTCUSDT"),
+        );
+        let mut read_only = testing::config(&server.url);
+        read_only.websocket_url = SecretString::from(websocket_url);
+        read_only.request_timeout = Duration::from_secs(3);
+        let mut trading = trading_config(journal_path);
+        trading.max_risk_age_ms = 60_000;
+        trading.max_risk_collection_span_ms = 10_000;
+        let config = BinancePapiExecutionClientConfig {
+            read_only: Some(read_only),
+            trading: Some(trading),
+            instrument_ids: vec![harness.instrument_id()],
+            ..Default::default()
+        };
+        let core = ExecutionClientCore::new(
+            harness.trader_id(),
+            harness.client_id(),
+            Venue::from("BINANCE"),
+            OmsType::Netting,
+            harness.account_id(),
+            AccountType::Margin,
+            None,
+            harness.cache().clone(),
+        );
+        let mut client = BinancePapiExecutionClient::new(core, config);
+        client.start().unwrap();
+        client.connect().await.unwrap();
+        (harness, client)
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn reconnect_blocks_increase_risk_until_recovery_and_risk_application(
+        #[case] second_gap: bool,
+    ) {
+        let gap = Arc::new(AtomicBool::new(false));
+        let pending = Arc::new(tokio::sync::Notify::new());
+        let server_gap = Arc::clone(&gap);
+        let server_pending = Arc::clone(&pending);
+        let server = MockServer::new(move |request| {
+            if request.method == "POST" && request.path == "/papi/v1/um/order" {
+                return command_ack(request);
+            }
+            let mut reply = current_trading_reply(request);
+
+            if request.path == "/papi/v1/balance" && server_gap.swap(false, Ordering::AcqRel) {
+                server_pending.notify_one();
+                reply.delay = Duration::from_secs(1);
+            }
+            reply
+        })
+        .await;
+        let directory = TempDir::new().unwrap();
+        let (url, close, websocket) = recovery_websocket().await;
+        let (mut harness, client) =
+            connected_recovery_client(&server, url, directory.path().join("commands.journal"))
+                .await;
+        let acknowledger = client.application_acknowledger.lock().clone().unwrap();
+        let coordinator = Arc::clone(&client.coordinator);
+        let reader = client.reader().unwrap();
+        harness.register_client(Box::new(client)).unwrap();
+        assert!(
+            harness
+                .pump_until(Duration::from_secs(3), |_| acknowledger
+                    .increase_risk_allowed())
+                .await
+        );
+        let queued = engine_limit_order("GAP-QUEUED", TimeInForce::Gtc, false);
+        let command = SubmitOrder::from_order(
+            &queued,
+            harness.trader_id(),
+            Some(harness.client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+        );
+        let operation = submit_operation(&command, harness.account_id()).unwrap();
+        let operation_id = operation.operation_id;
+        coordinator
+            .lock()
+            .as_mut()
+            .unwrap()
+            .prepare_submit(operation, Instant::now())
+            .unwrap();
+        let old_checkpoint = acknowledger.refresh_checkpoint().unwrap();
+        gap.store(true, Ordering::Release);
+        close.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), pending.notified())
+            .await
+            .unwrap();
+
+        if second_gap {
+            gap.store(true, Ordering::Release);
+            close.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(6), pending.notified())
+                .await
+                .unwrap();
+        }
+
+        // This command was admitted before the gap but has not crossed the HTTP barrier
+        let queued_result = reader
+            .dispatch_submit(&coordinator, operation_id, || Ok(()))
+            .await;
+        assert!(queued_result.is_err());
+        assert!(matches!(
+            coordinator.lock().as_ref().unwrap().journal().operations()[&operation_id].stage,
+            PapiOperationStage::Resolved {
+                resolution: PapiOperationResolution::NotSent
+            }
+        ));
+        let denied = engine_limit_order("GAP-DENIED", TimeInForce::Gtc, false);
+        harness.submit_via_risk(&denied);
+        assert!(
+            harness
+                .pump_until(Duration::from_millis(500), |cache| {
+                    cache
+                        .order(&denied.client_order_id())
+                        .is_some_and(|order| order.status() == OrderStatus::Denied)
+                })
+                .await
+        );
+        assert!(!acknowledger.increase_risk_allowed());
+        assert!(acknowledger.authorize_trading(old_checkpoint).is_err());
+        assert!(
+            !server
+                .requests()
+                .iter()
+                .any(|request| request.path == "/papi/v1/um/order" && request.method == "POST")
+        );
+
+        // Let REST converge without allowing the runner to apply its queued reports
+        nautilus_common::testing::wait_until_async(
+            || async { acknowledger.refresh_checkpoint().is_ok() },
+            Duration::from_secs(6),
+        )
+        .await;
+        assert!(acknowledger.applied_refresh_checkpoint().is_err());
+        assert!(!acknowledger.increase_risk_allowed());
+
+        assert!(
+            harness
+                .pump_until(Duration::from_secs(12), |_| acknowledger
+                    .increase_risk_allowed())
+                .await
+        );
+        let accepted = engine_limit_order("GAP-RECOVERED", TimeInForce::Gtc, false);
+        harness.submit_via_risk(&accepted);
+        assert!(
+            harness
+                .pump_until(Duration::from_secs(3), |cache| {
+                    cache
+                        .order(&accepted.client_order_id())
+                        .is_some_and(|order| order.status() == OrderStatus::Accepted)
+                })
+                .await
+        );
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|request| request.path == "/papi/v1/um/order" && request.method == "POST")
+                .count(),
+            1
+        );
+        harness.exec_engine().borrow_mut().stop_clients();
+        websocket.abort();
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn journal_restart_restores_exact_strategy_without_claiming_external_order(
+        #[case] startup: bool,
+    ) {
+        let resumed = Arc::new(AtomicBool::new(false));
+        let server_resumed = Arc::clone(&resumed);
+        let order_time = get_atomic_clock_realtime().get_time_ns().as_u64() / 1_000_000 - 1000;
+        let server = MockServer::new(move |request| {
+            if request.method == "POST" && request.path == "/papi/v1/um/order" {
+                return Reply {
+                    delay: Duration::from_secs(1),
+                    ..command_ack(request)
+                };
+            }
+
+            if server_resumed.load(Ordering::Acquire)
+                && matches!(
+                    request.path.as_str(),
+                    "/papi/v1/um/openOrders" | "/papi/v1/um/allOrders" | "/papi/v1/um/order"
+                )
+            {
+                let mut owned = testing::order();
+                owned["clientOrderId"] = json!("RESTART-OWNED");
+                owned["side"] = json!("BUY");
+                owned["origQty"] = json!("0.001");
+                owned["price"] = json!("30000.00");
+                owned["orderId"] = json!(42);
+                owned["time"] = json!(order_time);
+                owned["updateTime"] = owned["time"].clone();
+
+                if request.path == "/papi/v1/um/order" {
+                    return Reply::json(&owned);
+                }
+                let mut external = owned.clone();
+                external["clientOrderId"] = json!("RESTART-EXTERNAL");
+                external["orderId"] = json!(43);
+                return Reply::json(&json!([owned, external]));
+            }
+            current_trading_reply(request)
+        })
+        .await;
+        let (mut first, directory) = engine_trading_harness(&server, true);
+        let owned = engine_limit_order("RESTART-OWNED", TimeInForce::Gtc, false);
+        first.submit_via_risk(&owned);
+        server.wait_for_requests(1).await;
+        first.pump_for(Duration::from_millis(700)).await;
+        first.exec_engine().borrow_mut().stop_clients();
+        drop(first);
+        resumed.store(true, Ordering::Release);
+
+        let (url, _close, websocket) = recovery_websocket().await;
+        let (mut second, client) =
+            connected_recovery_client(&server, url, directory.path().join("papi-commands.journal"))
+                .await;
+        let report = client
+            .pending_application
+            .lock()
+            .as_ref()
+            .unwrap()
+            .report
+            .clone();
+        second.register_client(Box::new(client)).unwrap();
+
+        if startup {
+            let ExecutionReport::MassStatus(snapshot) = report else {
+                panic!("expected recovery snapshot")
+            };
+            let mut manager = ExecutionManager::new(
+                second.clock().clone(),
+                second.cache().clone(),
+                Default::default(),
+            )
+            .unwrap();
+            manager.reconcile_execution_mass_status(&snapshot, second.exec_engine());
+            assert_eq!(
+                second
+                    .cache()
+                    .borrow()
+                    .order(&owned.client_order_id())
+                    .unwrap()
+                    .strategy_id(),
+                owned.strategy_id()
+            );
+        }
+        assert!(
+            second
+                .pump_until(Duration::from_secs(3), |cache| {
+                    cache
+                        .order(&owned.client_order_id())
+                        .is_some_and(|order| order.status() == OrderStatus::Accepted)
+                        && cache
+                            .order(&ClientOrderId::from("RESTART-EXTERNAL"))
+                            .is_some()
+                })
+                .await
+        );
+        let cache = second.cache().borrow();
+        assert_eq!(
+            cache.order(&owned.client_order_id()).unwrap().strategy_id(),
+            owned.strategy_id()
+        );
+        assert_eq!(
+            cache
+                .order(&ClientOrderId::from("RESTART-EXTERNAL"))
+                .unwrap()
+                .strategy_id(),
+            StrategyId::external()
+        );
+        drop(cache);
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|request| request.path == "/papi/v1/um/order" && request.method == "POST")
+                .count(),
+            1
+        );
+        assert!(
+            server
+                .requests()
+                .iter()
+                .any(|request| request.path == "/papi/v1/um/order" && request.method == "GET")
+        );
+        second.exec_engine().borrow_mut().stop_clients();
+        websocket.abort();
     }
 
     #[tokio::test]

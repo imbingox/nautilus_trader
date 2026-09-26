@@ -206,6 +206,7 @@ pub(crate) struct PapiApplicationCheckpoint {
     session_generation: u64,
     recovery_generation: u64,
     fact_version: u64,
+    transport_revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,8 +242,47 @@ impl PapiApplicationAcknowledger {
         self.shared.evidence.lock().applied_fact_version
     }
 
-    pub(crate) fn set_trading_authorized(&self, authorized: bool) {
-        self.shared.evidence.lock().trading_authorized = authorized;
+    pub(crate) fn revoke_trading_authorization(&self) {
+        self.shared.evidence.lock().trading_authorized = false;
+    }
+
+    pub(crate) fn increase_risk_allowed(&self) -> bool {
+        let evidence = self.shared.evidence.lock();
+        evidence.transport_connected
+            && evidence.synchronized
+            && evidence.trading_authorized
+            && evidence.pending_application_fact_version.is_none()
+            && !self.shared.restricted.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn authorize_trading(
+        &self,
+        checkpoint: PapiApplicationCheckpoint,
+    ) -> anyhow::Result<()> {
+        let mut evidence = self.shared.evidence.lock();
+        anyhow::ensure!(
+            evidence.synchronized
+                && evidence.transport_connected
+                && evidence.session_generation == checkpoint.session_generation
+                && evidence.recovery_generation == checkpoint.recovery_generation
+                && self.shared.transport_revision.load(Ordering::Acquire)
+                    == checkpoint.transport_revision
+                && !self.shared.restricted.load(Ordering::Acquire),
+            "Stale PAPI trading authorization"
+        );
+        evidence.trading_authorized = true;
+        Ok(())
+    }
+
+    pub(crate) fn applied_refresh_checkpoint(&self) -> anyhow::Result<PapiApplicationCheckpoint> {
+        let checkpoint = self.refresh_checkpoint()?;
+        let evidence = self.shared.evidence.lock();
+        anyhow::ensure!(
+            evidence.pending_application_fact_version.is_none()
+                && evidence.applied_fact_version == checkpoint.fact_version,
+            "PAPI recovery facts are still awaiting engine application"
+        );
+        Ok(checkpoint)
     }
 
     pub(crate) fn refresh_checkpoint(&self) -> anyhow::Result<PapiApplicationCheckpoint> {
@@ -256,6 +296,7 @@ impl PapiApplicationAcknowledger {
             session_generation: evidence.session_generation,
             recovery_generation: evidence.recovery_generation,
             fact_version,
+            transport_revision: self.shared.transport_revision.load(Ordering::Acquire),
         })
     }
 
@@ -268,7 +309,9 @@ impl PapiApplicationAcknowledger {
         anyhow::ensure!(
             evidence.synchronized
                 && evidence.session_generation == checkpoint.session_generation
-                && evidence.recovery_generation == checkpoint.recovery_generation,
+                && evidence.recovery_generation == checkpoint.recovery_generation
+                && self.shared.transport_revision.load(Ordering::Acquire)
+                    == checkpoint.transport_revision,
             "Stale PAPI risk-refresh acknowledgement"
         );
 
@@ -313,6 +356,7 @@ fn acknowledge_application(
     anyhow::ensure!(
         evidence.session_generation == checkpoint.session_generation
             && evidence.recovery_generation == checkpoint.recovery_generation
+            && shared.transport_revision.load(Ordering::Acquire) == checkpoint.transport_revision
             && evidence.delivered_fact_version == checkpoint.fact_version
             && evidence.pending_application_fact_version == Some(checkpoint.fact_version),
         "Stale PAPI application acknowledgement"
@@ -416,6 +460,8 @@ impl BinancePapiAccountSession {
                 next_owner: AtomicU64::new(0),
                 current_owner: AtomicU64::new(0),
                 pending_owner: AtomicU64::new(0),
+                transport_revision: AtomicU64::new(0),
+                invalidation_handler: Mutex::new(None),
             }),
             websocket: Arc::new(tokio::sync::Mutex::new(None)),
             listen_key: Arc::new(Mutex::new(None)),
@@ -456,8 +502,12 @@ impl BinancePapiAccountSession {
         self.shared.evidence.lock().synchronized
     }
 
-    pub(crate) fn set_trading_authorized(&self, authorized: bool) {
-        self.shared.evidence.lock().trading_authorized = authorized;
+    pub(crate) fn revoke_trading_authorization(&self) {
+        self.shared.evidence.lock().trading_authorized = false;
+    }
+
+    pub(crate) fn set_invalidation_handler(&self, handler: Arc<dyn Fn() + Send + Sync>) {
+        *self.shared.invalidation_handler.lock() = Some(handler);
     }
 
     /// Confirms that the execution engine applied the exact delivered recovery generation.
@@ -569,6 +619,7 @@ impl BinancePapiAccountSession {
             for _ in 0..MAX_RECOVERY_ROUNDS {
                 match recover(&driver, &mut rx, &cancel, true, owner).await? {
                     RecoveryOutcome::Synchronized => return Ok(()),
+                    RecoveryOutcome::Superseded => {}
                     RecoveryOutcome::ReplaceListenKey => {
                         replace_listen_key(&driver, &cancel).await?;
                         owner = self.shared.current_owner.load(Ordering::Acquire);
@@ -720,6 +771,8 @@ struct SessionShared {
     next_owner: AtomicU64,
     current_owner: AtomicU64,
     pending_owner: AtomicU64,
+    transport_revision: AtomicU64,
+    invalidation_handler: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl SessionShared {
@@ -747,6 +800,13 @@ impl SessionShared {
         let mut evidence = self.evidence.lock();
         evidence.state = BinancePapiSessionState::Recovering;
         evidence.synchronized = false;
+        evidence.trading_authorized = false;
+        self.transport_revision.fetch_add(1, Ordering::AcqRel);
+        drop(evidence);
+
+        if let Some(handler) = self.invalidation_handler.lock().as_ref() {
+            handler();
+        }
     }
 
     fn restrict(&self, issue: String) {
@@ -754,6 +814,8 @@ impl SessionShared {
         let mut evidence = self.evidence.lock();
         evidence.state = BinancePapiSessionState::Restricted;
         evidence.synchronized = false;
+        evidence.trading_authorized = false;
+        self.transport_revision.fetch_add(1, Ordering::AcqRel);
 
         if !evidence.issues.contains(&issue) {
             evidence.issues.push(issue);
@@ -883,6 +945,8 @@ async fn build_websocket(
                 evidence.state = BinancePapiSessionState::Recovering;
             }
         }
+
+        state_shared.set_recovering();
 
         if state_tx
             .try_send(Inbound::Transport { owner, state })
@@ -1025,6 +1089,21 @@ async fn run_driver(
 
         match result {
             Ok(RecoveryOutcome::Synchronized) => {}
+            Ok(RecoveryOutcome::Superseded) => {
+                if context.shared.evidence.lock().transport_connected
+                    && context
+                        .tx
+                        .try_send(Inbound::Transport {
+                            owner: context.shared.current_owner.load(Ordering::Acquire),
+                            state: SocketState::Connected,
+                        })
+                        .is_err()
+                {
+                    context
+                        .shared
+                        .restrict("PAPI recovery trigger queue overflow".to_string());
+                }
+            }
             Ok(RecoveryOutcome::ReplaceListenKey) => {
                 if let Err(e) = replace_listen_key(&context, &cancel).await {
                     context.shared.restrict(e.to_string());
@@ -1194,6 +1273,7 @@ fn deliver_incremental(
         session_generation,
         recovery_generation,
         fact_version,
+        transport_revision: context.shared.transport_revision.load(Ordering::Acquire),
     };
     let previous_application = {
         let mut evidence = context.shared.evidence.lock();
@@ -1254,6 +1334,7 @@ async fn recover(
         "PAPI session has an unresolved restriction"
     );
     shared.set_recovering();
+    let transport_revision = shared.transport_revision.load(Ordering::Acquire);
     let recovery_started = Instant::now();
     let window_end = reader.now();
     let lookback_ns = u64::try_from(config.recovery_lookback.as_nanos())?;
@@ -1316,13 +1397,23 @@ async fn recover(
     validate_projection(&projection)?;
     anyhow::ensure!(
         snapshot.issues.as_slice() == [KNOWN_HISTORY_LIMITATION],
-        "PAPI historical recovery has unresolved source failures"
+        "PAPI historical recovery has unresolved source failures: {:?}",
+        snapshot.issues
     );
     let account_state = projection
         .account_state
         .ok_or_else(|| anyhow::anyhow!("PAPI wallet projection produced no account state"))?;
     snapshot.mass_status.client_id = *crate::consts::BINANCE_PAPI_CLIENT_ID;
-    let fact_version = shared.facts.lock().fact_version;
+    let fact_version = {
+        let mut facts = shared.facts.lock();
+
+        // A complete REST baseline advances application evidence even for an empty account
+        facts.fact_version = facts
+            .fact_version
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("PAPI fact version overflow"))?;
+        facts.fact_version
+    };
 
     {
         let evidence = shared.evidence.lock();
@@ -1332,6 +1423,12 @@ async fn recover(
                 && !shared.overflowed.load(Ordering::Acquire),
             "PAPI session has an unresolved restriction"
         );
+
+        if shared.transport_revision.load(Ordering::Acquire) != transport_revision
+            || !evidence.transport_connected
+        {
+            return Ok(RecoveryOutcome::Superseded);
+        }
         anyhow::ensure!(
             evidence.recovery_generation == recovery_generation
                 && evidence.session_generation != 0
@@ -1344,6 +1441,7 @@ async fn recover(
         session_generation: shared.evidence.lock().session_generation,
         recovery_generation,
         fact_version,
+        transport_revision,
     };
     let previous_application = {
         let mut evidence = shared.evidence.lock();
@@ -1380,6 +1478,12 @@ async fn recover(
     let facts = shared.facts.lock();
     let mut evidence = shared.evidence.lock();
 
+    if shared.transport_revision.load(Ordering::Acquire) != transport_revision
+        || !evidence.transport_connected
+    {
+        return Ok(RecoveryOutcome::Superseded);
+    }
+
     if cancel.is_cancelled()
         || evidence.recovery_generation != recovery_generation
         || evidence.session_generation == 0
@@ -1413,6 +1517,7 @@ async fn recover(
 
 enum RecoveryOutcome {
     Synchronized,
+    Superseded,
     ReplaceListenKey,
 }
 
@@ -1517,8 +1622,7 @@ fn process_inbound(
                 return Ok(InboundAction::Ignore);
             }
 
-            if state == SocketState::Disconnected {
-                shared.set_recovering();
+            if state != SocketState::Connected {
                 return Ok(InboundAction::Ignore);
             }
             Ok(InboundAction::Recover)
@@ -1753,16 +1857,16 @@ mod tests {
         assert!(evidence.transport_connected);
         assert!(evidence.synchronized);
         assert!(!evidence.trading_authorized);
-        assert_eq!(evidence.received_fact_version, 1);
-        assert_eq!(evidence.delivered_fact_version, 1);
+        assert_eq!(evidence.received_fact_version, 2);
+        assert_eq!(evidence.delivered_fact_version, 2);
         assert_eq!(evidence.applied_fact_version, 0);
-        assert_eq!(evidence.pending_application_fact_version, Some(1));
+        assert_eq!(evidence.pending_application_fact_version, Some(2));
         assert_eq!(callback_count.load(Ordering::Acquire), 1);
         assert!(!baseline_before_websocket.load(Ordering::Acquire));
 
         let checkpoint = delivered_checkpoint.lock().unwrap();
         session.acknowledge_application(checkpoint).unwrap();
-        assert_eq!(session.evidence().applied_fact_version, 1);
+        assert_eq!(session.evidence().applied_fact_version, 2);
         assert_eq!(session.evidence().pending_application_fact_version, None);
         assert!(session.acknowledge_application(checkpoint).is_err());
 
@@ -1854,18 +1958,18 @@ mod tests {
             bundle.checkpoint
         };
         let evidence = session.evidence();
-        assert_eq!(evidence.received_fact_version, 2);
-        assert_eq!(evidence.delivered_fact_version, 2);
+        assert_eq!(evidence.received_fact_version, 3);
+        assert_eq!(evidence.delivered_fact_version, 3);
         assert_eq!(evidence.applied_fact_version, 0);
-        assert_eq!(evidence.pending_application_fact_version, Some(2));
+        assert_eq!(evidence.pending_application_fact_version, Some(3));
         assert_eq!(server.requests().len(), baseline_requests);
 
         session.acknowledge_application(checkpoint).unwrap();
-        assert_eq!(session.evidence().applied_fact_version, 2);
+        assert_eq!(session.evidence().applied_fact_version, 3);
         websocket_tx.send(event).unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(deliveries.lock().len(), 1);
-        assert_eq!(session.evidence().received_fact_version, 2);
+        assert_eq!(session.evidence().received_fact_version, 3);
         assert_eq!(server.requests().len(), baseline_requests);
 
         session.stop().await.unwrap();
@@ -1932,7 +2036,7 @@ mod tests {
             refresh_acknowledger
                 .acknowledge_refresh(refresh_checkpoint)
                 .unwrap(),
-            PapiRefreshAcknowledgement::Superseded { fact_version: 3 }
+            PapiRefreshAcknowledgement::Superseded { fact_version: 4 }
         );
         let checkpoint = deliveries.lock()[0].checkpoint;
         session.acknowledge_application(checkpoint).unwrap();

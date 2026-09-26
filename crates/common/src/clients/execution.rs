@@ -69,6 +69,21 @@ pub trait ExecutionClient {
         None
     }
 
+    /// Returns an exact order owner proven by the client's durable submission records.
+    ///
+    /// This takes precedence over instrument-wide external claims when recovering a missing order.
+    /// Clients without durable ownership evidence return `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the report conflicts with the durable order identity or terms.
+    fn recovered_order_strategy(
+        &self,
+        _report: &OrderStatusReport,
+    ) -> anyhow::Result<Option<StrategyId>> {
+        Ok(None)
+    }
+
     /// Observes a reconciliation report after the execution engine has applied it.
     ///
     /// Implementations must verify any adapter-specific application expectations against their

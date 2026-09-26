@@ -1140,7 +1140,21 @@ impl ExecutionEngine {
         &mut self,
         report: &OrderStatusReport,
     ) -> Option<OrderAny> {
-        let strategy_id = self.resolve_external_strategy(&report.instrument_id);
+        let recovered_strategy = self
+            .source_client_id_for_account(report.account_id, &report.instrument_id)
+            .and_then(|client_id| self.get_client(&client_id))
+            .map(|client| client.recovered_order_strategy(report))
+            .transpose();
+        let strategy_id = match recovered_strategy {
+            Ok(strategy) => strategy
+                .flatten()
+                .unwrap_or_else(|| self.resolve_external_strategy(&report.instrument_id)),
+            Err(e) => {
+                log::error!("Cannot recover order {}: {e}", report.venue_order_id);
+                return None;
+            }
+        };
+
         if self.should_filter_unclaimed_external_order(strategy_id) {
             self.filtered_unclaimed_external_order_count += 1;
 
