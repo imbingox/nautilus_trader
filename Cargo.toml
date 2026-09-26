@@ -65,7 +65,7 @@ keywords = [
 ]
 documentation = "https://nautilustrader.io/docs"
 repository = "https://github.com/nautechsystems/nautilus_trader"
-homepage = "https://nautilustrader.io"
+homepage = "https://github.com/imbingox/nautilus_trader"
 
 [workspace.dependencies]
 nautilus-analysis = { path = "crates/analysis", version = "0.65.0" }
