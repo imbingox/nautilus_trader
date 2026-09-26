@@ -9,7 +9,7 @@ conflicts with the official `nautilus-trader` distribution.
 | Field               | Value                                                       |
 | ------------------- | ----------------------------------------------------------- |
 | Distribution        | `nautilus-trader-papi`                                      |
-| Version             | `2.0.0rc8`                                                  |
+| Version             | `2.0.0rc9`                                                  |
 | Python              | CPython 3.14, GIL build                                     |
 | ABI                 | `cp314`                                                     |
 | Platform            | Linux x86_64                                                |
@@ -17,7 +17,7 @@ conflicts with the official `nautilus-trader` distribution.
 | Build profile       | Cargo `release`                                             |
 | Python extension    | Full `nautilus-pyo3` extension with high precision and PAPI |
 | Source distribution | Not published                                               |
-| Release tag         | `papi-v2.0.0rc8`                                            |
+| Release tag         | `papi-v2.0.0rc9`                                            |
 
 The upstream baseline is
 `46a5658a2f66cf0a798d414dc1b63d98cf10fcc1`. The PAPI feature head before upstream integration is
@@ -30,19 +30,21 @@ The version belongs to this distribution. Increment it for every changed PAPI re
 even when the upstream Python version remains unchanged. PyPI files are immutable, so never rebuild
 different bytes under an uploaded version.
 
-## Changes in 2.0.0rc8
+## Changes in 2.0.0rc9
 
-Current position and open-order reports can query the whole UM account without supplied
-instruments. The client discovers active instruments from official USD-M exchange metadata and
-returns native Nautilus status reports. Historical reports and trading recovery retain their
-explicit instrument scope.
+Risk-increasing orders are blocked as soon as the private stream disconnects and remain blocked
+until the current recovery baseline has been applied by the execution engine and fresh risk
+evidence has been acknowledged. Queued commands and stale recovery generations cannot reuse a
+previous trading authorization. Existing reduction and cancellation policies remain in effect.
 
-Read-only live acceptance on 2026-09-25 returned one nonzero position and no ordinary or algo open
-orders in two consecutive rounds. Position direction, quantity, and entry price matched signed
-`positionRisk` and UM V1 account responses exactly. The V1 account contained 907 position rows;
-906 zero positions were omitted from the native account-wide result. Nonempty open orders and an
-algo trigger/child lifecycle were not available for this live acceptance. No orders were placed
-or canceled, and account settings were not changed.
+After a restart with an empty Cache, exact durable submission records restore the original
+strategy owner during both startup and runtime reconciliation. Account, instrument, order terms,
+and known venue identity must match; conflicting evidence does not create an external order.
+Recovery continues to use bounded reads without replaying unresolved submissions. The journal
+format is unchanged.
+
+These fixes address fork issue #9. Regression coverage uses loopback HTTP/WebSocket servers and
+native execution and reconciliation paths. This release adds no live trading acceptance claim.
 
 ## Downstream dependency audit
 
@@ -75,7 +77,7 @@ bash scripts/papi-release/verify-wheel.bash dist/papi
 python3 scripts/papi-release/generate-manifest.py \
   --wheel-dir dist/papi \
   --source-ref <release-commit-or-tag> \
-  --tag papi-v2.0.0rc8 \
+  --tag papi-v2.0.0rc9 \
   --output dist/papi/release-manifest.json
 ```
 
@@ -125,7 +127,7 @@ release tag and require approval where the GitHub plan supports it.
 The promotion sequence is:
 
 1. Merge the validated release branch into `main` without changing the candidate tree.
-2. Create signed tag `papi-v2.0.0rc8` at that exact commit.
+2. Create signed tag `papi-v2.0.0rc9` at that exact commit.
 3. Build and verify the wheel once, then freeze its SHA-256 manifest.
 4. Upload the frozen wheel to TestPyPI through the protected OIDC job.
 5. Run `verify-index.bash testpypi ...`; it downloads the file, compares SHA-256, and repeats the

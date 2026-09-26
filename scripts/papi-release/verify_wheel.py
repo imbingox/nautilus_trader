@@ -32,7 +32,7 @@ from typing import Any
 
 
 EXPECTED_NAME = "nautilus-trader-papi"
-EXPECTED_VERSION = "2.0.0rc8"
+EXPECTED_VERSION = "2.0.0rc9"
 EXPECTED_REQUIRES_PYTHON = ">=3.14,<3.15"
 EXPECTED_HOMEPAGE = "https://github.com/imbingox/nautilus_trader"
 EXPECTED_PLATFORM = "manylinux_2_34_x86_64"

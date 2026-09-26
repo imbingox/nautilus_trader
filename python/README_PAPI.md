@@ -11,7 +11,7 @@ and copyright holder of the upstream project. Report fork-specific issues to the
 
 ## Supported wheel
 
-The `2.0.0rc8` release supports only:
+The `2.0.0rc9` release supports only:
 
 - CPython 3.14 with the GIL enabled
 - Linux x86_64 with a `manylinux_2_34` baseline
@@ -24,7 +24,7 @@ Install the exact binary release in a new virtual environment:
 
 ```bash
 python3.14 -m venv .venv
-.venv/bin/python -m pip install --only-binary=:all: nautilus-trader-papi==2.0.0rc8
+.venv/bin/python -m pip install --only-binary=:all: nautilus-trader-papi==2.0.0rc9
 ```
 
 Do not install `nautilus-trader` and `nautilus-trader-papi` together. Both distributions provide
@@ -48,6 +48,13 @@ orders = await client.generate_order_status_reports(open_only=True)
 
 These methods return native Nautilus reports and discover required USD-M instrument metadata.
 Historical reports and trading recovery still require an explicit instrument scope.
+
+## Recovery fixes in 2.0.0rc9
+
+Risk-increasing orders remain blocked during private-stream recovery until the execution engine
+has applied the current baseline and fresh risk evidence is acknowledged. Restart reconciliation
+restores the original strategy owner from matching durable submission records even with an empty
+Cache, without replaying unresolved orders. The command journal format is unchanged.
 
 ## Safety boundary
 
