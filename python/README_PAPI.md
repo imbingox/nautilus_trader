@@ -56,15 +56,17 @@ has applied the current baseline and fresh risk evidence is acknowledged. Restar
 restores the original strategy owner from matching durable submission records even with an empty
 Cache, without replaying unresolved orders. The command journal format is unchanged.
 
-## 2.0.0rc10 恢复状态与仓位交接
+## Recovery evidence and position handoff in 2.0.0rc10
 
-生产 Node 使用的 `BinancePapiExecutionClientFactory` 通过
-`recovery_state_json(client_id)` 提供同一实际 execution client 的只读恢复证据，包含
-scope、generation、时效、报告应用进度及分操作权限。reader 不延长 journal owner 生命周期。
+The production `BinancePapiExecutionClientFactory` exposes `recovery_state_json(client_id)`
+for the same execution client used by the Node. Evidence includes scope, generation, freshness,
+report application progress, and operation permissions. Readers do not retain journal ownership.
 
-显式仓位交接验证账户、标的、数量和稳定 Strategy 归属，实际 Cache 应用后持久化凭证。
-历史外来订单保持 EXTERNAL，已包含在当前仓位中的旧成交不重复累计；交接失败、外来挂单
-或凭证丢失会阻断新风险订单。启动恢复补建仓位后也会通知原 execution client 核验应用结果。
+Explicit position handoff verifies the account, instruments, quantities, and stable strategy
+ownership before persisting a receipt after Cache application. Historical external orders remain
+EXTERNAL, and legacy fills already covered by the position snapshot are not counted twice.
+Failed handoff, foreign open orders, or lost receipts block new risk-increasing orders. Startup
+reconciliation also notifies the source execution client after applying recovered positions.
 
 ## Safety boundary
 
