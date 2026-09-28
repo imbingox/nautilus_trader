@@ -84,6 +84,20 @@ pub trait ExecutionClient {
         Ok(None)
     }
 
+    /// Returns an exact position owner proven by an explicit durable handoff.
+    ///
+    /// This authorizes only synthetic position reconciliation, never venue order claims.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the position report conflicts with handoff evidence.
+    fn recovered_position_strategy(
+        &self,
+        _report: &PositionStatusReport,
+    ) -> anyhow::Result<Option<StrategyId>> {
+        Ok(None)
+    }
+
     /// Observes a reconciliation report after the execution engine has applied it.
     ///
     /// Implementations must verify any adapter-specific application expectations against their

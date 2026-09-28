@@ -11,7 +11,7 @@ and copyright holder of the upstream project. Report fork-specific issues to the
 
 ## Supported wheel
 
-The `2.0.0rc9` release supports only:
+The `2.0.0rc10` release supports only:
 
 - CPython 3.14 with the GIL enabled
 - Linux x86_64 with a `manylinux_2_34` baseline
@@ -24,7 +24,7 @@ Install the exact binary release in a new virtual environment:
 
 ```bash
 python3.14 -m venv .venv
-.venv/bin/python -m pip install --only-binary=:all: nautilus-trader-papi==2.0.0rc9
+.venv/bin/python -m pip install --only-binary=:all: nautilus-trader-papi==2.0.0rc10
 ```
 
 Do not install `nautilus-trader` and `nautilus-trader-papi` together. Both distributions provide
@@ -55,6 +55,16 @@ Risk-increasing orders remain blocked during private-stream recovery until the e
 has applied the current baseline and fresh risk evidence is acknowledged. Restart reconciliation
 restores the original strategy owner from matching durable submission records even with an empty
 Cache, without replaying unresolved orders. The command journal format is unchanged.
+
+## 2.0.0rc10 恢复状态与仓位交接
+
+生产 Node 使用的 `BinancePapiExecutionClientFactory` 通过
+`recovery_state_json(client_id)` 提供同一实际 execution client 的只读恢复证据，包含
+scope、generation、时效、报告应用进度及分操作权限。reader 不延长 journal owner 生命周期。
+
+显式仓位交接验证账户、标的、数量和稳定 Strategy 归属，实际 Cache 应用后持久化凭证。
+历史外来订单保持 EXTERNAL，已包含在当前仓位中的旧成交不重复累计；交接失败、外来挂单
+或凭证丢失会阻断新风险订单。启动恢复补建仓位后也会通知原 execution client 核验应用结果。
 
 ## Safety boundary
 

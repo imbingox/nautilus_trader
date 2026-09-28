@@ -15,7 +15,7 @@
 
 //! Factory for Binance Portfolio Margin execution clients.
 
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 
 #[cfg(test)]
 use nautilus_common::clock::VirtualClock;
@@ -30,11 +30,13 @@ use nautilus_model::{
     enums::{AccountType, OmsType},
     identifiers::{ClientId, TraderId},
 };
+use parking_lot::Mutex;
 
 use crate::{
     config::BinancePapiExecutionClientConfig,
     consts::{BINANCE_PAPI, BINANCE_PAPI_VENUE},
     execution::BinancePapiExecutionClient,
+    recovery::PapiRecoveryReader,
 };
 
 /// Factory for scoped Binance Portfolio Margin observation and execution reports.
@@ -47,13 +49,27 @@ use crate::{
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.binance_papi")
 )]
-pub struct BinancePapiExecutionClientFactory;
+pub struct BinancePapiExecutionClientFactory {
+    recovery_readers: Arc<Mutex<HashMap<String, PapiRecoveryReader>>>,
+}
 
 impl BinancePapiExecutionClientFactory {
     /// Creates a new [`BinancePapiExecutionClientFactory`].
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns a read-only snapshot from the named client created by this factory.
+    ///
+    /// A snapshot is sampled evidence, not a durable trading permit. Consumers must expire it
+    /// using `sampled_at_ns` and `valid_for_ms`; native admission remains authoritative.
+    #[must_use]
+    pub fn recovery_state_json(&self, client_id: &str) -> Option<String> {
+        self.recovery_readers
+            .lock()
+            .get(client_id)
+            .map(|reader| reader.snapshot().to_string())
     }
 }
 
@@ -85,10 +101,14 @@ impl ExecutionClientFactory for BinancePapiExecutionClientFactory {
             None,
             cache,
         );
-        Ok(Box::new(BinancePapiExecutionClient::new(
-            core,
-            config.clone(),
-        )))
+        let mut readers = self.recovery_readers.lock();
+        anyhow::ensure!(
+            !readers.contains_key(name),
+            "PAPI factory client identity already registered"
+        );
+        let client = BinancePapiExecutionClient::new(core, config.clone());
+        readers.insert(name.to_string(), client.recovery_reader());
+        Ok(Box::new(client))
     }
 
     fn name(&self) -> &'static str {
@@ -115,7 +135,10 @@ mod tests {
             account_id: AccountId::from("BINANCE-PAPI-002"),
             ..Default::default()
         };
-        let client = BinancePapiExecutionClientFactory::new()
+        let factory = BinancePapiExecutionClientFactory::new();
+        let observer = factory.clone();
+        assert!(observer.recovery_state_json("PAPI-CUSTOM").is_none());
+        let client = factory
             .create(
                 TraderId::from("TRADER-001"),
                 "PAPI-CUSTOM",
@@ -130,6 +153,15 @@ mod tests {
         assert_eq!(client.account_id().get_issuer(), client.venue());
         assert!(!client.is_connected());
         assert!(client.get_account().is_none());
+        let state: serde_json::Value =
+            serde_json::from_str(&observer.recovery_state_json("PAPI-CUSTOM").unwrap()).unwrap();
+        assert_eq!(state["account_id"], "BINANCE-PAPI-002");
+        assert_eq!(state["status"], "starting");
+        assert_eq!(state["permissions"]["increase_risk"], false);
+        drop(client);
+        let stopped: serde_json::Value =
+            serde_json::from_str(&observer.recovery_state_json("PAPI-CUSTOM").unwrap()).unwrap();
+        assert_eq!(stopped["status"], "stopped");
     }
 
     #[rstest]

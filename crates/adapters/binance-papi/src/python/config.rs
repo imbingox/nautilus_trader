@@ -224,12 +224,13 @@ impl BinancePapiExecutionClientConfig {
     /// durable command lifecycle, while increase-risk admission remains closed until the coordinator
     /// has current, authenticated Portfolio Margin risk evidence.
     #[new]
-    #[pyo3(signature = (account_id=None, read_only=None, instrument_ids=None, trading=None))]
+    #[pyo3(signature = (account_id=None, read_only=None, instrument_ids=None, trading=None, position_handoff_json=None))]
     fn py_new(
         account_id: Option<AccountId>,
         read_only: Option<BinancePapiReadOnlyConfig>,
         instrument_ids: Option<Vec<InstrumentId>>,
         trading: Option<BinancePapiTradingConfig>,
+        position_handoff_json: Option<String>,
     ) -> PyResult<Self> {
         let defaults = Self::default();
         let config = Self {
@@ -239,6 +240,7 @@ impl BinancePapiExecutionClientConfig {
             read_only,
             instrument_ids: instrument_ids.unwrap_or(defaults.instrument_ids),
             trading,
+            position_handoff_json,
         };
         config.validate().map_err(to_pyvalue_err)?;
         Ok(config)

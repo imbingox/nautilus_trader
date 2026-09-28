@@ -125,6 +125,7 @@ pub struct ExecutionEngine {
     event_count: u64,
     report_count: u64,
     filtered_unclaimed_external_order_count: u64,
+    position_handoff_snapshots: AHashMap<(AccountId, InstrumentId), UnixNanos>,
     snapshot_anchorer: Option<SnapshotAnchorer>,
 }
 
@@ -132,6 +133,10 @@ impl Debug for ExecutionEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(ExecutionEngine))
             .field("client_count", &self.clients.len())
+            .field(
+                "position_handoff_snapshots",
+                &self.position_handoff_snapshots,
+            )
             .finish()
     }
 }
@@ -164,6 +169,7 @@ impl ExecutionEngine {
             event_count: 0,
             report_count: 0,
             filtered_unclaimed_external_order_count: 0,
+            position_handoff_snapshots: AHashMap::new(),
             snapshot_anchorer: None,
         }
     }
@@ -1819,6 +1825,35 @@ impl ExecutionEngine {
         let fill_reports = mass_status.fill_reports();
         let mut paired_venue_ids = AHashSet::new();
 
+        // The live startup manager subsequently materializes the exact handed-off
+        // current position. Do not let legacy external history create a competing
+        // position while the initial mass report is being applied here first.
+        for reports in mass_status.position_reports().values() {
+            for report in reports {
+                let handed_off = self
+                    .get_client(&mass_status.client_id)
+                    .and_then(|client| client.recovered_position_strategy(report).ok().flatten())
+                    .is_some();
+
+                if handed_off
+                    && self
+                        .cache
+                        .borrow()
+                        .positions_open(
+                            None,
+                            Some(&report.instrument_id),
+                            None,
+                            Some(&report.account_id),
+                            None,
+                        )
+                        .is_empty()
+                {
+                    self.position_handoff_snapshots
+                        .insert((report.account_id, report.instrument_id), report.ts_last);
+                }
+            }
+        }
+
         for order_report in order_reports.values() {
             if self.is_order_snapshot_stale(order_report, mass_status.ts_init) {
                 msgbus::publish_any(
@@ -1858,6 +1893,7 @@ impl ExecutionEngine {
                 self.reconcile_position_report(position_report);
             }
         }
+        self.position_handoff_snapshots.clear();
 
         log::info!(
             "Mass status reconciliation complete: {} orders, {} fills, {} positions",
@@ -2852,7 +2888,12 @@ impl ExecutionEngine {
     }
 
     fn handle_event(&mut self, event: &OrderEventAny) {
-        self.handle_event_with_position_application(event, true);
+        let project_only = matches!(event, OrderEventAny::Filled(fill)
+            if fill.strategy_id.is_external()
+                && self.position_handoff_snapshots
+                    .get(&(fill.account_id, fill.instrument_id))
+                    .is_some_and(|snapshot_time| fill.ts_event <= *snapshot_time));
+        self.handle_event_with_position_application(event, !project_only);
     }
 
     fn handle_event_with_position_application(

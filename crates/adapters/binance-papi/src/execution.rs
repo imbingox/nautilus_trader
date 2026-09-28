@@ -63,6 +63,7 @@ use parking_lot::Mutex;
 use crate::{
     config::{BinancePapiExecutionClientConfig, BinancePapiTradingConfig},
     read_only::BinancePapiReadOnlyClient,
+    recovery::PapiRecoveryReader,
     reports::parse::{OrderFamily, venue_order_id},
     trading::{
         commands::{batch_cancel_operations, cancel_operation, submit_operation},
@@ -82,6 +83,20 @@ const TASK_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const TASK_SHUTDOWN_ABORT: Duration = Duration::from_secs(2);
 const RISK_REFRESH_QUIET_DELAY: Duration = Duration::from_secs(3);
 const RISK_REFRESH_MAX_DELAY: Duration = Duration::from_secs(5);
+
+fn require_position_handoff_authority(
+    handoff: Option<&crate::position_handoff::PapiPositionHandoffConfig>,
+    failure: &Mutex<Option<String>>,
+) -> anyhow::Result<()> {
+    if let Some(handoff) = handoff {
+        handoff.require_applied()?;
+
+        if let Some(reason) = failure.lock().as_ref() {
+            anyhow::bail!("Position handoff is blocked: {reason}");
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug)]
 struct PapiPendingApplication {
@@ -363,6 +378,9 @@ fn trading_risk_application_timeout(config: &BinancePapiTradingConfig) -> Durati
 #[derive(Debug)]
 pub(crate) struct BinancePapiExecutionClient {
     core: ExecutionClientCore,
+    position_handoff: Option<Arc<crate::position_handoff::PapiPositionHandoffConfig>>,
+    position_handoff_failure: Arc<Mutex<Option<String>>>,
+    recovery_lifetime: Arc<()>,
     config: BinancePapiExecutionClientConfig,
     emitter: ExecutionEventEmitter,
     coordinator: Arc<Mutex<Option<PapiCommandCoordinator>>>,
@@ -377,6 +395,9 @@ pub(crate) struct BinancePapiExecutionClient {
 
 impl BinancePapiExecutionClient {
     pub(crate) fn new(core: ExecutionClientCore, config: BinancePapiExecutionClientConfig) -> Self {
+        let position_handoff = config.position_handoff_json.as_ref().map(|raw| {
+            Arc::new(serde_json::from_str(raw).expect("Position handoff config was validated"))
+        });
         let emitter = ExecutionEventEmitter::new(
             get_atomic_clock_realtime(),
             core.trader_id,
@@ -387,6 +408,9 @@ impl BinancePapiExecutionClient {
 
         Self {
             core,
+            position_handoff,
+            position_handoff_failure: Arc::new(Mutex::new(None)),
+            recovery_lifetime: Arc::new(()),
             config,
             emitter,
             coordinator: Arc::new(Mutex::new(None)),
@@ -398,6 +422,188 @@ impl BinancePapiExecutionClient {
             session: None,
             pending_tasks: TaskGroup::new(),
         }
+    }
+
+    pub(crate) fn recovery_reader(&self) -> PapiRecoveryReader {
+        let lifetime = Arc::downgrade(&self.recovery_lifetime);
+        let coordinator = Arc::downgrade(&self.coordinator);
+        let acknowledger = Arc::downgrade(&self.application_acknowledger);
+        let connected = Arc::downgrade(&self.trading_connected);
+        let refresh = Arc::downgrade(&self.risk_refresh);
+        let client_id = self.core.client_id;
+        let account_id = self.core.account_id;
+        let position_handoff = self.position_handoff.as_ref().map(Arc::downgrade);
+        let position_handoff_failure = Arc::downgrade(&self.position_handoff_failure);
+        let instrument_ids = self.config.instrument_ids.clone();
+        let max_risk_age_ms = self
+            .config
+            .trading
+            .as_ref()
+            .map(|config| config.max_risk_age_ms);
+
+        PapiRecoveryReader::new(move || {
+            let sampled_at_ns = get_atomic_clock_realtime().get_time_ns().as_u64();
+            let now = Instant::now();
+            let alive = lifetime.upgrade().is_some();
+            let coordinator_source = coordinator.upgrade();
+            let coordinator_guard = coordinator_source.as_ref().map(|value| value.lock());
+            let coordinator = coordinator_guard.as_deref().and_then(Option::as_ref);
+            let acknowledger = acknowledger
+                .upgrade()
+                .and_then(|value| value.lock().clone());
+            let mut handoff_failure = position_handoff_failure
+                .upgrade()
+                .and_then(|value| value.lock().clone());
+            let handoff_evidence = position_handoff
+                .as_ref()
+                .and_then(|value| value.upgrade())
+                .map(|handoff| {
+                    let mut evidence = handoff.evidence();
+                    if evidence["applied"] != true
+                        && (handoff_failure.is_none() || evidence["error"].is_string())
+                    {
+                        handoff_failure = Some(
+                            evidence["error"]
+                                .as_str()
+                                .unwrap_or("Position handoff has not been applied")
+                                .to_string(),
+                        );
+                    }
+
+                    if let Some(error) = &handoff_failure {
+                        evidence["applied"] = serde_json::json!(false);
+                        evidence["error"] = serde_json::json!(error);
+                    }
+                    evidence
+                });
+            let before = acknowledger.as_ref().map(|value| value.recovery_evidence());
+            let risk = coordinator
+                .as_ref()
+                .and_then(|value| value.risk_evidence_age(now));
+            let mut permissions = coordinator
+                .as_ref()
+                .map(|value| value.permissions(now))
+                .unwrap_or_default();
+            let unresolved = coordinator
+                .as_ref()
+                .map_or(0, |value| value.journal().unresolved().count());
+            let after = acknowledger.as_ref().map(|value| value.recovery_evidence());
+            let stable = match (&before, &after) {
+                (Some((first, revision)), Some((second, current))) => {
+                    revision == current
+                        && first.session_generation == second.session_generation
+                        && first.recovery_generation == second.recovery_generation
+                        && first.delivered_fact_version == second.delivered_fact_version
+                        && first.applied_fact_version == second.applied_fact_version
+                }
+                _ => false,
+            };
+            let (evidence, transport_revision) =
+                after.map_or((None, 0), |(value, revision)| (Some(value), revision));
+            let scope_complete = evidence.as_ref().is_some_and(|value| {
+                value.account_id == account_id
+                    && value.instrument_ids.len() == instrument_ids.len()
+                    && value
+                        .instrument_ids
+                        .iter()
+                        .all(|id| instrument_ids.contains(id))
+                    && value.synchronized
+            });
+            let applied = evidence.as_ref().is_some_and(|value| {
+                value.delivered_fact_version > 0
+                    && value.applied_fact_version == value.delivered_fact_version
+                    && value.pending_application_fact_version.is_none()
+            });
+            let session_authorized = evidence.as_ref().is_some_and(|value| {
+                value.transport_connected && value.synchronized && value.trading_authorized
+            });
+            let trading_connected = alive
+                && connected
+                    .upgrade()
+                    .is_some_and(|value| value.load(Ordering::Acquire));
+            let hard_refresh_pending = refresh
+                .upgrade()
+                .is_none_or(|value| value.hard_refresh_pending());
+            permissions.increase_risk &= trading_connected
+                && stable
+                && scope_complete
+                && applied
+                && session_authorized
+                && !hard_refresh_pending
+                && handoff_failure.is_none();
+            if handoff_failure.is_some() {
+                permissions.verified_reduce_only = false;
+            }
+
+            if !trading_connected {
+                permissions.verified_reduce_only = false;
+                permissions.targeted_cancel = false;
+            }
+            let (status, reason) = if !alive {
+                ("stopped", "client_disposed")
+            } else if evidence.is_none() {
+                ("starting", "session_not_started")
+            } else if evidence.as_ref().is_some_and(|value| {
+                matches!(
+                    value.state,
+                    crate::websocket::BinancePapiSessionState::Stopped
+                        | crate::websocket::BinancePapiSessionState::Stopping
+                )
+            }) {
+                ("stopped", "session_stopped")
+            } else if handoff_failure.is_some() {
+                ("restricted", "position_handoff_failed")
+            } else if evidence.as_ref().is_some_and(|value| {
+                value.state == crate::websocket::BinancePapiSessionState::Restricted
+            }) {
+                ("restricted", "session_restricted")
+            } else if !trading_connected {
+                ("recovering", "client_not_connected")
+            } else if !stable || !scope_complete {
+                ("recovering", "session_recovery_pending")
+            } else if !applied {
+                ("recovering", "engine_application_pending")
+            } else if max_risk_age_ms.is_none() {
+                ("restricted", "trading_not_configured")
+            } else if hard_refresh_pending || !session_authorized {
+                ("recovering", "risk_refresh_pending")
+            } else if permissions.increase_risk {
+                ("ready", "ready")
+            } else if unresolved > 0 {
+                ("restricted", "journal_unresolved")
+            } else {
+                ("restricted", "risk_evidence_unavailable")
+            };
+            let valid_for_ms = if status == "ready" {
+                max_risk_age_ms.zip(risk).map_or(0, |(maximum, (_, age))| {
+                    maximum.saturating_sub(age).saturating_sub(1).min(1_000)
+                })
+            } else {
+                1_000
+            };
+            serde_json::json!({
+                "schema_version": 1, "client_id": client_id, "account_id": account_id,
+                "instrument_ids": instrument_ids, "sampled_at_ns": sampled_at_ns,
+                "valid_for_ms": valid_for_ms, "status": status, "reason": reason,
+                "session_generation": evidence.as_ref().map_or(0, |value| value.session_generation),
+                "recovery_generation": evidence.as_ref().map_or(0, |value| value.recovery_generation),
+                "transport_revision": transport_revision,
+                "received_fact_version": evidence.as_ref().map_or(0, |value| value.received_fact_version),
+                "delivered_fact_version": evidence.as_ref().map_or(0, |value| value.delivered_fact_version),
+                "applied_fact_version": evidence.as_ref().map_or(0, |value| value.applied_fact_version),
+                "pending_application_fact_version": evidence.as_ref().and_then(|value| value.pending_application_fact_version),
+                "current_scope_complete": scope_complete, "history_reports_complete": false,
+                "risk_generation": risk.map(|(generation, _)| generation),
+                "risk_age_ms": risk.map(|(_, age)| age), "max_risk_age_ms": max_risk_age_ms,
+                "unresolved_commands": unresolved,
+                "position_handoff": handoff_evidence,
+                "permissions": {
+                    "increase_risk": permissions.increase_risk,
+                    "verified_reduce_only": permissions.verified_reduce_only,
+                    "targeted_cancel": permissions.targeted_cancel,
+                },
+            })
+        })
     }
 
     fn spawn_task<F>(&self, description: &'static str, future: F) -> anyhow::Result<()>
@@ -850,7 +1056,23 @@ impl BinancePapiExecutionClient {
                     .values()
                     .flatten()
                     .all(|position| Self::position_report_applied(&cache, position));
-                orders_applied && fills_applied && positions_applied
+                if !(orders_applied && fills_applied && positions_applied) {
+                    return false;
+                }
+
+                if let Some(handoff) = self.position_handoff.as_ref()
+                    && let Err(e) = handoff.verify_applied(&cache, report)
+                {
+                    if let Some(acknowledger) = self.application_acknowledger.lock().as_ref() {
+                        acknowledger
+                            .restrict_recovery("Position handoff engine application failed");
+                    }
+                    *self.position_handoff_failure.lock() = Some(e.to_string());
+                    log::warn!("PAPI position handoff application was rejected: {e}");
+                    return false;
+                }
+                *self.position_handoff_failure.lock() = None;
+                true
             }
         }
     }
@@ -1120,11 +1342,25 @@ impl ExecutionClient for BinancePapiExecutionClient {
         }
     }
 
+    fn recovered_position_strategy(
+        &self,
+        report: &PositionStatusReport,
+    ) -> anyhow::Result<Option<StrategyId>> {
+        match &self.position_handoff {
+            Some(handoff) => handoff.strategy_for(report).inspect_err(|e| {
+                *self.position_handoff_failure.lock() = Some(e.to_string());
+            }),
+            None => Ok(None),
+        }
+    }
+
     fn native_capital_check(&self) -> Option<NativeCapitalCheck> {
         self.config.trading.as_ref()?;
         let coordinator = Arc::clone(&self.coordinator);
         let trading_connected = Arc::clone(&self.trading_connected);
         let risk_refresh = Arc::clone(&self.risk_refresh);
+        let position_handoff = self.position_handoff.clone();
+        let position_handoff_failure = Arc::clone(&self.position_handoff_failure);
         let account_id = self.core.account_id;
         let client_id = self.core.client_id;
 
@@ -1143,6 +1379,17 @@ impl ExecutionClient for BinancePapiExecutionClient {
 
             if risk_refresh.hard_refresh_pending() {
                 return deny("PAPI account risk refresh is pending".to_string());
+            }
+
+            let handoff_check = require_position_handoff_authority(
+                position_handoff.as_deref(),
+                &position_handoff_failure,
+            );
+
+            if let Err(e) = handoff_check {
+                return deny(format!(
+                    "PAPI position handoff authority is unavailable: {e}"
+                ));
             }
 
             if request.full_position_exit || request.orders.len() != 1 {
@@ -1518,6 +1765,19 @@ impl ExecutionClient for BinancePapiExecutionClient {
         };
         let operation_id = operation.operation_id;
 
+        let handoff_check = require_position_handoff_authority(
+            self.position_handoff.as_deref(),
+            &self.position_handoff_failure,
+        );
+
+        if let Err(e) = handoff_check {
+            self.emitter.emit_order_denied(
+                &order,
+                &format!("PAPI position handoff authority is unavailable: {e}"),
+            );
+            return Ok(());
+        }
+
         if let Err(e) = self
             .coordinator
             .lock()
@@ -1534,10 +1794,16 @@ impl ExecutionClient for BinancePapiExecutionClient {
         let barrier_emitter = emitter.clone();
         let barrier_order = order.clone();
         let task_order = order.clone();
+        let position_handoff = self.position_handoff.clone();
+        let position_handoff_failure = Arc::clone(&self.position_handoff_failure);
 
         if let Err(e) = self.spawn_task("submit_order", async move {
             let result = reader
                 .dispatch_submit(&coordinator, operation_id, move || {
+                    require_position_handoff_authority(
+                        position_handoff.as_deref(),
+                        &position_handoff_failure,
+                    )?;
                     barrier_emitter.try_emit_order_submitted(&barrier_order)
                 })
                 .await;
@@ -2029,6 +2295,40 @@ mod tests {
         }
     }
 
+    #[rstest]
+    fn recovery_factory_does_not_retain_native_journal_ownership() {
+        install_exec_event_sender();
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("commands.journal");
+        let config = BinancePapiExecutionClientConfig {
+            read_only: Some(testing::config("http://127.0.0.1:1")),
+            instrument_ids: vec![InstrumentId::from("BTCUSDT-PERP.BINANCE")],
+            trading: Some(trading_config(path.clone())),
+            ..Default::default()
+        };
+        let factory = BinancePapiExecutionClientFactory::new();
+        let mut client = factory
+            .create(
+                TraderId::from("TRADER-001"),
+                "PAPI-OWNERSHIP",
+                &config,
+                Rc::new(RefCell::new(Cache::default())).into(),
+                Rc::new(RefCell::new(VirtualClock::new())),
+            )
+            .unwrap();
+        client.start().unwrap();
+        assert!(
+            crate::trading::journal::PapiCommandJournal::open(&path, config.account_id).is_err()
+        );
+        drop(client);
+        let state: serde_json::Value =
+            serde_json::from_str(&factory.recovery_state_json("PAPI-OWNERSHIP").unwrap()).unwrap();
+        assert_eq!(state["status"], "stopped");
+        assert!(
+            crate::trading::journal::PapiCommandJournal::open(&path, config.account_id).is_ok()
+        );
+    }
+
     fn trading_client(server: &MockServer, path: std::path::PathBuf) -> Box<dyn ExecutionClient> {
         install_exec_event_sender();
         let cache = Rc::new(RefCell::new(Cache::default()));
@@ -2326,6 +2626,8 @@ mod tests {
         let (mut harness, client) =
             connected_recovery_client(&server, url, directory.path().join("commands.journal"))
                 .await;
+        let recovery_reader = client.recovery_reader();
+        assert_ne!(recovery_reader.snapshot()["status"], "ready");
         let acknowledger = client.application_acknowledger.lock().clone().unwrap();
         let coordinator = Arc::clone(&client.coordinator);
         let reader = client.reader().unwrap();
@@ -2336,6 +2638,12 @@ mod tests {
                     .increase_risk_allowed())
                 .await
         );
+        let ready = recovery_reader.snapshot();
+        assert_eq!(ready["status"], "ready");
+        assert_eq!(ready["permissions"]["increase_risk"], true);
+        assert_eq!(ready["current_scope_complete"], true);
+        assert_eq!(ready["history_reports_complete"], false);
+        assert!(ready["valid_for_ms"].as_u64().unwrap() > 0);
         let queued = engine_limit_order("GAP-QUEUED", TimeInForce::Gtc, false);
         let command = SubmitOrder::from_order(
             &queued,
@@ -2367,6 +2675,14 @@ mod tests {
                 .await
                 .unwrap();
         }
+
+        let recovering = recovery_reader.snapshot();
+        assert_ne!(recovering["status"], "ready");
+        assert_eq!(recovering["permissions"]["increase_risk"], false);
+        assert!(
+            recovering["transport_revision"].as_u64().unwrap()
+                > ready["transport_revision"].as_u64().unwrap()
+        );
 
         // This command was admitted before the gap but has not crossed the HTTP barrier
         let queued_result = reader
@@ -2407,6 +2723,7 @@ mod tests {
         .await;
         assert!(acknowledger.applied_refresh_checkpoint().is_err());
         assert!(!acknowledger.increase_risk_allowed());
+        assert_ne!(recovery_reader.snapshot()["status"], "ready");
 
         assert!(
             harness
@@ -2414,6 +2731,7 @@ mod tests {
                     .increase_risk_allowed())
                 .await
         );
+        assert_eq!(recovery_reader.snapshot()["status"], "ready");
         let accepted = engine_limit_order("GAP-RECOVERED", TimeInForce::Gtc, false);
         harness.submit_via_risk(&accepted);
         assert!(

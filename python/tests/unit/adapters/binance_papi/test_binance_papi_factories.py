@@ -51,7 +51,9 @@ def test_config_and_factory_share_core_types() -> None:
         papi.BinancePapiExecutionClientConfig
         is _libnautilus.binance_papi.BinancePapiExecutionClientConfig
     )
-    assert papi.BinancePapiExecutionClientFactory().name() == "BINANCE_PAPI"
+    factory = papi.BinancePapiExecutionClientFactory()
+    assert factory.name() == "BINANCE_PAPI"
+    assert factory.recovery_state_json("UNREGISTERED") is None
     assert BinanceExecutionClientFactory().name() == "BINANCE"
     assert papi.BINANCE_PAPI_VENUE == BINANCE_VENUE
 

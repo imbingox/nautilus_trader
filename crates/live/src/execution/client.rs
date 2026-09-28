@@ -217,6 +217,13 @@ impl ExecutionClient for LiveExecutionClient {
         self.client.borrow().recovered_order_strategy(report)
     }
 
+    fn recovered_position_strategy(
+        &self,
+        report: &PositionStatusReport,
+    ) -> anyhow::Result<Option<StrategyId>> {
+        self.client.borrow().recovered_position_strategy(report)
+    }
+
     fn on_execution_report_applied(&self, report: &ExecutionReport) {
         self.client.borrow().on_execution_report_applied(report);
     }

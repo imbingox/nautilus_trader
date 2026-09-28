@@ -152,6 +152,7 @@ pub struct ExecutionManager {
     position_activity_revisions: IndexMap<InstrumentAccountKey, u64>,
     position_recon: IndexMap<InstrumentAccountKey, PositionReconciliationState>,
     position_recon_tolerances: IndexMap<AccountId, Decimal>,
+    position_handoff_owner: Option<(AccountId, InstrumentId, StrategyId)>,
 }
 
 impl Debug for ExecutionManager {
@@ -175,6 +176,7 @@ impl Debug for ExecutionManager {
             .field("position_activity_revisions", &self.position_activity_revisions)
             .field("position_recon", &self.position_recon)
             .field("position_recon_tolerances", &self.position_recon_tolerances)
+            .field("position_handoff_owner", &self.position_handoff_owner)
             .finish()
     }
 }
@@ -210,6 +212,7 @@ impl ExecutionManager {
             position_activity_revisions: IndexMap::new(),
             position_recon: IndexMap::new(),
             position_recon_tolerances: IndexMap::new(),
+            position_handoff_owner: None,
         })
     }
 
@@ -487,6 +490,35 @@ impl ExecutionManager {
         }
 
         self.validate_mass_status_order_sources(mass_status);
+
+        // An exact position handoff supersedes pre-handoff external fill history only for
+        // an empty position cache. The external orders themselves retain their ownership.
+        let mut handed_off_position_snapshots = IndexMap::new();
+
+        for reports in mass_status.position_reports().values() {
+            for report in reports {
+                let owner = exec_engine
+                    .borrow()
+                    .get_client(&mass_status.client_id)
+                    .and_then(|client| client.recovered_position_strategy(report).ok().flatten());
+                if owner.is_some()
+                    && self
+                        .cache
+                        .borrow()
+                        .positions_open(
+                            None,
+                            Some(&report.instrument_id),
+                            None,
+                            Some(&report.account_id),
+                            None,
+                        )
+                        .is_empty()
+                {
+                    handed_off_position_snapshots
+                        .insert((report.account_id, report.instrument_id), report.ts_last);
+                }
+            }
+        }
 
         // Publish raw reports before any state mutation (including fill adjustment
         // below, which can synthesize replacement order/fill reports). The
@@ -999,12 +1031,15 @@ impl ExecutionManager {
 
         for event in &events {
             if let OrderEventAny::Filled(fill) = event
-                && should_project_fill(
+                && (should_project_fill(
                     fill,
                     &retained_fill_state,
                     &reported_fill_keys,
                     &order_only_venue_order_ids,
-                )
+                ) || (fill.strategy_id.is_external()
+                    && handed_off_position_snapshots
+                        .get(&(fill.account_id, fill.instrument_id))
+                        .is_some_and(|snapshot_time| fill.ts_event <= *snapshot_time)))
             {
                 exec_engine.borrow_mut().project_reconciliation_fill(fill);
             } else {
@@ -1062,11 +1097,28 @@ impl ExecutionManager {
                         continue;
                     }
 
-                    if let Some(position_events) = self.reconcile_position_report(
+                    let owner = exec_engine
+                        .borrow()
+                        .get_client(&mass_status.client_id)
+                        .map(|client| client.recovered_position_strategy(&report))
+                        .transpose();
+                    let owner = match owner {
+                        Ok(owner) => owner.flatten(),
+                        Err(e) => {
+                            log::error!("Cannot recover position {}: {e}", report.instrument_id);
+                            continue;
+                        }
+                    };
+                    self.position_handoff_owner = owner
+                        .map(|strategy| (mass_status.account_id, report.instrument_id, strategy));
+                    let position_events = self.reconcile_position_report(
                         &report,
                         mass_status.account_id,
                         &instruments_with_unattributed_fills,
-                    ) {
+                    );
+                    self.position_handoff_owner = None;
+
+                    if let Some(position_events) = position_events {
                         for event in position_events {
                             exec_engine.borrow_mut().process(&event);
                             events.push(event);
@@ -4317,7 +4369,11 @@ impl ExecutionManager {
         commission_client: Option<&dyn ExecutionClient>,
     ) -> (Vec<OrderEventAny>, Option<ExternalOrderMetadata>) {
         let recovered_strategy = if is_synthetic {
-            None
+            self.position_handoff_owner
+                .filter(|(account, instrument, _)| {
+                    *account == account_id && *instrument == report.instrument_id
+                })
+                .map(|(_, _, strategy)| strategy)
         } else {
             match commission_client
                 .map(|client| client.recovered_order_strategy(report))

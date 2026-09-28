@@ -44,6 +44,7 @@
 pub mod config;
 pub mod consts;
 pub mod factories;
+pub mod position_handoff;
 pub mod read_only;
 pub mod websocket;
 
@@ -53,6 +54,7 @@ pub mod python;
 mod execution;
 mod http;
 mod observations;
+mod recovery;
 mod reports;
 #[allow(
     dead_code,

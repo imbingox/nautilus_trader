@@ -238,6 +238,15 @@ impl PapiCommandCoordinator {
         Ok(())
     }
 
+    pub(crate) fn risk_evidence_age(&self, now: Instant) -> Option<(u64, u64)> {
+        let evidence = self.evidence.as_ref()?;
+        let age = now.checked_duration_since(evidence.observed_at)?;
+        Some((
+            evidence.generation,
+            u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
+        ))
+    }
+
     pub(crate) fn permissions(&self, now: Instant) -> PapiCommandPermissions {
         let evidence_current = self
             .evidence

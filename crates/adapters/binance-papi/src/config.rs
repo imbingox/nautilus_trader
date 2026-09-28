@@ -236,6 +236,8 @@ pub struct BinancePapiExecutionClientConfig {
     pub instrument_ids: Vec<InstrumentId>,
     /// Explicit trading opt-in and finite admission limits. `None` keeps trading disabled.
     pub trading: Option<BinancePapiTradingConfig>,
+    /// Exact position handoff and durable receipt bound to the host ownership context.
+    pub position_handoff_json: Option<String>,
 }
 
 impl Default for BinancePapiExecutionClientConfig {
@@ -245,6 +247,7 @@ impl Default for BinancePapiExecutionClientConfig {
             read_only: None,
             instrument_ids: Vec::new(),
             trading: None,
+            position_handoff_json: None,
         }
     }
 }
@@ -282,6 +285,12 @@ impl BinancePapiExecutionClientConfig {
                     .all(|id| id.venue.as_str() == "BINANCE"),
             "PAPI instrument IDs must be unique and use the BINANCE venue"
         );
+
+        if let Some(raw) = &self.position_handoff_json {
+            let handoff: crate::position_handoff::PapiPositionHandoffConfig =
+                serde_json::from_str(raw)?;
+            handoff.validate(self.account_id, &self.instrument_ids)?;
+        }
 
         if let Some(trading) = &self.trading {
             trading.validate()?;

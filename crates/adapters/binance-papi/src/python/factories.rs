@@ -28,6 +28,15 @@ impl BinancePapiExecutionClientFactory {
         Self::new()
     }
 
+    /// Returns a read-only snapshot from the named client created by this factory.
+    ///
+    /// A snapshot is sampled evidence, not a durable trading permit. Consumers must expire it
+    /// using `sampled_at_ns` and `valid_for_ms`; native admission remains authoritative.
+    #[pyo3(name = "recovery_state_json")]
+    fn py_recovery_state_json(&self, client_id: &str) -> Option<String> {
+        self.recovery_state_json(client_id)
+    }
+
     #[pyo3(name = "name")]
     fn py_name(&self) -> &'static str {
         BINANCE_PAPI

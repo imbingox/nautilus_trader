@@ -509,6 +509,27 @@ rebaseline, unsupported account states, unobserved historical/algo retention and
 remain open acceptance work. The rationale and detailed evidence are recorded in
 [ACCOUNT_VERIFICATION.md](ACCOUNT_VERIFICATION.md).
 
+## Execution recovery observations
+
+Retain the `BinancePapiExecutionClientFactory` passed to the node builder and call
+`factory.recovery_state_json(client_id)` to sample that exact native execution client. Factory
+clones share the observation registry. An unknown client returns `None`; a disposed client returns
+a stopped snapshot. This does not create an account session or expose an authorization setter.
+
+The versioned JSON identifies the account and declared instruments, session/recovery/transport
+revisions, delivered and applied fact versions, scope completion, risk generation and age, unresolved
+journal commands, and current native permissions. `status="ready"` means the native scoped recovery,
+engine application, and current increase-risk admission are satisfied. It does not transfer ownership
+of external orders or authorize a business strategy to trade. Historical report completeness remains
+explicitly false and is not used as proof that an unknown order is absent.
+
+Consumers expire snapshots using `sampled_at_ns` and `valid_for_ms` (at most one second and no longer
+than the remaining risk lifetime). A sample is not a durable trading permit: transport changes can
+revoke authority immediately, and each command still crosses native admission and dispatch checks.
+The `position_handoff` field reports an explicitly configured position handoff receipt; a missing
+handoff is `null`. Handoff verification failures prevent engine application acknowledgement and
+restrict the actual account session.
+
 ## Local tests
 
 ```bash

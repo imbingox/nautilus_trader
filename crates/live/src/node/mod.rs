@@ -977,6 +977,19 @@ impl LiveNode {
                             );
                         }
                     }
+
+                    // The manager applies startup reports outside the engine's runtime report
+                    // path. Notify the original client only after all cache mutations and
+                    // external order registration, so its own application checks can complete.
+                    let exec_engine = self.kernel.exec_engine.borrow();
+                    let source_client = exec_engine.get_client(&client_id).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Execution client {client_id} disappeared after startup reconciliation"
+                        )
+                    })?;
+                    source_client.on_execution_report_applied(&ExecutionReport::MassStatus(
+                        Box::new(mass_status),
+                    ));
                 }
                 Ok(None) => {
                     log::warn!(

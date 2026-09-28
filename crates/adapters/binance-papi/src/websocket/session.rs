@@ -234,6 +234,18 @@ impl Debug for PapiApplicationAcknowledger {
 }
 
 impl PapiApplicationAcknowledger {
+    pub(crate) fn restrict_recovery(&self, reason: &str) {
+        self.shared.restrict(reason.to_string());
+    }
+
+    pub(crate) fn recovery_evidence(&self) -> (BinancePapiRecoveryEvidence, u64) {
+        let evidence = self.shared.evidence.lock();
+        (
+            evidence.clone(),
+            self.shared.transport_revision.load(Ordering::Acquire),
+        )
+    }
+
     pub(crate) fn acknowledge(&self, checkpoint: PapiApplicationCheckpoint) -> anyhow::Result<()> {
         acknowledge_application(&self.shared, checkpoint)
     }
