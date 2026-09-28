@@ -9,7 +9,7 @@ conflicts with the official `nautilus-trader` distribution.
 | Field               | Value                                                       |
 | ------------------- | ----------------------------------------------------------- |
 | Distribution        | `nautilus-trader-papi`                                      |
-| Version             | `2.0.0rc9`                                                  |
+| Version             | `2.0.0rc10`                                                 |
 | Python              | CPython 3.14, GIL build                                     |
 | ABI                 | `cp314`                                                     |
 | Platform            | Linux x86_64                                                |
@@ -17,7 +17,7 @@ conflicts with the official `nautilus-trader` distribution.
 | Build profile       | Cargo `release`                                             |
 | Python extension    | Full `nautilus-pyo3` extension with high precision and PAPI |
 | Source distribution | Not published                                               |
-| Release tag         | `papi-v2.0.0rc9`                                            |
+| Release tag         | `papi-v2.0.0rc10`                                           |
 
 The upstream baseline is
 `46a5658a2f66cf0a798d414dc1b63d98cf10fcc1`. The PAPI feature head before upstream integration is
@@ -30,28 +30,27 @@ The version belongs to this distribution. Increment it for every changed PAPI re
 even when the upstream Python version remains unchanged. PyPI files are immutable, so never rebuild
 different bytes under an uploaded version.
 
-## Changes in 2.0.0rc9
+## Changes in 2.0.0rc10
 
-Risk-increasing orders are blocked as soon as the private stream disconnects and remain blocked
-until the current recovery baseline has been applied by the execution engine and fresh risk
-evidence has been acknowledged. Queued commands and stale recovery generations cannot reuse a
-previous trading authorization. Existing reduction and cancellation policies remain in effect.
+The production execution factory exposes current recovery evidence through
+`recovery_state_json(client_id)`, including generation, scope, freshness, engine application
+progress, and operation permissions. Readers do not retain native journal ownership.
 
-After a restart with an empty Cache, exact durable submission records restore the original
-strategy owner during both startup and runtime reconciliation. Account, instrument, order terms,
-and known venue identity must match; conflicting evidence does not create an external order.
-Recovery continues to use bounded reads without replaying unresolved submissions. The journal
-format is unchanged.
+Explicit position handoff verifies the stable strategy context and current venue position before
+persisting an applied receipt. External orders retain their original ownership, and fills already
+covered by the position snapshot do not duplicate recovered positions. Startup reconciliation
+notifies the source execution client after applying recovered positions. Missing receipts and
+foreign open orders prevent new risk-increasing orders.
 
-These fixes address fork issue #9. Regression coverage uses loopback HTTP/WebSocket servers and
-native execution and reconciliation paths. This release adds no live trading acceptance claim.
+These changes support nacre_trader issue #48. The rc9 recovery admission and journal ownership
+fixes remain in effect. Validation uses loopback HTTP/WebSocket fixtures, real wheel/client/engine
+paths, and isolated persistence. This release adds no live trading acceptance claim.
 
 ## Downstream dependency audit
 
 The wheel declares no runtime dependency on the official distribution. A repository scan found no
-dependency on `nautilus-trader` inside this fork. The local `nacre_trader` project has a `worker`
-extra pinned to `nautilus_trader==1.230.0`; that extra cannot coexist with this package and must be
-changed to an explicit `nautilus-trader-papi` version before that worker environment adopts PAPI.
+dependency on `nautilus-trader` inside this fork. The `nacre_trader` project uses a `worker` extra pinned to `nautilus-trader-papi`; its release
+upgrade must pin the new published version and artifact hash before delivery.
 Do not use an empty compatibility package or a permanent `--no-deps` installation to bypass the
 declared dependency.
 
@@ -77,7 +76,7 @@ bash scripts/papi-release/verify-wheel.bash dist/papi
 python3 scripts/papi-release/generate-manifest.py \
   --wheel-dir dist/papi \
   --source-ref <release-commit-or-tag> \
-  --tag papi-v2.0.0rc9 \
+  --tag papi-v2.0.0rc10 \
   --output dist/papi/release-manifest.json
 ```
 
@@ -112,6 +111,13 @@ The release does not broaden the adapter's trading scope. Additional live accept
 separate operator decision with explicit account, action, and size; packaging work never authorizes
 orders or account changes.
 
+## Candidate builds
+
+The manually dispatched `.github/workflows/papi-build.yml` builds and verifies the selected commit
+using the same release builder and Linux/Python baseline. It uploads the wheel, verification report,
+and source commit as `papi-build-candidate`, without publishing permissions. Candidate verification
+does not replace the signed-tag and index verification requirements for a published release.
+
 ## Trusted Publishing and promotion
 
 The workflow template is stored outside `.github` at
@@ -127,7 +133,7 @@ release tag and require approval where the GitHub plan supports it.
 The promotion sequence is:
 
 1. Merge the validated release branch into `main` without changing the candidate tree.
-2. Create signed tag `papi-v2.0.0rc9` at that exact commit.
+2. Create signed tag `papi-v2.0.0rc10` at that exact commit.
 3. Build and verify the wheel once, then freeze its SHA-256 manifest.
 4. Upload the frozen wheel to TestPyPI through the protected OIDC job.
 5. Run `verify-index.bash testpypi ...`; it downloads the file, compares SHA-256, and repeats the
