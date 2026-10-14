@@ -27,6 +27,13 @@ increase-risk submission remains fail-closed until authenticated PM risk evidenc
 Construction performs no network requests. Cleanup is idempotent, bounded, and a later start uses
 a new cancellation domain.
 
+Quiet accounts also renew current-state risk evidence: the refresh worker wakes after one third
+of `max_risk_age_ms` (at least one second) and uses the same bounded 3-5 second coalescing window,
+REST collection, and engine application acknowledgement as event-triggered refreshes. Collection
+failures retry without extending the installed evidence's age. Expired evidence continues to block
+commands until a fresh, complete collection is applied; no private stream event or reconnect is
+required for renewal. Periodic refreshes do not scan history or reset command reservations.
+
 The independent factory name and default client ID are `BINANCE_PAPI`. Instrument venue
 remains `BINANCE`. The default account ID is `BINANCE-PAPI-001`, keeping its issuer
 aligned with the venue used by the core account cache. Use `BinanceDataClientFactory`, `BinanceDataClientConfig` and

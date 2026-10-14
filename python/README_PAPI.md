@@ -11,7 +11,7 @@ and copyright holder of the upstream project. Report fork-specific issues to the
 
 ## Supported wheel
 
-The `2.0.0rc10` release supports only:
+The `2.0.0rc11` release supports only:
 
 - CPython 3.14 with the GIL enabled
 - Linux x86_64 with a `manylinux_2_34` baseline
@@ -24,7 +24,7 @@ Install the exact binary release in a new virtual environment:
 
 ```bash
 python3.14 -m venv .venv
-.venv/bin/python -m pip install --only-binary=:all: nautilus-trader-papi==2.0.0rc10
+.venv/bin/python -m pip install --only-binary=:all: nautilus-trader-papi==2.0.0rc11
 ```
 
 Do not install `nautilus-trader` and `nautilus-trader-papi` together. Both distributions provide
@@ -56,7 +56,7 @@ has applied the current baseline and fresh risk evidence is acknowledged. Restar
 restores the original strategy owner from matching durable submission records even with an empty
 Cache, without replaying unresolved orders. The command journal format is unchanged.
 
-## Recovery evidence and position handoff in 2.0.0rc10
+## Recovery evidence and position handoff in 2.0.0rc11
 
 The production `BinancePapiExecutionClientFactory` exposes `recovery_state_json(client_id)`
 for the same execution client used by the Node. Evidence includes scope, generation, freshness,
