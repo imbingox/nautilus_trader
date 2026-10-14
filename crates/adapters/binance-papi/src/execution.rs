@@ -240,10 +240,16 @@ async fn run_risk_refresh_worker(
     control: Arc<PapiRiskRefreshControl>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
+    let refresh_interval = Duration::from_millis((trading.max_risk_age_ms / 3).max(1_000));
+
     loop {
         tokio::select! {
             biased;
             () = cancel.cancelled() => return Ok(()),
+            () = nautilus_common::live::dst::time::sleep(refresh_interval) => {
+                // Quiet accounts still need current risk evidence; renew through engine application
+                control.mark_dirty(0, false);
+            }
             () = control.notify.notified() => {}
         }
 
@@ -2562,6 +2568,7 @@ mod tests {
         server: &MockServer,
         websocket_url: String,
         journal_path: std::path::PathBuf,
+        max_risk_age_ms: u64,
     ) -> (ExecutionHarness, BinancePapiExecutionClient) {
         let harness = ExecutionHarness::new(
             TraderId::from("TRADER-001"),
@@ -2573,7 +2580,7 @@ mod tests {
         read_only.websocket_url = SecretString::from(websocket_url);
         read_only.request_timeout = Duration::from_secs(3);
         let mut trading = trading_config(journal_path);
-        trading.max_risk_age_ms = 60_000;
+        trading.max_risk_age_ms = max_risk_age_ms;
         trading.max_risk_collection_span_ms = 10_000;
         let config = BinancePapiExecutionClientConfig {
             read_only: Some(read_only),
@@ -2595,6 +2602,86 @@ mod tests {
         client.start().unwrap();
         client.connect().await.unwrap();
         (harness, client)
+    }
+
+    #[tokio::test]
+    async fn quiet_account_renews_risk_and_recovers_after_collection_failure() {
+        let fault = Arc::new(AtomicBool::new(false));
+        let server_fault = Arc::clone(&fault);
+        let server = MockServer::new(move |request| {
+            if request.path == "/papi/v1/um/leverageBracket" && server_fault.load(Ordering::Acquire)
+            {
+                return Reply::json(&json!([]));
+            }
+            current_trading_reply(request)
+        })
+        .await;
+        let directory = TempDir::new().unwrap();
+        let (url, _close, websocket) = recovery_websocket().await;
+        let (mut harness, client) = connected_recovery_client(
+            &server,
+            url,
+            directory.path().join("commands.journal"),
+            10_000,
+        )
+        .await;
+        let recovery_reader = client.recovery_reader();
+        harness.register_client(Box::new(client)).unwrap();
+        assert!(
+            harness
+                .pump_until(Duration::from_secs(3), |_| {
+                    recovery_reader.snapshot()["status"] == "ready"
+                })
+                .await
+        );
+        let before = recovery_reader.snapshot();
+
+        // No private account events are sent during more than two evidence lifetimes
+        for _ in 0..110 {
+            harness.pump_for(Duration::from_millis(200)).await;
+            let current = recovery_reader.snapshot();
+            assert_eq!(current["status"], "ready");
+            assert_eq!(current["permissions"]["increase_risk"], true);
+            assert_eq!(
+                current["received_fact_version"],
+                before["received_fact_version"]
+            );
+        }
+        let renewed = recovery_reader.snapshot();
+        assert!(
+            renewed["risk_generation"].as_u64().unwrap()
+                >= before["risk_generation"].as_u64().unwrap() + 2
+        );
+        fault.store(true, Ordering::Release);
+        harness.pump_for(Duration::from_secs(11)).await;
+        let expired = recovery_reader.snapshot();
+        assert_eq!(expired["status"], "restricted");
+        assert_eq!(expired["permissions"]["increase_risk"], false);
+        assert!(
+            expired["risk_age_ms"].as_u64().unwrap() > expired["max_risk_age_ms"].as_u64().unwrap()
+        );
+        fault.store(false, Ordering::Release);
+        assert!(
+            harness
+                .pump_until(Duration::from_secs(8), |_| {
+                    recovery_reader.snapshot()["status"] == "ready"
+                })
+                .await
+        );
+        let recovered = recovery_reader.snapshot();
+        assert_eq!(recovered["permissions"]["increase_risk"], true);
+        assert_eq!(
+            recovered["transport_revision"],
+            before["transport_revision"]
+        );
+        assert!(
+            !server
+                .requests()
+                .iter()
+                .any(|request| { request.path == "/papi/v1/um/order" && request.method == "POST" })
+        );
+        harness.exec_engine().borrow_mut().stop_clients();
+        websocket.abort();
     }
 
     #[rstest]
@@ -2623,9 +2710,13 @@ mod tests {
         .await;
         let directory = TempDir::new().unwrap();
         let (url, close, websocket) = recovery_websocket().await;
-        let (mut harness, client) =
-            connected_recovery_client(&server, url, directory.path().join("commands.journal"))
-                .await;
+        let (mut harness, client) = connected_recovery_client(
+            &server,
+            url,
+            directory.path().join("commands.journal"),
+            60_000,
+        )
+        .await;
         let recovery_reader = client.recovery_reader();
         assert_ne!(recovery_reader.snapshot()["status"], "ready");
         let acknowledger = client.application_acknowledger.lock().clone().unwrap();
@@ -2809,9 +2900,13 @@ mod tests {
         resumed.store(true, Ordering::Release);
 
         let (url, _close, websocket) = recovery_websocket().await;
-        let (mut second, client) =
-            connected_recovery_client(&server, url, directory.path().join("papi-commands.journal"))
-                .await;
+        let (mut second, client) = connected_recovery_client(
+            &server,
+            url,
+            directory.path().join("papi-commands.journal"),
+            60_000,
+        )
+        .await;
         let report = client
             .pending_application
             .lock()
