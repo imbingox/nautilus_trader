@@ -15,6 +15,7 @@ use nautilus_common::messages::execution::{BatchCancelOrders, CancelOrder, Submi
 use nautilus_model::{
     enums::{OrderSide, OrderType, TimeInForce},
     identifiers::AccountId,
+    orders::{Order, OrderAny},
 };
 use thiserror::Error;
 
@@ -152,6 +153,47 @@ pub(crate) fn cancel_operation(
         command: PapiPersistedCommand::Cancel { venue_order_id },
         reservation: None,
     })
+}
+
+/// Validates engine ownership and pins the venue identity before journaling a cancel.
+pub(crate) fn validate_cancel_order(
+    mut operation: PapiPersistedOperation,
+    order: &OrderAny,
+) -> Result<PapiPersistedOperation, CommandValidationError> {
+    if operation.strategy_id != order.strategy_id()
+        || operation.strategy_id.is_external()
+        || operation.instrument_id != order.instrument_id()
+        || operation.client_order_id != order.client_order_id()
+        || order
+            .account_id()
+            .is_some_and(|account| account != operation.account_id)
+        || order.is_closed()
+        || !matches!(order.order_type(), OrderType::Market | OrderType::Limit)
+    {
+        return Err(CommandValidationError::Identity);
+    }
+    let PapiPersistedCommand::Cancel { venue_order_id } = &mut operation.command else {
+        return Err(CommandValidationError::Identity);
+    };
+
+    if let Some(cached_id) = order.venue_order_id() {
+        if order.account_id() != Some(operation.account_id) {
+            return Err(CommandValidationError::Identity);
+        }
+        let symbol =
+            nautilus_binance::common::symbol::format_binance_symbol(&operation.instrument_id);
+        let (family, id) = decode_order_id(cached_id, &symbol)
+            .map_err(|_| CommandValidationError::VenueOrderId)?;
+
+        if family != OrderFamily::Ordinary || venue_order_id.is_some_and(|expected| expected != id)
+        {
+            return Err(CommandValidationError::VenueOrderId);
+        }
+        *venue_order_id = Some(id);
+    } else if venue_order_id.is_some() {
+        return Err(CommandValidationError::VenueOrderId);
+    }
+    Ok(operation)
 }
 
 pub(crate) fn batch_cancel_operations(

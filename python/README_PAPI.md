@@ -11,7 +11,7 @@ and copyright holder of the upstream project. Report fork-specific issues to the
 
 ## Supported wheel
 
-The `2.0.0rc11` release supports only:
+The `2.0.0rc12` release supports only:
 
 - CPython 3.14 with the GIL enabled
 - Linux x86_64 with a `manylinux_2_34` baseline
@@ -24,7 +24,7 @@ Install the exact binary release in a new virtual environment:
 
 ```bash
 python3.14 -m venv .venv
-.venv/bin/python -m pip install --only-binary=:all: nautilus-trader-papi==2.0.0rc11
+.venv/bin/python -m pip install --only-binary=:all: nautilus-trader-papi==2.0.0rc12
 ```
 
 Do not install `nautilus-trader` and `nautilus-trader-papi` together. Both distributions provide
@@ -55,6 +55,13 @@ Risk-increasing orders remain blocked during private-stream recovery until the e
 has applied the current baseline and fresh risk evidence is acknowledged. Restart reconciliation
 restores the original strategy owner from matching durable submission records even with an empty
 Cache, without replaying unresolved orders. The command journal format is unchanged.
+
+## Cancellation of claimed orders in 2.0.0rc12
+
+A strategy can cancel its recovered ordinary UM orders through the standard single, batch, and
+cancel-all APIs without the original Submit journal entry. Cancellation uses the engine's current
+order ownership and venue identity. The journal records the new cancellation and its recovery;
+no position handoff or fabricated submission history is required.
 
 ## Recovery evidence and position handoff in 2.0.0rc11
 

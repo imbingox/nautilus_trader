@@ -5860,6 +5860,7 @@ dependencies = [
  "nautilus-network",
  "nautilus-portfolio",
  "nautilus-system",
+ "nautilus-trading",
  "parking_lot",
  "pyo3",
  "pyo3-async-runtimes",

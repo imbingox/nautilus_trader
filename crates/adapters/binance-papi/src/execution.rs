@@ -66,7 +66,9 @@ use crate::{
     recovery::PapiRecoveryReader,
     reports::parse::{OrderFamily, venue_order_id},
     trading::{
-        commands::{batch_cancel_operations, cancel_operation, submit_operation},
+        commands::{
+            batch_cancel_operations, cancel_operation, submit_operation, validate_cancel_order,
+        },
         coordinator::{
             CoordinatorDispatchError, PapiCancelPreparation, PapiCommandCoordinator,
             PapiRebaselineToken, PapiVerifiedRiskSnapshot,
@@ -745,9 +747,29 @@ impl BinancePapiExecutionClient {
         operations: Vec<PapiPersistedOperation>,
     ) -> anyhow::Result<()> {
         let mut scoped = Vec::with_capacity(operations.len());
+        let mut validation_error = None;
+
         for operation in operations {
             let order = self.core.get_order(&operation.client_order_id)?;
-            scoped.push((operation, order));
+            match validate_cancel_order(operation.clone(), &order) {
+                Ok(operation) => scoped.push((operation, order)),
+                Err(e) => {
+                    validation_error.get_or_insert(e);
+                    scoped.push((operation, order));
+                }
+            }
+        }
+
+        if let Some(e) = validation_error {
+            for (_, order) in &scoped {
+                self.emitter.emit_order_cancel_rejected(
+                    order,
+                    order.venue_order_id(),
+                    &e.to_string(),
+                    get_atomic_clock_realtime().get_time_ns(),
+                );
+            }
+            return Ok(());
         }
         let reader = match self.trading_reader() {
             Ok(reader) => reader,
@@ -1880,7 +1902,9 @@ impl ExecutionClient for BinancePapiExecutionClient {
                 return Ok(());
             }
         };
-        let operation = match cancel_operation(&cmd, self.core.account_id) {
+        let operation = match cancel_operation(&cmd, self.core.account_id)
+            .and_then(|operation| validate_cancel_order(operation, &order))
+        {
             Ok(operation) => operation,
             Err(e) => {
                 self.emitter.emit_order_cancel_rejected(
@@ -1954,12 +1978,25 @@ impl ExecutionClient for BinancePapiExecutionClient {
     }
 
     fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
+        let orders = self
+            .core
+            .cache()
+            .orders(
+                None,
+                Some(&cmd.instrument_id),
+                Some(&cmd.strategy_id),
+                None,
+                cmd.order_side,
+            )
+            .iter()
+            .map(|order| order.cloned())
+            .collect::<Vec<_>>();
         let operations = match self
             .coordinator
             .lock()
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("PAPI command coordinator is unavailable"))?
-            .plan_cancel_all(&cmd)
+            .plan_cancel_all(&cmd, &orders)
         {
             Ok(operations) => operations,
             Err(e) => {
@@ -2133,6 +2170,7 @@ mod tests {
         types::{Currency, Money, Price, Quantity},
     };
     use nautilus_portfolio::portfolio::Portfolio;
+    use nautilus_trading::strategy::Strategy;
     use rstest::rstest;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
@@ -2844,6 +2882,182 @@ mod tests {
         );
         harness.exec_engine().borrow_mut().stop_clients();
         websocket.abort();
+    }
+
+    #[rstest]
+    #[case("single")]
+    #[case("batch")]
+    #[case("all")]
+    #[case("partial")]
+    #[case("lost")]
+    #[case("race")]
+    #[tokio::test]
+    async fn claimed_order_cancels_through_engine_without_submit_journal(#[case] mode: &str) {
+        let partial = mode == "partial";
+        let race = mode == "race";
+        let lost = mode == "lost" || race;
+        let canceled = Arc::new(AtomicBool::new(false));
+        let server_canceled = Arc::clone(&canceled);
+        let order_time = get_atomic_clock_realtime().get_time_ns().as_u64() / 1_000_000 - 1000;
+        let server = MockServer::new(move |request| {
+            if matches!(
+                request.path.as_str(),
+                "/papi/v1/um/openOrders" | "/papi/v1/um/allOrders" | "/papi/v1/um/order"
+            ) {
+                let mut order = testing::order();
+                order["clientOrderId"] = json!("CLAIMED-001");
+                order["orderId"] = json!(42);
+                order["side"] = json!("BUY");
+                order["origQty"] = json!("0.002");
+                order["executedQty"] = json!(if partial { "0.001" } else { "0" });
+                order["avgPrice"] = json!(if partial { "30000.00" } else { "0" });
+                order["price"] = json!("30000.00");
+                order["time"] = json!(order_time);
+                order["updateTime"] = json!(order_time);
+
+                if request.method == "DELETE" {
+                    assert_eq!(request.params["orderId"], "42");
+                    server_canceled.store(true, Ordering::Release);
+
+                    if lost {
+                        return Reply::raw(503, r#"{"code":-1007,"msg":"Timeout"}"#);
+                    }
+                }
+
+                if race && server_canceled.load(Ordering::Acquire) {
+                    order["executedQty"] = json!("0.002");
+                    order["avgPrice"] = json!("30000.00");
+                }
+                order["status"] = json!(if race && server_canceled.load(Ordering::Acquire) {
+                    "FILLED"
+                } else if server_canceled.load(Ordering::Acquire) {
+                    "CANCELED"
+                } else if partial {
+                    "PARTIALLY_FILLED"
+                } else {
+                    "NEW"
+                });
+
+                if request.path == "/papi/v1/um/order" {
+                    return Reply::json(&order);
+                }
+                return Reply::json(&json!([order]));
+            }
+            current_trading_reply(request)
+        })
+        .await;
+        let (mut harness, directory) = engine_trading_harness(&server, false);
+        let journal_path = directory.path().join("papi-commands.journal");
+        harness
+            .exec_engine()
+            .borrow_mut()
+            .register_external_order_claims(
+                StrategyId::from("TEST-001"),
+                &std::collections::HashSet::from([harness.instrument_id()]),
+            )
+            .unwrap();
+        let id = ClientOrderId::from("CLAIMED-001");
+        let reader = testing::client(&server, &["BTCUSDT"]);
+        let report = reader
+            .generate_order_status_report(harness.instrument_id(), None, Some(id))
+            .await
+            .unwrap();
+        harness
+            .exec_engine()
+            .borrow_mut()
+            .reconcile_order_status_report(&report);
+        let order = harness.cache().borrow().order(&id).unwrap().clone();
+        assert_eq!(
+            order.status(),
+            if partial {
+                OrderStatus::PartiallyFilled
+            } else {
+                OrderStatus::Accepted
+            }
+        );
+        assert_eq!(order.strategy_id(), StrategyId::from("TEST-001"));
+
+        let mut strategy =
+            harness.register_exec_tester(order.strategy_id(), Quantity::from("0.001"));
+
+        match mode {
+            "single" | "partial" | "lost" | "race" => strategy
+                .cancel_order(id, Some(harness.client_id()), None)
+                .unwrap(),
+            "batch" => strategy
+                .cancel_orders(vec![id], Some(harness.client_id()), None)
+                .unwrap(),
+            "all" => strategy
+                .cancel_all_orders(
+                    order.instrument_id(),
+                    Some(OrderSide::Buy),
+                    Some(harness.client_id()),
+                    false,
+                    None,
+                )
+                .unwrap(),
+            _ => unreachable!(),
+        }
+
+        if lost {
+            harness.pump_for(Duration::from_millis(100)).await;
+            assert_ne!(
+                harness.cache().borrow().order(&id).unwrap().status(),
+                OrderStatus::Canceled
+            );
+            strategy
+                .query_order(&order, Some(harness.client_id()), None)
+                .unwrap();
+        }
+        assert!(
+            harness
+                .pump_until(Duration::from_secs(3), |cache| {
+                    cache.order(&id).is_some_and(|order| {
+                        order.status()
+                            == if race {
+                                OrderStatus::Filled
+                            } else {
+                                OrderStatus::Canceled
+                            }
+                    })
+                })
+                .await
+        );
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|r| r.method == "DELETE")
+                .count(),
+            1
+        );
+        assert!(
+            !server
+                .requests()
+                .iter()
+                .any(|r| r.method == "POST" && r.path == "/papi/v1/um/order")
+        );
+        assert_eq!(
+            harness.cache().borrow().order(&id).unwrap().filled_qty(),
+            if race {
+                Quantity::from("0.002")
+            } else {
+                order.filled_qty()
+            }
+        );
+        let account_id = harness.account_id();
+        harness.exec_engine().borrow_mut().stop_clients();
+        drop(strategy);
+        drop(harness);
+        let journal =
+            crate::trading::journal::PapiCommandJournal::open(&journal_path, account_id).unwrap();
+        assert_eq!(journal.operations().len(), 1);
+        assert!(journal.operations().values().all(|operation| matches!(
+            operation.operation.command,
+            crate::trading::journal::PapiPersistedCommand::Cancel {
+                venue_order_id: Some(42)
+            }
+        )));
     }
 
     #[rstest]

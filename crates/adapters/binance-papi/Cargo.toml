@@ -78,6 +78,7 @@ pyo3-stub-gen = { workspace = true, optional = true }
 nautilus-live = { workspace = true, features = ["test-support"] }
 nautilus-model = { workspace = true, features = ["test-support"] }
 nautilus-portfolio = { workspace = true }
+nautilus-trading = { workspace = true }
 
 aws-lc-rs = { workspace = true }
 axum = { workspace = true }

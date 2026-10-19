@@ -22,12 +22,13 @@ use std::{
 };
 
 use nautilus_binance::common::symbol::format_binance_symbol;
-use nautilus_common::messages::execution::CancelAllOrders;
+use nautilus_common::messages::execution::{CancelAllOrders, CancelOrder};
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_live::execution::failure::CommandFailure;
 use nautilus_model::{
     enums::{OrderSide, OrderStatus, OrderType, TimeInForce},
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId},
+    orders::{Order, OrderAny},
     reports::OrderStatusReport,
     types::Currency,
 };
@@ -496,6 +497,32 @@ impl PapiCommandCoordinator {
             });
         }
 
+        if !self
+            .config
+            .instrument_limits
+            .iter()
+            .any(|limit| limit.instrument_id == operation.instrument_id)
+        {
+            return Err(CoordinatorError::UnsupportedInstrument(
+                operation.instrument_id,
+            ));
+        }
+
+        if matches!(
+            operation.command,
+            PapiPersistedCommand::Cancel {
+                venue_order_id: None
+            }
+        ) && !self.journal.unresolved().any(|target| {
+            target.operation.instrument_id == operation.instrument_id
+                && target.operation.client_order_id == operation.client_order_id
+                && matches!(target.operation.command, PapiPersistedCommand::Submit(_))
+        }) {
+            return Err(CoordinatorError::UnknownCancelTarget(
+                operation.client_order_id,
+            ));
+        }
+
         if self.unresolved_count() >= self.config.max_in_flight_operations {
             return Err(CoordinatorError::InFlightLimit);
         }
@@ -506,12 +533,11 @@ impl PapiCommandCoordinator {
             ));
         }
 
-        let target_generation = self
-            .target_generation(operation.instrument_id, operation.client_order_id)
-            .ok_or(CoordinatorError::UnknownCancelTarget(
-                operation.client_order_id,
-            ))?;
-        operation.generation = target_generation;
+        // Ownership was checked against the engine order before entering the coordinator
+        operation.generation = self
+            .evidence
+            .as_ref()
+            .map_or(0, |evidence| evidence.generation);
         operation.reservation = None;
         let cancel_operation_id = operation.operation_id;
         self.journal.append_prepared(operation)?;
@@ -520,72 +546,58 @@ impl PapiCommandCoordinator {
         })
     }
 
-    /// Freezes the currently owned ordinary UM targets within one cancel-all command scope.
+    /// Freezes engine-managed ordinary UM targets within one cancel-all command scope.
     pub(crate) fn plan_cancel_all(
         &self,
         command: &CancelAllOrders,
+        orders: &[OrderAny],
     ) -> Result<Vec<PapiPersistedOperation>, CoordinatorError> {
         if command.params.is_some() {
             return Err(CoordinatorError::InvalidCancelAll);
         }
-
-        let side = command.order_side.map(|side| match side {
-            OrderSide::Buy => PapiIntentSide::Buy,
-            OrderSide::Sell => PapiIntentSide::Sell,
-        });
         let mut targets = Vec::new();
 
-        for recovered in self.journal.operations().values() {
-            let PapiPersistedCommand::Submit(intent) = &recovered.operation.command else {
-                continue;
-            };
-
-            if recovered.operation.strategy_id != command.strategy_id
-                || recovered.operation.instrument_id != command.instrument_id
-                || side.is_some_and(|side| intent_side(intent) != side)
-                || self.has_unresolved_cancel(
-                    recovered.operation.instrument_id,
-                    recovered.operation.client_order_id,
-                )
+        for order in orders {
+            if order.trader_id() != command.trader_id
+                || order.strategy_id() != command.strategy_id
+                || order.instrument_id() != command.instrument_id
+                || order
+                    .account_id()
+                    .is_some_and(|id| id != self.journal.account_id())
+                || command
+                    .order_side
+                    .is_some_and(|side| side != order.order_side())
+                || order.is_closed()
+                || !(order.is_open()
+                    || order.is_inflight()
+                    || self
+                        .prepared_submit_target(order.instrument_id(), order.client_order_id())
+                        .is_some())
+                || self.has_unresolved_cancel(order.instrument_id(), order.client_order_id())
             {
                 continue;
             }
-
-            let evidence_order = self.matching_verified_open_order(&recovered.operation, intent);
-            let venue_order_id = match recovered.stage {
-                PapiOperationStage::Prepared
-                | PapiOperationStage::MayHaveDispatched
-                | PapiOperationStage::Unknown { .. } => None,
-                PapiOperationStage::Observed { venue_order_id } => Some(venue_order_id),
-                PapiOperationStage::Resolved { .. } => {
-                    let Some(order) = evidence_order else {
-                        continue;
-                    };
-                    Some(order.venue_order_id)
-                }
-            };
-            targets.push((recovered.operation.client_order_id, venue_order_id));
+            let cancel = CancelOrder::new(
+                command.trader_id,
+                command.client_id,
+                command.strategy_id,
+                command.instrument_id,
+                order.client_order_id(),
+                order.venue_order_id(),
+                UUID4::new(),
+                command.ts_init,
+                None,
+                None,
+            );
+            let operation = super::commands::cancel_operation(&cancel, self.journal.account_id())?;
+            targets.push(super::commands::validate_cancel_order(operation, order)?);
         }
-
-        if targets.is_empty() {
-            return Err(CoordinatorError::EmptyCancelAll);
-        }
-
-        targets.sort_unstable_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
-        Ok(targets
-            .into_iter()
-            .map(|(client_order_id, venue_order_id)| PapiPersistedOperation {
-                operation_id: UUID4::new(),
-                account_id: self.journal.account_id(),
-                strategy_id: command.strategy_id,
-                instrument_id: command.instrument_id,
-                client_order_id,
-                generation: 0,
-                ts_init: command.ts_init,
-                command: PapiPersistedCommand::Cancel { venue_order_id },
-                reservation: None,
-            })
-            .collect())
+        targets.sort_unstable_by(|left, right| {
+            left.client_order_id
+                .as_str()
+                .cmp(right.client_order_id.as_str())
+        });
+        Ok(targets)
     }
 
     pub(crate) fn transition(
@@ -848,6 +860,14 @@ impl PapiCommandCoordinator {
             return Err(CoordinatorError::ReportTermsMismatch);
         }
         let venue_order_id = decode_ordinary_venue_order_id(report.venue_order_id.as_str())?;
+
+        if let PapiPersistedCommand::Cancel {
+            venue_order_id: Some(expected),
+        } = operation.command
+            && expected != venue_order_id
+        {
+            return Err(CoordinatorError::ReportIdentityMismatch);
+        }
 
         if matches!(current_stage, PapiOperationStage::Prepared) {
             return Err(CoordinatorError::ReportBeforeDispatch);
@@ -1254,20 +1274,7 @@ impl PapiCommandCoordinator {
                     return Err(CoordinatorError::RecoveryRestricted);
                 }
             }
-            PapiPersistedCommand::Cancel { .. } => {
-                let generation = self
-                    .target_generation(
-                        recovered.operation.instrument_id,
-                        recovered.operation.client_order_id,
-                    )
-                    .ok_or(CoordinatorError::UnknownCancelTarget(
-                        recovered.operation.client_order_id,
-                    ))?;
-
-                if generation != recovered.operation.generation {
-                    return Err(CoordinatorError::GenerationMismatch);
-                }
-            }
+            PapiPersistedCommand::Cancel { .. } => {}
         }
         Ok(())
     }
@@ -1907,58 +1914,6 @@ impl PapiCommandCoordinator {
             .then_some(operation.operation.operation_id)
         })
     }
-
-    fn target_generation(
-        &self,
-        instrument_id: InstrumentId,
-        client_order_id: ClientOrderId,
-    ) -> Option<u64> {
-        self.journal
-            .unresolved()
-            .find(|operation| {
-                operation.operation.instrument_id == instrument_id
-                    && operation.operation.client_order_id == client_order_id
-                    && matches!(operation.operation.command, PapiPersistedCommand::Submit(_))
-                    && !matches!(operation.stage, PapiOperationStage::Prepared)
-            })
-            .map(|operation| operation.operation.generation)
-            .or_else(|| {
-                let owned = self.journal.operations().values().find(|operation| {
-                    operation.operation.instrument_id == instrument_id
-                        && operation.operation.client_order_id == client_order_id
-                        && matches!(operation.operation.command, PapiPersistedCommand::Submit(_))
-                })?;
-                let PapiPersistedCommand::Submit(intent) = &owned.operation.command else {
-                    return None;
-                };
-                self.matching_verified_open_order(&owned.operation, intent)?;
-                self.evidence.as_ref().map(|evidence| evidence.generation)
-            })
-    }
-
-    fn matching_verified_open_order<'a>(
-        &'a self,
-        operation: &PapiPersistedOperation,
-        intent: &PapiSubmitIntent,
-    ) -> Option<&'a PapiVerifiedOpenOrder> {
-        let observed_venue_order_id = self
-            .journal
-            .operations()
-            .get(&operation.operation_id)
-            .and_then(|recovered| match recovered.stage {
-                PapiOperationStage::Observed { venue_order_id } => Some(venue_order_id),
-                _ => None,
-            });
-
-        self.evidence.as_ref()?.open_orders.iter().find(|order| {
-            order.instrument_id == operation.instrument_id
-                && order.client_order_id == operation.client_order_id
-                && observed_venue_order_id.is_none_or(|value| order.venue_order_id == value)
-                && order.side == intent_side(intent)
-                && order.quantity == intent_quantity(intent)
-                && order.reduce_only == intent_reduce_only(intent)
-        })
-    }
 }
 
 /// Dispatches a prepared submit without holding the account coordinator lock across I/O.
@@ -2123,10 +2078,10 @@ pub(crate) enum CoordinatorError {
     InvalidCancelBatch,
     #[error("PAPI cancel-all contains unsupported parameters")]
     InvalidCancelAll,
-    #[error("PAPI cancel-all has no owned ordinary UM target in scope")]
-    EmptyCancelAll,
-    #[error("PAPI cancel target is not a known owned ordinary UM order: {0}")]
+    #[error("PAPI cancel target has neither a confirmed venue identity nor a pending submit: {0}")]
     UnknownCancelTarget(ClientOrderId),
+    #[error(transparent)]
+    CancelValidation(#[from] super::commands::CommandValidationError),
     #[error("PAPI recovery report identity does not match its durable operation")]
     ReportIdentityMismatch,
     #[error("PAPI recovery report terms do not match its durable submit intent")]
@@ -4160,112 +4115,99 @@ mod tests {
         ));
     }
 
+    fn managed_order(id: &str, strategy: &str, side: OrderSide, venue_id: Option<i64>) -> OrderAny {
+        use nautilus_model::{
+            events::{OrderAccepted, OrderEventAny},
+            orders::OrderTestBuilder,
+        };
+
+        let mut order = OrderTestBuilder::new(OrderType::Market)
+            .trader_id(TraderId::from("TRADER-001"))
+            .strategy_id(StrategyId::from(strategy))
+            .instrument_id(instrument_id())
+            .client_order_id(ClientOrderId::from(id))
+            .side(side)
+            .quantity(Quantity::from("0.5"))
+            .build();
+
+        if let Some(venue_id) = venue_id {
+            order
+                .apply(OrderEventAny::Accepted(OrderAccepted::new(
+                    order.trader_id(),
+                    order.strategy_id(),
+                    order.instrument_id(),
+                    order.client_order_id(),
+                    VenueOrderId::from(format!("PAPI:O:BTCUSDT:{venue_id}")),
+                    AccountId::from("BINANCE-PAPI-001"),
+                    UUID4::new(),
+                    UnixNanos::from(1),
+                    UnixNanos::from(1),
+                    true,
+                )))
+                .unwrap();
+        }
+        order
+    }
+
     #[rstest]
-    fn cancel_all_planner_freezes_only_owned_scoped_ordinary_targets() {
+    fn cancel_all_planner_freezes_only_engine_managed_scoped_ordinary_targets() {
         let directory = TempDir::new().unwrap();
         let now = Instant::now();
-        let mut snapshot = evidence(now, Decimal::ZERO);
-        snapshot.open_orders.push(PapiVerifiedOpenOrder {
-            instrument_id: instrument_id(),
-            client_order_id: ClientOrderId::from("EXTERNAL-001"),
-            venue_order_id: 99,
-            side: PapiIntentSide::Buy,
-            quantity: dec!(0.5),
-            reduce_only: false,
-            worst_case_exposure: dec!(15165.150),
-        });
         let mut coordinator = PapiCommandCoordinator::open(
             config(&directory.path().join("commands.journal")),
             AccountId::from("BINANCE-PAPI-001"),
         )
         .unwrap();
-        coordinator.install_evidence(snapshot, now).unwrap();
-
-        assert!(matches!(
+        coordinator
+            .install_evidence(evidence(now, Decimal::ZERO), now)
+            .unwrap();
+        assert!(
             coordinator
-                .plan_cancel_all(&cancel_all("S-001", None))
-                .unwrap_err(),
-            CoordinatorError::EmptyCancelAll
-        ));
-        assert!(matches!(
-            coordinator
-                .prepare_cancel(cancel("EXTERNAL-001"), UnixNanos::from(2))
-                .unwrap_err(),
-            CoordinatorError::UnknownCancelTarget(id)
-                if id == ClientOrderId::from("EXTERNAL-001")
-        ));
-
-        let buy = submit("O-001", PapiIntentSide::Buy, false);
-        let buy_id = buy.operation_id;
-        coordinator.prepare_submit(buy, now).unwrap();
-        coordinator
-            .transition(
-                buy_id,
-                PapiOperationStage::MayHaveDispatched,
-                UnixNanos::from(3),
-            )
-            .unwrap();
-
-        let sell = submit("O-002", PapiIntentSide::Sell, false);
-        let sell_id = sell.operation_id;
-        coordinator.prepare_submit(sell, now).unwrap();
-        coordinator
-            .transition(
-                sell_id,
-                PapiOperationStage::MayHaveDispatched,
-                UnixNanos::from(4),
-            )
-            .unwrap();
-        coordinator
-            .apply_command_success(
-                sell_id,
-                &PapiCommandAcknowledgement {
-                    venue_order_id: 52,
-                    client_order_id: "O-002".to_owned(),
-                },
-                UnixNanos::from(5),
-            )
-            .unwrap();
-
+                .plan_cancel_all(&cancel_all("S-001", None), &[])
+                .unwrap()
+                .is_empty()
+        );
         coordinator
             .prepare_submit(submit("O-LOCAL", PapiIntentSide::Buy, false), now)
             .unwrap();
-        let mut other_strategy = submit("O-OTHER", PapiIntentSide::Buy, false);
-        other_strategy.strategy_id = StrategyId::from("S-002");
-        let other_strategy_id = other_strategy.operation_id;
-        coordinator.prepare_submit(other_strategy, now).unwrap();
-        coordinator
-            .transition(
-                other_strategy_id,
-                PapiOperationStage::MayHaveDispatched,
-                UnixNanos::from(6),
-            )
-            .unwrap();
-
+        let orders = vec![
+            managed_order("O-001", "S-001", OrderSide::Buy, Some(51)),
+            managed_order("O-002", "S-001", OrderSide::Sell, Some(52)),
+            managed_order("O-LOCAL", "S-001", OrderSide::Buy, None),
+            managed_order("O-OTHER", "S-002", OrderSide::Buy, Some(53)),
+            managed_order("O-EXTERNAL", "EXTERNAL", OrderSide::Buy, Some(54)),
+        ];
         let buy_targets = coordinator
-            .plan_cancel_all(&cancel_all("S-001", Some(OrderSide::Buy)))
+            .plan_cancel_all(&cancel_all("S-001", Some(OrderSide::Buy)), &orders)
             .unwrap();
         assert_eq!(
             buy_targets
                 .iter()
-                .map(|operation| operation.client_order_id.as_str())
+                .map(|op| op.client_order_id.as_str())
                 .collect::<Vec<_>>(),
             ["O-001", "O-LOCAL"]
         );
-        assert!(buy_targets.iter().all(|operation| {
-            operation.account_id == AccountId::from("BINANCE-PAPI-001")
-                && operation.strategy_id == StrategyId::from("S-001")
-                && operation.instrument_id == instrument_id()
-                && matches!(
-                    operation.command,
-                    PapiPersistedCommand::Cancel {
-                        venue_order_id: None
-                    }
-                )
-        }));
-
+        assert!(
+            buy_targets
+                .iter()
+                .all(|op| op.account_id == AccountId::from("BINANCE-PAPI-001")
+                    && op.strategy_id == StrategyId::from("S-001")
+                    && op.instrument_id == instrument_id())
+        );
+        assert!(matches!(
+            buy_targets[0].command,
+            PapiPersistedCommand::Cancel {
+                venue_order_id: Some(51)
+            }
+        ));
+        assert!(matches!(
+            buy_targets[1].command,
+            PapiPersistedCommand::Cancel {
+                venue_order_id: None
+            }
+        ));
         let sell_targets = coordinator
-            .plan_cancel_all(&cancel_all("S-001", Some(OrderSide::Sell)))
+            .plan_cancel_all(&cancel_all("S-001", Some(OrderSide::Sell)), &orders)
             .unwrap();
         assert_eq!(sell_targets.len(), 1);
         assert_eq!(
@@ -4278,12 +4220,117 @@ mod tests {
                 venue_order_id: Some(52)
             }
         ));
-
         let mut unsupported = cancel_all("S-001", None);
         unsupported.params = Some(serde_json::from_str(r#"{"unsupported":true}"#).unwrap());
         assert!(matches!(
-            coordinator.plan_cancel_all(&unsupported).unwrap_err(),
+            coordinator
+                .plan_cancel_all(&unsupported, &orders)
+                .unwrap_err(),
             CoordinatorError::InvalidCancelAll
+        ));
+    }
+
+    #[rstest]
+    #[case("strategy")]
+    #[case("account")]
+    #[case("instrument")]
+    #[case("client")]
+    #[case("venue")]
+    fn cancel_rejects_engine_identity_mismatch(#[case] mismatch: &str) {
+        let order = managed_order("CLAIMED", "S-001", OrderSide::Buy, Some(42));
+        let mut operation = cancel("CLAIMED");
+        operation.command = PapiPersistedCommand::Cancel {
+            venue_order_id: Some(42),
+        };
+
+        match mismatch {
+            "strategy" => operation.strategy_id = StrategyId::from("S-OTHER"),
+            "account" => operation.account_id = AccountId::from("BINANCE-PAPI-OTHER"),
+            "instrument" => operation.instrument_id = InstrumentId::from("ETHUSDT-PERP.BINANCE"),
+            "client" => operation.client_order_id = ClientOrderId::from("OTHER"),
+            "venue" => {
+                operation.command = PapiPersistedCommand::Cancel {
+                    venue_order_id: Some(43),
+                }
+            }
+            _ => unreachable!(),
+        }
+        assert!(super::super::commands::validate_cancel_order(operation, &order).is_err());
+    }
+
+    #[tokio::test]
+    async fn cancel_without_submit_survives_restart_and_requires_matching_terminal_report() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("commands.journal");
+        let account = AccountId::from("BINANCE-PAPI-001");
+        let mut coordinator = PapiCommandCoordinator::open(config(&path), account).unwrap();
+        let mut operation = cancel("RECOVERED");
+        operation.command = PapiPersistedCommand::Cancel {
+            venue_order_id: Some(42),
+        };
+        let id = operation.operation_id;
+        coordinator
+            .prepare_cancel(operation.clone(), UnixNanos::from(2))
+            .unwrap();
+        let mut duplicate = operation;
+        duplicate.operation_id = UUID4::new();
+        assert!(matches!(
+            coordinator.prepare_cancel(duplicate, UnixNanos::from(3)),
+            Err(CoordinatorError::DuplicateCancelTarget(_))
+        ));
+        coordinator
+            .dispatch_barrier(id, Instant::now(), UnixNanos::from(4))
+            .unwrap();
+        coordinator
+            .transition(
+                id,
+                PapiOperationStage::Unknown {
+                    reason: PapiUnknownReason::Timeout,
+                },
+                UnixNanos::from(5),
+            )
+            .unwrap();
+        drop(coordinator);
+        let mut coordinator = PapiCommandCoordinator::open(config(&path), account).unwrap();
+        let mut terminal = report("RECOVERED", OrderStatus::Filled);
+        terminal.venue_order_id = VenueOrderId::from("PAPI:O:BTCUSDT:43");
+        assert!(matches!(
+            coordinator.apply_order_report(id, &terminal, UnixNanos::from(6)),
+            Err(CoordinatorError::ReportIdentityMismatch)
+        ));
+        let server = MockServer::new(|request| {
+            if request.path == "/papi/v1/um/order" {
+                let mut order = testing::filled_order();
+                order["clientOrderId"] = serde_json::json!("RECOVERED");
+                order["orderId"] = serde_json::json!(42);
+                order["status"] = serde_json::json!("FILLED");
+                order["executedQty"] = order["origQty"].clone();
+                return Reply::json(&order);
+            }
+            testing::quiet(request)
+        })
+        .await;
+        let reader = testing::client(&server, &["BTCUSDT"]);
+        let summary = coordinator.recover_unknowns(&reader).await.unwrap();
+        assert_eq!(summary.unresolved, 0);
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|request| request.path == "/papi/v1/um/order")
+                .count(),
+            1
+        );
+        terminal.venue_order_id = VenueOrderId::from("PAPI:O:BTCUSDT:42");
+        coordinator
+            .apply_matching_order_report(&terminal, UnixNanos::from(8))
+            .unwrap();
+        assert_eq!(coordinator.journal().operations().len(), 1);
+        assert!(matches!(
+            coordinator.journal().operations()[&id].stage,
+            PapiOperationStage::Resolved {
+                resolution: PapiOperationResolution::Filled
+            }
         ));
     }
 
