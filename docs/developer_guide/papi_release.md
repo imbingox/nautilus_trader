@@ -9,7 +9,7 @@ conflicts with the official `nautilus-trader` distribution.
 | Field               | Value                                                       |
 | ------------------- | ----------------------------------------------------------- |
 | Distribution        | `nautilus-trader-papi`                                      |
-| Version             | `2.0.0rc12`                                                 |
+| Version             | `2.0.0rc13`                                                 |
 | Python              | CPython 3.14, GIL build                                     |
 | ABI                 | `cp314`                                                     |
 | Platform            | Linux x86_64                                                |
@@ -17,7 +17,7 @@ conflicts with the official `nautilus-trader` distribution.
 | Build profile       | Cargo `release`                                             |
 | Python extension    | Full `nautilus-pyo3` extension with high precision and PAPI |
 | Source distribution | Not published                                               |
-| Release tag         | `papi-v2.0.0rc12`                                           |
+| Release tag         | `papi-v2.0.0rc13`                                           |
 
 The upstream baseline is
 `46a5658a2f66cf0a798d414dc1b63d98cf10fcc1`. The PAPI feature head before upstream integration is
@@ -29,6 +29,19 @@ commit and tag.
 The version belongs to this distribution. Increment it for every changed PAPI release candidate,
 even when the upstream Python version remains unchanged. PyPI files are immutable, so never rebuild
 different bytes under an uploaded version.
+
+## Changes in 2.0.0rc13
+
+Account-only private-stream events no longer block current risk collection while waiting for the
+same facts to be applied. Collection waits for previously delivered execution reports, and the
+new risk snapshot still requires engine application before authorization resumes. Newer facts
+invalidate an older collection, and evidence freshness limits remain unchanged.
+
+Recovery diagnostics report the latest received fact version and include session `issues`.
+An application checkpoint or risk-report acknowledgement timeout restricts the session and stops
+the refresh worker. The host must handle this state and recreate the execution client; late
+acknowledgements cannot restore authority. This release adds offline regression coverage and no
+new live trading acceptance claim.
 
 ## Changes in 2.0.0rc12
 
@@ -96,7 +109,7 @@ bash scripts/papi-release/verify-wheel.bash dist/papi
 python3 scripts/papi-release/generate-manifest.py \
   --wheel-dir dist/papi \
   --source-ref <release-commit-or-tag> \
-  --tag papi-v2.0.0rc12 \
+  --tag papi-v2.0.0rc13 \
   --output dist/papi/release-manifest.json
 ```
 
@@ -153,7 +166,7 @@ release tag and require approval where the GitHub plan supports it.
 The promotion sequence is:
 
 1. Merge the validated release branch into `main` without changing the candidate tree.
-2. Create signed tag `papi-v2.0.0rc12` at that exact commit.
+2. Create signed tag `papi-v2.0.0rc13` at that exact commit.
 3. Build and verify the wheel once, then freeze its SHA-256 manifest.
 4. Upload the frozen wheel to TestPyPI through the protected OIDC job.
 5. Run `verify-index.bash testpypi ...`; it downloads the file, compares SHA-256, and repeats the

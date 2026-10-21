@@ -239,9 +239,12 @@ impl PapiApplicationAcknowledger {
     }
 
     pub(crate) fn recovery_evidence(&self) -> (BinancePapiRecoveryEvidence, u64) {
+        let facts = self.shared.facts.lock();
         let evidence = self.shared.evidence.lock();
+        let mut snapshot = evidence.clone();
+        snapshot.received_fact_version = facts.fact_version;
         (
-            evidence.clone(),
+            snapshot,
             self.shared.transport_revision.load(Ordering::Acquire),
         )
     }
@@ -289,16 +292,20 @@ impl PapiApplicationAcknowledger {
     pub(crate) fn applied_refresh_checkpoint(&self) -> anyhow::Result<PapiApplicationCheckpoint> {
         let checkpoint = self.refresh_checkpoint()?;
         let evidence = self.shared.evidence.lock();
+
+        // Account events need the new collection to be applied; only prior deliveries must be applied
         anyhow::ensure!(
             evidence.pending_application_fact_version.is_none()
-                && evidence.applied_fact_version == checkpoint.fact_version,
+                && evidence.applied_fact_version != 0
+                && evidence.applied_fact_version == evidence.delivered_fact_version,
             "PAPI recovery facts are still awaiting engine application"
         );
         Ok(checkpoint)
     }
 
     pub(crate) fn refresh_checkpoint(&self) -> anyhow::Result<PapiApplicationCheckpoint> {
-        let fact_version = self.shared.facts.lock().fact_version;
+        let facts = self.shared.facts.lock();
+        let fact_version = facts.fact_version;
         let evidence = self.shared.evidence.lock();
         anyhow::ensure!(
             evidence.synchronized && evidence.session_generation != 0 && fact_version != 0,
@@ -316,7 +323,8 @@ impl PapiApplicationAcknowledger {
         &self,
         checkpoint: PapiApplicationCheckpoint,
     ) -> anyhow::Result<PapiRefreshAcknowledgement> {
-        let fact_version = self.shared.facts.lock().fact_version;
+        let facts = self.shared.facts.lock();
+        let fact_version = facts.fact_version;
         let mut evidence = self.shared.evidence.lock();
         anyhow::ensure!(
             evidence.synchronized

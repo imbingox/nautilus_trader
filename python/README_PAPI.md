@@ -11,7 +11,7 @@ and copyright holder of the upstream project. Report fork-specific issues to the
 
 ## Supported wheel
 
-The `2.0.0rc12` release supports only:
+The `2.0.0rc13` release supports only:
 
 - CPython 3.14 with the GIL enabled
 - Linux x86_64 with a `manylinux_2_34` baseline
@@ -24,7 +24,7 @@ Install the exact binary release in a new virtual environment:
 
 ```bash
 python3.14 -m venv .venv
-.venv/bin/python -m pip install --only-binary=:all: nautilus-trader-papi==2.0.0rc12
+.venv/bin/python -m pip install --only-binary=:all: nautilus-trader-papi==2.0.0rc13
 ```
 
 Do not install `nautilus-trader` and `nautilus-trader-papi` together. Both distributions provide
@@ -55,6 +55,18 @@ Risk-increasing orders remain blocked during private-stream recovery until the e
 has applied the current baseline and fresh risk evidence is acknowledged. Restart reconciliation
 restores the original strategy owner from matching durable submission records even with an empty
 Cache, without replaying unresolved orders. The command journal format is unchanged.
+
+## Risk refresh recovery in 2.0.0rc13
+
+Account events can trigger a new risk collection without first waiting for those same account
+facts to be applied. Previously delivered execution reports must still be applied, and new risk
+evidence is installed only after the engine applies its matching report. Superseded snapshots
+cannot restore authorization, and freshness limits are unchanged.
+
+Recovery diagnostics include the latest received fact version and session `issues`. Application
+checkpoint and risk-report acknowledgement timeouts restrict the session and stop the refresh
+worker. The host must handle the failure and recreate the execution client. This change has offline
+regression coverage; it does not add a live strategy acceptance claim.
 
 ## Cancellation of claimed orders in 2.0.0rc12
 

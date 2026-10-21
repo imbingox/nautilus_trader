@@ -34,6 +34,16 @@ failures retry without extending the installed evidence's age. Expired evidence 
 commands until a fresh, complete collection is applied; no private stream event or reconnect is
 required for renewal. Periodic refreshes do not scan history or reset command reservations.
 
+Account events can advance the received fact version before a new risk snapshot is collected.
+Collection waits for previously delivered execution reports to be applied, not for those new
+account facts to be applied in advance. The matching risk report must still be applied by the
+engine before its risk generation is installed, and a newer fact invalidates an older collection.
+The recovery view reports the latest received fact version and includes session `issues`.
+Waiting for a prior application checkpoint is bounded by `max_risk_age_ms`, checked on each retry;
+waiting for a delivered risk report acknowledgement uses the same timeout. Either timeout latches
+the session as `restricted` with a diagnostic issue and stops the risk worker. The host must handle
+this state and recreate the execution client; a late acknowledgement cannot restore authority.
+
 The independent factory name and default client ID are `BINANCE_PAPI`. Instrument venue
 remains `BINANCE`. The default account ID is `BINANCE-PAPI-001`, keeping its issuer
 aligned with the venue used by the core account cache. Use `BinanceDataClientFactory`, `BinanceDataClientConfig` and

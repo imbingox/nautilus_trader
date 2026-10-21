@@ -243,6 +243,7 @@ async fn run_risk_refresh_worker(
     cancel: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     let refresh_interval = Duration::from_millis((trading.max_risk_age_ms / 3).max(1_000));
+    let mut checkpoint_wait_started = None;
 
     loop {
         tokio::select! {
@@ -283,14 +284,28 @@ async fn run_risk_refresh_worker(
         } else {
             None
         };
-        let checkpoint = match acknowledger
+        let checkpoint_result = acknowledger
             .lock()
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("PAPI application acknowledger is unavailable"))
-            .and_then(|acknowledger| acknowledger.applied_refresh_checkpoint())
-        {
-            Ok(checkpoint) => checkpoint,
+            .and_then(|acknowledger| acknowledger.applied_refresh_checkpoint());
+        let checkpoint = match checkpoint_result {
+            Ok(checkpoint) => {
+                checkpoint_wait_started = None;
+                checkpoint
+            }
             Err(e) => {
+                let started = checkpoint_wait_started.get_or_insert_with(tokio::time::Instant::now);
+
+                if started.elapsed() >= trading_risk_application_timeout(&trading) {
+                    let reason = format!("PAPI risk refresh application checkpoint timed out: {e}");
+
+                    if let Some(acknowledger) = acknowledger.lock().as_ref() {
+                        acknowledger.restrict_recovery(&reason);
+                    }
+                    anyhow::bail!(reason);
+                }
+
                 log::warn!("PAPI risk refresh has no application checkpoint: {e}");
                 control.notify.notify_one();
                 continue;
@@ -369,8 +384,12 @@ async fn run_risk_refresh_worker(
                 state.pending = None;
             }
             drop(state);
-            log::warn!("PAPI risk refresh application acknowledgement timed out");
-            control.notify.notify_one();
+            let reason = "PAPI risk refresh application acknowledgement timed out";
+
+            if let Some(acknowledger) = acknowledger.lock().as_ref() {
+                acknowledger.restrict_recovery(reason);
+            }
+            anyhow::bail!(reason);
         } else if control.dirty_generation.load(Ordering::Acquire)
             > control.clean_generation.load(Ordering::Acquire)
         {
@@ -596,6 +615,7 @@ impl BinancePapiExecutionClient {
                 "session_generation": evidence.as_ref().map_or(0, |value| value.session_generation),
                 "recovery_generation": evidence.as_ref().map_or(0, |value| value.recovery_generation),
                 "transport_revision": transport_revision,
+                "issues": evidence.as_ref().map(|value| &value.issues),
                 "received_fact_version": evidence.as_ref().map_or(0, |value| value.received_fact_version),
                 "delivered_fact_version": evidence.as_ref().map_or(0, |value| value.delivered_fact_version),
                 "applied_fact_version": evidence.as_ref().map_or(0, |value| value.applied_fact_version),
@@ -2142,7 +2162,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use futures_util::StreamExt;
+    use futures_util::{SinkExt, StreamExt};
     use nautilus_common::{
         cache::Cache,
         clock::VirtualClock,
@@ -2602,6 +2622,35 @@ mod tests {
         reply
     }
 
+    async fn account_update_websocket() -> (
+        String,
+        tokio::sync::mpsc::UnboundedSender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+            while receiver.recv().await.is_some() {
+                let event = json!({
+                    "e": "ACCOUNT_UPDATE", "E": TRADE_TIME, "T": TRADE_TIME,
+                    "fs": "UM", "a": {"m": "FUNDING_FEE", "B": [], "P": []},
+                });
+                websocket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        event.to_string().into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+        (url, sender, task)
+    }
+
     async fn connected_recovery_client(
         server: &MockServer,
         websocket_url: String,
@@ -2640,6 +2689,217 @@ mod tests {
         client.start().unwrap();
         client.connect().await.unwrap();
         (harness, client)
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn account_update_renews_risk_only_after_engine_application(#[case] superseded: bool) {
+        let server = MockServer::new(|request| {
+            if request.method == "POST" && request.path == "/papi/v1/um/order" {
+                return command_ack(request);
+            }
+            current_trading_reply(request)
+        })
+        .await;
+        let directory = TempDir::new().unwrap();
+        let (url, updates, websocket) = account_update_websocket().await;
+        let (mut harness, client) = connected_recovery_client(
+            &server,
+            url,
+            directory.path().join("commands.journal"),
+            60_000,
+        )
+        .await;
+        let recovery_reader = client.recovery_reader();
+        let control = Arc::clone(&client.risk_refresh);
+        harness.register_client(Box::new(client)).unwrap();
+        assert!(
+            harness
+                .pump_until(Duration::from_secs(3), |_| {
+                    recovery_reader.snapshot()["status"] == "ready"
+                })
+                .await
+        );
+        let before = recovery_reader.snapshot();
+        let baseline_requests = server.requests().len();
+
+        // An account-only event must produce a report without waiting for a later order event
+        updates.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while control.state.lock().pending.is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let pending = recovery_reader.snapshot();
+        assert_eq!(pending["permissions"]["increase_risk"], false);
+        assert_eq!(pending["risk_generation"], before["risk_generation"]);
+        assert_eq!(
+            pending["applied_fact_version"],
+            before["applied_fact_version"]
+        );
+        assert_eq!(
+            pending["received_fact_version"].as_u64().unwrap(),
+            before["received_fact_version"].as_u64().unwrap() + 1
+        );
+
+        if superseded {
+            updates.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while recovery_reader.snapshot()["received_fact_version"]
+                    == pending["received_fact_version"]
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            harness.pump_for(Duration::from_millis(100)).await;
+            let stale = recovery_reader.snapshot();
+            assert_eq!(stale["permissions"]["increase_risk"], false);
+            assert_eq!(stale["risk_generation"], before["risk_generation"]);
+        }
+
+        assert!(
+            harness
+                .pump_until(Duration::from_secs(8), |_| {
+                    recovery_reader.snapshot()["status"] == "ready"
+                })
+                .await
+        );
+        let renewed = recovery_reader.snapshot();
+        assert!(
+            renewed["risk_generation"].as_u64().unwrap()
+                > before["risk_generation"].as_u64().unwrap()
+        );
+        assert_eq!(
+            renewed["received_fact_version"],
+            renewed["applied_fact_version"]
+        );
+        assert_eq!(
+            renewed["pending_application_fact_version"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            renewed["recovery_generation"],
+            before["recovery_generation"]
+        );
+        assert_eq!(renewed["history_reports_complete"], false);
+        assert!(
+            server.requests()[baseline_requests..]
+                .iter()
+                .all(|request| {
+                    !matches!(
+                        request.path.as_str(),
+                        "/papi/v1/um/allOrders" | "/papi/v1/um/userTrades"
+                    )
+                })
+        );
+
+        // A later account event must start another refresh after the previous rebaseline completed
+        updates.send(()).unwrap();
+        assert!(
+            harness
+                .pump_until(Duration::from_secs(8), |_| {
+                    let current = recovery_reader.snapshot();
+                    current["status"] == "ready"
+                        && current["applied_fact_version"].as_u64().unwrap()
+                            > renewed["applied_fact_version"].as_u64().unwrap()
+                        && current["risk_generation"].as_u64().unwrap()
+                            > renewed["risk_generation"].as_u64().unwrap()
+                })
+                .await
+        );
+        let order = engine_limit_order("RISK-RENEWED", TimeInForce::Gtc, true);
+        harness.submit_via_risk(&order);
+        assert!(
+            harness
+                .pump_until(Duration::from_secs(3), |cache| {
+                    cache
+                        .order(&order.client_order_id())
+                        .is_some_and(|order| order.status() == OrderStatus::Accepted)
+                })
+                .await
+        );
+        let requests = server.requests();
+        let submits: Vec<_> = requests
+            .iter()
+            .filter(|request| request.method == "POST" && request.path == "/papi/v1/um/order")
+            .collect();
+        assert_eq!(submits.len(), 1);
+        assert_eq!(submits[0].params["timeInForce"], "GTX");
+        harness.exec_engine().borrow_mut().stop_clients();
+        websocket.abort();
+    }
+
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    #[tokio::test]
+    async fn missing_engine_application_restricts_risk_refresh_with_a_reason(
+        #[case] initial_application_pending: bool,
+    ) {
+        let server = MockServer::new(current_trading_reply).await;
+        let directory = TempDir::new().unwrap();
+        let (url, updates, websocket) = account_update_websocket().await;
+        let (mut harness, client) = connected_recovery_client(
+            &server,
+            url,
+            directory.path().join("commands.journal"),
+            10_000,
+        )
+        .await;
+        let recovery_reader = client.recovery_reader();
+        let control = Arc::clone(&client.risk_refresh);
+        harness.register_client(Box::new(client)).unwrap();
+
+        if !initial_application_pending {
+            assert!(
+                harness
+                    .pump_until(Duration::from_secs(3), |_| {
+                        recovery_reader.snapshot()["status"] == "ready"
+                    })
+                    .await
+            );
+        }
+        let before = recovery_reader.snapshot();
+        updates.send(()).unwrap();
+
+        // Leave the runner paused so neither the baseline nor the new risk report can be confirmed
+        tokio::time::timeout(Duration::from_secs(22), async {
+            while recovery_reader.snapshot()["reason"] != "session_restricted" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let failed = recovery_reader.snapshot();
+        let expected_reason = if initial_application_pending {
+            "PAPI risk refresh application checkpoint timed out"
+        } else {
+            "PAPI risk refresh application acknowledgement timed out"
+        };
+        assert!(failed["issues"].as_array().unwrap().iter().any(|issue| {
+            issue
+                .as_str()
+                .is_some_and(|issue| issue.starts_with(expected_reason))
+        }));
+        assert_eq!(failed["status"], "restricted");
+        assert_eq!(failed["permissions"]["increase_risk"], false);
+        assert_eq!(failed["risk_generation"], before["risk_generation"]);
+        assert!(control.state.lock().pending.is_none());
+
+        // Late engine delivery cannot revive a restricted session or install the timed-out snapshot
+        harness.pump_for(Duration::from_millis(100)).await;
+        let late = recovery_reader.snapshot();
+        assert_eq!(late["reason"], "session_restricted");
+        assert_eq!(late["permissions"]["increase_risk"], false);
+        assert_eq!(late["risk_generation"], before["risk_generation"]);
+        harness.exec_engine().borrow_mut().stop_clients();
+        websocket.abort();
     }
 
     #[tokio::test]
