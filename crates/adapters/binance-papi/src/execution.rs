@@ -2952,13 +2952,11 @@ mod tests {
                     .await
             );
             control.mark_dirty(1, false);
-            tokio::time::timeout(Duration::from_secs(10), async {
-                while control.state.lock().pending.is_none() {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .unwrap();
+            nautilus_common::testing::wait_until_async(
+                || async { control.state.lock().pending.is_some() },
+                Duration::from_secs(10),
+            )
+            .await;
         }
         let application = if risk {
             control
