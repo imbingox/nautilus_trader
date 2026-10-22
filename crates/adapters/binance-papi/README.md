@@ -510,8 +510,8 @@ retaining successful sources independently after a partial failure. The SDK deco
 JSON before the exact observation parser runs, preserving missing/null distinctions. There is no
 native free/locked balance mapping. A successful wallet projection contains a formal reported
 margin `AccountState` with `base_currency=None`, empty complete balances and margins, and exact
-native `total_only_balances`; the private session publishes it only after bounded recovery
-converges. The
+native `total_only_balances`. The private session publishes it after bounded recovery converges;
+standard account queries use the separate conservative publication contract below. The
 [synthetic account fixtures](test_data/observations/README.md) and
 [official report examples](test_data/reports/README.md) do not establish live compatibility.
 
@@ -525,6 +525,88 @@ REST account recovery. Direct IOC expiration, partial and multi-fill orders, dyn
 rebaseline, unsupported account states, unobserved historical/algo retention and live throttling
 remain open acceptance work. The rationale and detailed evidence are recorded in
 [ACCOUNT_VERIFICATION.md](ACCOUNT_VERIFICATION.md).
+
+## Standard account queries
+
+Starting with `2.0.0rc14`, a running strategy can request an account refresh using the standard API:
+
+```python
+self.query_account(account_id, client_id=BINANCE_PAPI_CLIENT_ID)
+```
+
+The execution client publishes a standard `AccountState` through the runner and portfolio into
+the cache. Submission means acceptance only. Each client admits at most one account query task;
+commands submitted during that task coalesce without queuing another refresh. Applications own
+their timer, timeout and retry policy. There is no per-command completion or failure event.
+
+Queries use the existing ad hoc reader, cancellation domain and shared HTTP budget. All nine
+requests must succeed in the current generation: `/papi/v1/balance`, `/papi/v1/account`,
+`/papi/v1/um/account`, `/papi/v2/um/account`, `/papi/v1/um/openOrders`,
+`/papi/v1/um/algo/openAlgoOrders`, `/papi/v1/cm/positionRisk`, `/papi/v1/cm/openOrders`, and
+`/papi/v1/margin/openOrders`. This includes the reader's UM V1 observation even though wallet
+projection uses V2. Receipt age and combined collection span must fit `operation_timeout`.
+The existing wallet validation still requires exact representable totals, zero unsupported
+borrowing/interest, scoped UM exposure/orders, no CM exposure/orders, and no margin orders.
+PM `actualEquity` and `uniMMR` must both be valid exact decimal strings. A failure publishes no
+query event; the account ID and failing endpoint or projection reason are logged. Retained reader
+values cannot turn that failure into a successful query.
+
+The local `info["papi"]` schema is specific to this fork, not a promised official PAPI schema:
+
+```json
+{
+  "portfolio_margin": {
+    "source": "/papi/v1/account",
+    "actual_equity": "2234.1234567800",
+    "uni_mmr": "51.12345678",
+    "units": {"actual_equity": "USD", "uni_mmr": "ratio"},
+    "ts_source": 1617939110373000000,
+    "ts_received": 1800000000000000000
+  },
+  "wallet": {
+    "source": "/papi/v1/balance",
+    "coverage": "returned_assets",
+    "asset_times": [{"asset": "USDT", "ts_source": null}]
+  },
+  "sources": [
+    {"endpoint": "/papi/v1/balance", "ts_received": 1800000000000000000, "generation": 1}
+  ],
+  "ts_published": 1800000000000000000
+}
+```
+
+The example abbreviates `sources`; actual events include all nine endpoint receipts. Times are
+integer Unix nanoseconds. `ts_source` is the venue's validated `updateTime`, or `null` when
+unavailable; zero remains zero. The summary and each returned wallet asset retain separate source
+times. Other validation sources carry receipt times only; no venue timestamp is inferred for them.
+`ts_published` and `AccountState.ts_init` mark event construction for publication; `ts_event` remains
+the wallet projection's latest receipt time. None of these client times renew venue source times.
+USD equity is never relabeled as a USDT balance, and no free/locked amounts are invented.
+
+Wallet coverage is the rows returned by that REST response, not an assertion that every known asset
+was returned. Cache merges balances by currency: explicit zero replaces a prior value, while an
+absent asset does not clear it. `last_event` is the latest event, not the complete accumulated cache
+or a merged PM observation. Later recovery or balance events can have no PM summary; that means no
+summary update. Consumers must retain per-source last-good values and their original times and
+decide expiration independently.
+
+Query publication holds the recovery and risk pending-application locks through enqueueing. If
+either checkpoint is pending, the query fails without publication; the caller can retry later.
+Queries do not create or confirm checkpoints, install trading evidence, or enable trading.
+Stopping cancels the query and closes admission. Restart uses the existing task lifecycle.
+
+The public factory still requires 1-256 explicitly scoped, preloaded instruments, including for
+read-only execution. Empty scope is unsupported. Read-only connected execution supports queries.
+A started execution client can also query before connection, but this does not make a LiveNode
+whose startup recovery is blocked ready to run strategies. With an already running node, pending
+recovery/risk application rejects publication. Retain downstream fallback collection where the
+node cannot start or the account is outside the existing wallet scope.
+
+Offline validation includes real factory/engine checkpoint interleavings and the installed-wheel
+script `python/tests/integration/binance_papi_query_account.py`. It exercises a read-only LiveNode,
+standard strategy queries, two quiet-account updates, exact summary fields, coalescing, explicit
+zero and missing asset semantics, failed publication and subsequent recovery. It submits no orders
+and is not live venue acceptance.
 
 ## Execution recovery observations
 

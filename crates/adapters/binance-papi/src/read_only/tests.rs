@@ -21,9 +21,12 @@ use std::{
     time::Duration,
 };
 
+use nautilus_core::UUID4;
 use nautilus_model::{
+    accounts::{Account, MarginAccount},
     enums::{OrderStatus, PositionSide},
     identifiers::InstrumentId,
+    types::{Currency, Money},
 };
 use rstest::rstest;
 use serde_json::{Value, json};
@@ -34,6 +37,111 @@ use crate::{
     reports::parse::PapiCommissionError,
     testing::{self, MockServer, Reply, TRADE_TIME, ms},
 };
+
+#[rstest]
+#[case("/papi/v1/balance")]
+#[case("/papi/v1/account")]
+#[case("/papi/v1/um/account")]
+#[case("/papi/v2/um/account")]
+#[case("/papi/v1/um/openOrders")]
+#[case("/papi/v1/um/algo/openAlgoOrders")]
+#[case("/papi/v1/cm/positionRisk")]
+#[case("/papi/v1/cm/openOrders")]
+#[case("/papi/v1/margin/openOrders")]
+#[tokio::test]
+async fn account_query_never_reuses_failed_source(#[case] endpoint: &'static str) {
+    let fail = Arc::new(AtomicBool::new(false));
+    let server_fail = Arc::clone(&fail);
+    let server = MockServer::new(move |request| {
+        if request.path == endpoint && server_fail.load(Ordering::Acquire) {
+            return Reply::raw(403, r#"{"code":-2015,"msg":"Invalid permissions"}"#);
+        }
+        testing::supported_trading(request)
+    })
+    .await;
+    let client = testing::client(&server, &["BTCUSDT"]);
+    let first = client.query_account_state().await.unwrap();
+    fail.store(true, Ordering::Release);
+    let error = client.query_account_state().await.unwrap_err().to_string();
+    assert!(error.contains(endpoint), "{error}");
+    fail.store(false, Ordering::Release);
+    let third = client.query_account_state().await.unwrap();
+    assert_ne!(first.event_id, third.event_id);
+    assert_eq!(
+        third.info.as_ref().unwrap()["papi"]["sources"][0]["generation"],
+        3
+    );
+}
+
+#[rstest]
+#[case(json!({"uniMMR": "2"}), "actualEquity")]
+#[case(json!({"actualEquity": "1"}), "uniMMR")]
+#[case(json!({"actualEquity": null, "uniMMR": "2"}), "actualEquity")]
+#[case(json!({"actualEquity": "1", "uniMMR": "NaN"}), "uniMMR")]
+#[tokio::test]
+async fn account_query_requires_exact_summary_fields(
+    #[case] mut summary: Value,
+    #[case] field: &str,
+) {
+    summary["accountStatus"] = json!("NORMAL");
+    let server = MockServer::new(move |request| {
+        if request.path == "/papi/v1/account" {
+            return Reply::json(&summary);
+        }
+        testing::supported_trading(request)
+    })
+    .await;
+    let client = testing::client(&server, &["BTCUSDT"]);
+    let error = client.query_account_state().await.unwrap_err().to_string();
+    assert!(error.contains("/papi/v1/account"), "{error}");
+    assert!(error.contains(field), "{error}");
+}
+
+#[tokio::test]
+async fn account_query_preserves_unknown_source_time_and_explicit_zero() {
+    let server = MockServer::new(|request| match request.path.as_str() {
+        "/papi/v1/account" => {
+            Reply::json(&json!({"actualEquity": "0.000", "uniMMR": "0", "accountStatus": "NORMAL"}))
+        }
+        "/papi/v1/balance" => Reply::json(&json!([{
+            "asset": "USDT", "totalWalletBalance": "0.00000000",
+            "crossMarginBorrowed": "0", "crossMarginInterest": "0",
+        }])),
+        _ => testing::supported_trading(request),
+    })
+    .await;
+    let client = testing::client(&server, &["BTCUSDT"]);
+    let state = client.query_account_state().await.unwrap();
+    let info = &state.info.as_ref().unwrap()["papi"];
+    assert_eq!(info["portfolio_margin"]["actual_equity"], "0.000");
+    assert!(info["portfolio_margin"]["ts_source"].is_null());
+    assert!(info["wallet"]["asset_times"][0]["ts_source"].is_null());
+    assert_eq!(state.total_only_balances.len(), 1);
+    assert!(state.total_only_balances[0].as_decimal().is_zero());
+}
+
+#[tokio::test]
+async fn account_query_summary_is_event_local_after_balance_delta() {
+    let server = MockServer::new(testing::supported_trading).await;
+    let client = testing::client(&server, &["BTCUSDT"]);
+    let state = client.query_account_state().await.unwrap();
+    let summary = state.info.clone();
+    let mut account = MarginAccount::new(state.clone(), false);
+    let mut delta = state;
+    delta.event_id = UUID4::new();
+    delta.info = None;
+    delta.total_only_balances = vec![Money::from("0 USDT")];
+    account.apply(delta).unwrap();
+    assert!(account.last_event().unwrap().info.is_none());
+    assert_eq!(
+        account.balance_total(Some(Currency::USDT())).unwrap(),
+        Money::from("0 USDT")
+    );
+    assert_eq!(
+        summary.as_ref().unwrap()["papi"]["portfolio_margin"]["actual_equity"],
+        "1000"
+    );
+}
 
 #[rstest]
 #[case("/papi/v1/balance", 10, 0)]

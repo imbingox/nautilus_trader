@@ -9,7 +9,7 @@ conflicts with the official `nautilus-trader` distribution.
 | Field               | Value                                                       |
 | ------------------- | ----------------------------------------------------------- |
 | Distribution        | `nautilus-trader-papi`                                      |
-| Version             | `2.0.0rc13`                                                 |
+| Version             | `2.0.0rc14`                                                 |
 | Python              | CPython 3.14, GIL build                                     |
 | ABI                 | `cp314`                                                     |
 | Platform            | Linux x86_64                                                |
@@ -17,7 +17,7 @@ conflicts with the official `nautilus-trader` distribution.
 | Build profile       | Cargo `release`                                             |
 | Python extension    | Full `nautilus-pyo3` extension with high precision and PAPI |
 | Source distribution | Not published                                               |
-| Release tag         | `papi-v2.0.0rc13`                                           |
+| Release tag         | `papi-v2.0.0rc14`                                           |
 
 The upstream baseline is
 `46a5658a2f66cf0a798d414dc1b63d98cf10fcc1`. The PAPI feature head before upstream integration is
@@ -29,6 +29,18 @@ commit and tag.
 The version belongs to this distribution. Increment it for every changed PAPI release candidate,
 even when the upstream Python version remains unchanged. PyPI files are immutable, so never rebuild
 different bytes under an uploaded version.
+
+## Changes in 2.0.0rc14
+
+Standard `QueryAccount` refreshes a supported PAPI wallet and publishes exact PM `actualEquity`
+and `uniMMR` in `AccountState.info["papi"]`. Queries coalesce per execution client and publish only
+when the current observation round succeeds. Source timestamps remain separate from receipts and
+publication time. Pending recovery or risk application checkpoints prevent query publication;
+queries never grant trading authorization. Empty execution instrument scope remains unsupported.
+
+See the adapter README's standard account query contract and the installed-wheel integration
+script `python/tests/integration/binance_papi_query_account.py`. Validation is offline and does not
+add a live venue acceptance claim.
 
 ## Changes in 2.0.0rc13
 
@@ -109,7 +121,7 @@ bash scripts/papi-release/verify-wheel.bash dist/papi
 python3 scripts/papi-release/generate-manifest.py \
   --wheel-dir dist/papi \
   --source-ref <release-commit-or-tag> \
-  --tag papi-v2.0.0rc13 \
+  --tag papi-v2.0.0rc14 \
   --output dist/papi/release-manifest.json
 ```
 
@@ -166,7 +178,7 @@ release tag and require approval where the GitHub plan supports it.
 The promotion sequence is:
 
 1. Merge the validated release branch into `main` without changing the candidate tree.
-2. Create signed tag `papi-v2.0.0rc13` at that exact commit.
+2. Create signed tag `papi-v2.0.0rc14` at that exact commit.
 3. Build and verify the wheel once, then freeze its SHA-256 manifest.
 4. Upload the frozen wheel to TestPyPI through the protected OIDC job.
 5. Run `verify-index.bash testpypi ...`; it downloads the file, compares SHA-256, and repeats the

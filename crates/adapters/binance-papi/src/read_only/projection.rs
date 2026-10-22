@@ -16,7 +16,7 @@
 use std::time::Duration;
 
 use nautilus_common::live::dst::time::Instant;
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::{
     enums::AccountType,
     events::AccountState,
@@ -24,6 +24,7 @@ use nautilus_model::{
     types::{Currency, Money},
 };
 use serde::Serialize;
+use serde_json::json;
 
 use super::StoredObservation;
 use crate::{
@@ -171,6 +172,89 @@ pub(super) fn project_account_snapshot<'a>(
         wallet,
         portfolio_margin_risk,
     }
+}
+
+pub(super) fn project_query_account(
+    sources: &[StoredObservation],
+    context: &AccountProjectionContext<'_>,
+) -> anyhow::Result<AccountState> {
+    let validation = validate_sources(
+        &sources.iter().map(Some).collect::<Vec<_>>(),
+        context.now,
+        context.max_receipt_age,
+        context.max_collection_span,
+        context.canceled,
+    );
+    anyhow::ensure!(
+        validation.issues.is_empty(),
+        "{}",
+        validation.issues.join("; ")
+    );
+    let snapshot = project_account_snapshot(sources, context);
+    let state = snapshot.wallet.value.ok_or_else(|| {
+        anyhow::anyhow!(
+            "PAPI wallet projection: {}",
+            snapshot.wallet.issues.join("; ")
+        )
+    })?;
+    let risk = snapshot.portfolio_margin_risk.value.ok_or_else(|| {
+        anyhow::anyhow!(
+            "PAPI /papi/v1/account projection: {}",
+            snapshot.portfolio_margin_risk.issues.join("; ")
+        )
+    })?;
+    let summary = risk.account_summary;
+    let actual_equity = summary
+        .actual_equity
+        .require("/papi/v1/account actualEquity")?;
+    let uni_mmr = summary.uni_mmr.require("/papi/v1/account uniMMR")?;
+    let mut receipts = Vec::new();
+    let mut balance_times = Vec::new();
+    let mut summary_received = None;
+
+    for source in sources {
+        let observation = source
+            .slot
+            .last_response()
+            .ok_or_else(|| anyhow::anyhow!("PAPI query source disappeared"))?;
+        receipts.push(json!({
+            "endpoint": observation.source.endpoint(),
+            "ts_received": observation.ts_received,
+            "generation": observation.generation,
+        }));
+
+        match &observation.data {
+            ObservationData::Account(_) => summary_received = Some(observation.ts_received),
+            ObservationData::Balances(rows) => {
+                for row in rows {
+                    balance_times.push(json!({
+                        "asset": row.asset,
+                        "ts_source": row.update_time.require("updateTime").ok().map(|time| time.nanoseconds),
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut info = Params::new();
+    info.insert("papi".to_string(), json!({
+        "portfolio_margin": {
+            "source": "/papi/v1/account",
+            "actual_equity": actual_equity,
+            "uni_mmr": uni_mmr,
+            "units": {"actual_equity": "USD", "uni_mmr": "ratio"},
+            "ts_source": summary.update_time.require("updateTime").ok().map(|time| time.nanoseconds),
+            "ts_received": summary_received,
+        },
+        "wallet": {
+            "source": "/papi/v1/balance",
+            "coverage": "returned_assets",
+            "asset_times": balance_times,
+        },
+        "sources": receipts,
+        "ts_published": context.ts_init,
+    }));
+    Ok(state.with_info(Some(info)))
 }
 
 fn project_wallet<'a>(

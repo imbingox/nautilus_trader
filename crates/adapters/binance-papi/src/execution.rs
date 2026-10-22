@@ -415,6 +415,7 @@ pub(crate) struct BinancePapiExecutionClient {
     application_acknowledger: Arc<Mutex<Option<crate::websocket::PapiApplicationAcknowledger>>>,
     pending_application: Arc<Mutex<Option<PapiPendingApplication>>>,
     risk_refresh: Arc<PapiRiskRefreshControl>,
+    account_query: Arc<tokio::sync::Mutex<()>>,
     reader: RefCell<Option<BinancePapiReadOnlyClient>>,
     session: Option<BinancePapiAccountSession>,
     pending_tasks: TaskGroup,
@@ -445,6 +446,7 @@ impl BinancePapiExecutionClient {
             application_acknowledger: Arc::new(Mutex::new(None)),
             pending_application: Arc::new(Mutex::new(None)),
             risk_refresh: Arc::new(PapiRiskRefreshControl::default()),
+            account_query: Arc::new(tokio::sync::Mutex::new(())),
             reader: RefCell::new(None),
             session: None,
             pending_tasks: TaskGroup::new(),
@@ -705,12 +707,16 @@ impl BinancePapiExecutionClient {
     }
 
     fn begin_shutdown(&self) {
+        if self.session.is_some() || !self.pending_tasks.is_empty() {
+            self.pending_tasks.begin_shutdown();
+        }
+
         self.trading_connected.store(false, Ordering::Release);
         self.application_acknowledger.lock().take();
         self.pending_application.lock().take();
         self.risk_refresh.reset();
         self.risk_refresh.completion.notify_waiters();
-        let has_session = self.session.is_some();
+
         if let Some(session) = self.session.as_ref() {
             session.begin_shutdown();
         }
@@ -719,9 +725,6 @@ impl BinancePapiExecutionClient {
             reader.cancel();
         }
 
-        if has_session || !self.pending_tasks.is_empty() {
-            self.pending_tasks.begin_shutdown();
-        }
         self.core.set_disconnected();
     }
 
@@ -2051,8 +2054,56 @@ impl ExecutionClient for BinancePapiExecutionClient {
         self.dispatch_cancel_operations(operations)
     }
 
-    fn query_account(&self, _cmd: QueryAccount) -> anyhow::Result<()> {
-        anyhow::bail!("Binance PAPI account state is published by the private recovery session")
+    fn query_account(&self, cmd: QueryAccount) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            cmd.account_id == self.core.account_id,
+            "PAPI account query identity mismatch"
+        );
+        let reader = self.reader()?;
+        anyhow::ensure!(
+            self.pending_tasks.is_open(),
+            "PAPI account query task admission is closed"
+        );
+        let Ok(guard) = Arc::clone(&self.account_query).try_lock_owned() else {
+            return Ok(());
+        };
+        let account_id = self.core.account_id;
+        let emitter = self.emitter.clone();
+        let pending = Arc::clone(&self.pending_application);
+        let risk = Arc::clone(&self.risk_refresh);
+        let cancel = self.pending_tasks.cancellation_token();
+
+        self.spawn_task("query_account", async move {
+            let _guard = guard;
+            let result = async {
+                let state = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => anyhow::bail!("query canceled"),
+                    result = reader.query_account_state() => result?,
+                };
+
+                // Hold both admission locks through enqueueing so a checkpoint cannot
+                // publish its account event between our check and our event.
+                let pending = pending.lock();
+                let risk = risk.state.lock();
+                anyhow::ensure!(!cancel.is_cancelled(), "query canceled before publication");
+                anyhow::ensure!(
+                    pending.is_none(),
+                    "recovery application checkpoint is pending"
+                );
+                anyhow::ensure!(
+                    risk.pending.is_none(),
+                    "risk application checkpoint is pending"
+                );
+                emitter.try_send_account_state(state)
+            }
+            .await;
+
+            if let Err(e) = result {
+                log::warn!("PAPI account query failed for {account_id}: {e}");
+            }
+            Ok(())
+        })
     }
 
     fn query_order(&self, cmd: QueryOrder) -> anyhow::Result<()> {
@@ -2173,8 +2224,10 @@ mod tests {
             execution::{
                 GenerateFillReportsBuilder, GenerateOrderStatusReportBuilder,
                 GenerateOrderStatusReportsBuilder, GeneratePositionStatusReportsBuilder,
+                TradingCommand,
             },
         },
+        msgbus::{self, MessagingSwitchboard},
     };
     use nautilus_core::{UUID4, string::secret::SecretString, time::AtomicTime};
     use nautilus_execution::engine::ExecutionEngine;
@@ -2264,6 +2317,183 @@ mod tests {
     fn install_exec_event_sender() {
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
         replace_exec_event_sender(sender);
+    }
+
+    fn account_query(client: &dyn ExecutionClient) -> QueryAccount {
+        QueryAccount::new(
+            TraderId::from("TRADER-001"),
+            Some(client.client_id()),
+            client.account_id(),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn account_query_refreshes_quiet_account_and_coalesces() {
+        let round = Arc::new(AtomicUsize::new(0));
+        let response_round = Arc::clone(&round);
+        let server = MockServer::new(move |request| {
+            if request.path == "/papi/v1/account" {
+                let count = response_round.fetch_add(1, Ordering::AcqRel);
+                return Reply::json(&json!({
+                    "actualEquity": if count == 0 { "2234.1234567800" } else { "2235.1234567800" },
+                    "uniMMR": "51.12345678",
+                    "accountStatus": "NORMAL",
+                    "updateTime": 1617939110373_i64,
+                }));
+            }
+            testing::supported_trading(request)
+        })
+        .await;
+        let mut client = configured_client(&server, &["BTCUSDT"], true);
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        replace_exec_event_sender(sender);
+        client.start().unwrap();
+
+        for expected in ["2234.1234567800", "2235.1234567800"] {
+            for _ in 0..100 {
+                client
+                    .query_account(account_query(client.as_ref()))
+                    .unwrap();
+            }
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let ExecutionEvent::Account(state) = event else {
+                panic!("expected account event")
+            };
+            let info = &state.info.as_ref().unwrap()["papi"];
+            assert_eq!(info["portfolio_margin"]["actual_equity"], expected);
+            assert_eq!(info["portfolio_margin"]["uni_mmr"], "51.12345678");
+            assert_eq!(info["portfolio_margin"]["units"]["actual_equity"], "USD");
+            assert_eq!(
+                info["portfolio_margin"]["ts_source"],
+                1_617_939_110_373_000_000_u64
+            );
+            assert_eq!(info["sources"].as_array().unwrap().len(), 9);
+            assert!(state.balances.is_empty());
+            assert!(!state.total_only_balances.is_empty());
+        }
+        assert_eq!(round.load(Ordering::Acquire), 2);
+        assert!(events.try_recv().is_err());
+        assert!(!client.is_connected());
+        client.stop().unwrap();
+        assert!(
+            client
+                .query_account(account_query(client.as_ref()))
+                .is_err()
+        );
+        client.disconnect().await.unwrap();
+        assert_eq!(server.requests().len(), 18);
+    }
+
+    #[tokio::test]
+    async fn account_query_stop_cancels_in_flight_collection() {
+        let server = MockServer::new(|request| {
+            let mut reply = testing::supported_trading(request);
+            reply.delay = Duration::from_secs(10);
+            reply
+        })
+        .await;
+        let mut client = configured_client(&server, &["BTCUSDT"], true);
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        replace_exec_event_sender(sender);
+        client.start().unwrap();
+        client
+            .query_account(account_query(client.as_ref()))
+            .unwrap();
+        server.wait_for_requests(1).await;
+        client.stop().unwrap();
+        client.disconnect().await.unwrap();
+        assert_eq!(server.requests().len(), 1);
+        assert!(events.try_recv().is_err());
+    }
+
+    #[rstest]
+    #[case(403)]
+    #[case(429)]
+    #[case(200)]
+    #[case(408)]
+    #[tokio::test]
+    async fn account_query_async_failure_publishes_nothing(#[case] failure: u16) {
+        let fail = Arc::new(AtomicBool::new(false));
+        let server_fail = Arc::clone(&fail);
+        let server = MockServer::new(move |request| {
+            if request.path == "/papi/v1/account" && server_fail.load(Ordering::Acquire) {
+                return match failure {
+                    200 => Reply::json(&json!({"accountStatus": "NORMAL", "uniMMR": "2"})),
+                    408 => Reply {
+                        delay: Duration::from_secs(5),
+                        ..testing::supported_trading(request)
+                    },
+                    status => Reply::raw(status, r#"{"code":-2015,"msg":"Offline failure"}"#),
+                };
+            }
+            testing::supported_trading(request)
+        })
+        .await;
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_instrument(testing::instrument("BTCUSDT"))
+            .unwrap();
+        let mut read_only = testing::config(&server.url);
+        read_only.operation_timeout = Duration::from_secs(10);
+        read_only.request_timeout = Duration::from_millis(100);
+        let config = BinancePapiExecutionClientConfig {
+            read_only: Some(read_only),
+            instrument_ids: vec![InstrumentId::from("BTCUSDT-PERP.BINANCE")],
+            ..Default::default()
+        };
+        let core = ExecutionClientCore::new(
+            TraderId::from("TRADER-001"),
+            ClientId::from("PAPI-QUERY"),
+            Venue::from("BINANCE"),
+            OmsType::Netting,
+            config.account_id,
+            AccountType::Margin,
+            None,
+            cache,
+        );
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        replace_exec_event_sender(sender);
+        let mut client = BinancePapiExecutionClient::new(core, config);
+        client.start().unwrap();
+        *client.reader.borrow_mut() = Some(
+            BinancePapiReadOnlyClient::from_parts(
+                client.config.read_only.as_ref().unwrap(),
+                vec![testing::instrument("BTCUSDT")],
+                testing::gate(),
+                Arc::new(AtomicTime::default()),
+            )
+            .unwrap(),
+        );
+        client.query_account(account_query(&client)).unwrap();
+        let guard = tokio::time::timeout(Duration::from_secs(5), client.account_query.lock())
+            .await
+            .unwrap();
+        drop(guard);
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            ExecutionEvent::Account(_)
+        ));
+        fail.store(true, Ordering::Release);
+        client.query_account(account_query(&client)).unwrap();
+        let guard = tokio::time::timeout(Duration::from_secs(5), client.account_query.lock())
+            .await
+            .unwrap();
+        drop(guard);
+        assert!(events.try_recv().is_err());
+        assert!(client.pending_application.lock().is_none());
+        assert!(client.risk_refresh.state.lock().pending.is_none());
+        assert!(!client.trading_connected.load(Ordering::Acquire));
+        client.stop().unwrap();
+        client.disconnect().await.unwrap();
+        assert!(client.pending_tasks.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -2689,6 +2919,121 @@ mod tests {
         client.start().unwrap();
         client.connect().await.unwrap();
         (harness, client)
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn account_query_cannot_overwrite_unconfirmed_checkpoint(#[case] risk: bool) {
+        let server = MockServer::new(current_trading_reply).await;
+        let directory = TempDir::new().unwrap();
+        let (url, _close, websocket) = recovery_websocket().await;
+        let (mut harness, client) = connected_recovery_client(
+            &server,
+            url,
+            directory.path().join("commands.journal"),
+            60_000,
+        )
+        .await;
+        let query = account_query(&client);
+        let query_task = Arc::clone(&client.account_query);
+        let pending = Arc::clone(&client.pending_application);
+        let control = Arc::clone(&client.risk_refresh);
+        let recovery = client.recovery_reader();
+        harness.register_client(Box::new(client)).unwrap();
+
+        if risk {
+            assert!(
+                harness
+                    .pump_until(Duration::from_secs(5), |_| {
+                        recovery.snapshot()["status"] == "ready"
+                    })
+                    .await
+            );
+            control.mark_dirty(1, false);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while control.state.lock().pending.is_none() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let application = if risk {
+            control
+                .state
+                .lock()
+                .pending
+                .as_ref()
+                .unwrap()
+                .application
+                .clone()
+        } else {
+            pending.lock().as_ref().unwrap().clone()
+        };
+        let account = application.account_state.as_ref().unwrap();
+
+        // Deliver only the account, leaving the corresponding report in the runner queue
+        msgbus::send_account_state(MessagingSwitchboard::portfolio_update_account(), account);
+        let before = recovery.snapshot();
+        harness
+            .exec_engine()
+            .borrow_mut()
+            .execute(TradingCommand::QueryAccount(query));
+        let guard = tokio::time::timeout(Duration::from_secs(5), query_task.lock())
+            .await
+            .unwrap();
+        drop(guard);
+        assert_eq!(
+            recovery.snapshot()["risk_generation"],
+            before["risk_generation"]
+        );
+        assert_eq!(
+            recovery.snapshot()["applied_fact_version"],
+            before["applied_fact_version"]
+        );
+        assert_eq!(
+            harness
+                .cache()
+                .borrow()
+                .account(&harness.account_id())
+                .unwrap()
+                .last_event()
+                .unwrap()
+                .event_id,
+            account.event_id,
+        );
+
+        if risk {
+            assert!(control.state.lock().pending.is_some());
+        } else {
+            assert!(pending.lock().is_some());
+        }
+
+        // Completing the real report still confirms the original event ID
+        assert!(
+            harness
+                .pump_until(Duration::from_secs(5), |_| {
+                    pending.lock().is_none()
+                        && control.state.lock().pending.is_none()
+                        && recovery.snapshot()["status"] == "ready"
+                })
+                .await
+        );
+        assert!(
+            harness
+                .cache()
+                .borrow()
+                .account(&harness.account_id())
+                .unwrap()
+                .last_event()
+                .unwrap()
+                .info
+                .is_none()
+        );
+        harness.exec_engine().borrow_mut().stop_clients();
+        websocket.abort();
     }
 
     #[rstest]

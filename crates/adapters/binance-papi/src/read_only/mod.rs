@@ -371,6 +371,21 @@ impl BinancePapiReadOnlyClient {
         Ok(())
     }
 
+    pub(crate) async fn query_account_state(&self) -> anyhow::Result<AccountState> {
+        self.refresh_account_observations().await?;
+        let observations = self.inner.observations.lock();
+        let context = projection::AccountProjectionContext {
+            account_id: self.inner.account_id,
+            scope: &self.inner.scope,
+            ts_init: self.inner.clock.get_time_ns(),
+            now: Instant::now(),
+            max_receipt_age: self.inner.operation_timeout,
+            max_collection_span: self.inner.operation_timeout,
+            canceled: self.inner.cancel.is_cancelled(),
+        };
+        projection::project_query_account(&observations.sources, &context)
+    }
+
     /// Serializes retained observations and their current receipt status as exact JSON evidence.
     ///
     /// The output contains private account data. Recent receipt does not establish economic

@@ -45,6 +45,10 @@ wheel_python="${environment}/bin/python"
   cd "$temp_root"
   "$wheel_python" -I \
     "$repo_root/python/tests/integration/binance_papi_wheel_smoke.py" enabled
+  "$wheel_python" -I \
+    "$repo_root/python/tests/integration/binance_papi_query_account.py"
+  "$wheel_python" -I \
+    "$repo_root/python/tests/integration/binance_papi_query_account.py" --blocked
   "$wheel_python" -I - << 'PY'
 import importlib.metadata
 
@@ -71,6 +75,7 @@ report.update(
         "pip_check": "passed",
         "twine_check": "passed",
         "wheel_smoke": "passed",
+        "account_query": "passed",
         "complete": True,
     },
 )
