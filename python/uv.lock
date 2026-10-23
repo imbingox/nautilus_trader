@@ -445,7 +445,7 @@ wheels = [
 
 [[package]]
 name = "nautilus-trader-papi"
-version = "2.0.0rc14"
+version = "2.0.0rc15"
 source = { editable = "." }
 
 [package.optional-dependencies]

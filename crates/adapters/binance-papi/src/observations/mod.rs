@@ -311,10 +311,12 @@ fn parse_response(source: &ObservationSource, body: &str) -> anyhow::Result<Obse
             let JsonObject(summary): JsonObject<AccountSummary> = serde_json::from_str(body)
                 .map_err(|_| anyhow::anyhow!("Invalid PAPI account response"))?;
 
-            // An error object or empty object is not a successful account observation
+            // A query summary may omit status, but an error or empty object is not an observation
             anyhow::ensure!(
-                !matches!(summary.account_status, fields::Field::Missing),
-                "PAPI account response has no accountStatus field"
+                !matches!(summary.account_status, fields::Field::Missing)
+                    || (summary.actual_equity.require("actualEquity").is_ok()
+                        && summary.uni_mmr.require("uniMMR").is_ok()),
+                "PAPI account response has neither accountStatus nor valid actualEquity and uniMMR"
             );
             Ok(ObservationData::Account(Box::new(summary)))
         }

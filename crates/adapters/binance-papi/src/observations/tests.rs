@@ -311,6 +311,16 @@ fn test_um_side_identity_and_sparse_response() {
 }
 
 #[rstest]
+#[case("{}")]
+#[case(r#"{"code":-2015,"msg":"Invalid permissions"}"#)]
+#[case(r#"{"updateTime":1617939110373}"#)]
+#[case(r#"{"actualEquity":"1"}"#)]
+#[case(r#"{"actualEquity":"NaN","uniMMR":"2"}"#)]
+fn test_account_rejects_unidentified_response(#[case] body: &str) {
+    assert!(parse_response(&ObservationSource::Account, body).is_err());
+}
+
+#[rstest]
 fn test_failed_refresh_preserves_observation_and_monotonic_age() {
     let start = Instant::now();
     let max_age = Duration::from_secs(10);

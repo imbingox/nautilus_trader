@@ -559,7 +559,13 @@ The local `info["papi"]` schema is specific to this fork, not a promised officia
     "source": "/papi/v1/account",
     "actual_equity": "2234.1234567800",
     "uni_mmr": "51.12345678",
-    "units": {"actual_equity": "USD", "uni_mmr": "ratio"},
+    "account_equity": "2250.9876543200",
+    "account_maint_margin": "12.3400",
+    "account_status": "REDUCE_ONLY",
+    "units": {
+      "actual_equity": "USD", "uni_mmr": "ratio",
+      "account_equity": "USD", "account_maint_margin": "USD"
+    },
     "ts_source": 1617939110373000000,
     "ts_received": 1800000000000000000
   },
@@ -583,6 +589,16 @@ times. Other validation sources carry receipt times only; no venue timestamp is 
 the wallet projection's latest receipt time. None of these client times renew venue source times.
 USD equity is never relabeled as a USDT balance, and no free/locked amounts are invented.
 
+Starting with `2.0.0rc15`, the summary also includes `account_equity`, `account_maint_margin`, and
+`account_status` from that same `/papi/v1/account` response. Both amounts retain the original exact
+decimal strings in USD, including trailing zeros; `account_equity` is distinct from `actual_equity`.
+Status retains the original nonempty string, including unknown or non-`NORMAL` values. Missing,
+null, empty, or invalid optional fields appear explicitly as `null`. They do not add query success
+requirements, become zero or `NORMAL`, or reuse a previous response's values. Consumers decide
+whether such a summary is partial. All summary fields share that response's source and receipt
+times. Empty/error responses remain rejected, and trading authorization still requires valid
+`NORMAL` status independently of query publication.
+
 Wallet coverage is the rows returned by that REST response, not an assertion that every known asset
 was returned. Cache merges balances by currency: explicit zero replaces a prior value, while an
 absent asset does not clear it. `last_event` is the latest event, not the complete accumulated cache
@@ -605,7 +621,8 @@ node cannot start or the account is outside the existing wallet scope.
 Offline validation includes real factory/engine checkpoint interleavings and the installed-wheel
 script `python/tests/integration/binance_papi_query_account.py`. It exercises a read-only LiveNode,
 standard strategy queries, two quiet-account updates, exact summary fields, coalescing, explicit
-zero and missing asset semantics, failed publication and subsequent recovery. It submits no orders
+zero and missing asset semantics, optional summary updates and missing/invalid fields, failed
+publication and subsequent recovery. It submits no orders
 and is not live venue acceptance.
 
 ## Execution recovery observations

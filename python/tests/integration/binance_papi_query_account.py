@@ -61,6 +61,11 @@ class Venue:
         Initialize mutable REST fixture facts.
         """
         self.equity = "2234.1234567800"
+        self.summary_fields = {
+            "accountEquity": "2250.9876543200",
+            "accountMaintMargin": "0.0000000000000000000000000001",
+            "accountStatus": "NORMAL",
+        }
         self.zero = False
         self.fail = False
         self.block_recovery = False
@@ -85,7 +90,7 @@ class Venue:
             return {
                 "actualEquity": None if self.fail else self.equity,
                 "uniMMR": "51.12345678",
-                "accountStatus": "NORMAL",
+                **self.summary_fields,
                 "updateTime": SOURCE_MS,
             }
         if path == "/papi/v1/balance":
@@ -214,7 +219,7 @@ class QueryStrategy(Strategy):
         Request the first refresh and watch cache events.
         """
         self.started = True
-        self.deadline = time.monotonic() + 45
+        self.deadline = time.monotonic() + 60
         self.query_count = self.venue.requests.count("/papi/v1/account")
         self.submit_queries()
         self.clock.set_timer_ns("account-query-check", 100_000_000, callback=self.check)
@@ -247,7 +252,12 @@ class QueryStrategy(Strategy):
         if not info:
             return
         summary = info["portfolio_margin"]
-        assert summary["units"] == {"actual_equity": "USD", "uni_mmr": "ratio"}
+        assert summary["units"] == {
+            "actual_equity": "USD",
+            "uni_mmr": "ratio",
+            "account_equity": "USD",
+            "account_maint_margin": "USD",
+        }
         assert summary["uni_mmr"] == "51.12345678"
         assert summary["ts_source"] == SOURCE_MS * 1_000_000
         assert summary["ts_received"] > summary["ts_source"]
@@ -255,14 +265,26 @@ class QueryStrategy(Strategy):
 
         if self.stage == 0:
             assert summary["actual_equity"] == "2234.1234567800"
+            assert summary["account_equity"] == "2250.9876543200"
+            assert summary["account_maint_margin"] == "0.0000000000000000000000000001"
+            assert summary["account_status"] == "NORMAL"
             self.observations.append(info)
             self.last_id = event.event_id
             self.stage = 1
             self.venue.equity = "2235.1234567800"
+            self.venue.summary_fields = {
+                "accountEquity": "2251.9876543200",
+                "accountMaintMargin": "0.000",
+                "accountStatus": "REDUCE_ONLY",
+            }
             self.venue.zero = True
             self.submit_queries()
         elif self.stage == 1 and event.event_id != self.last_id:
             assert summary["actual_equity"] == "2235.1234567800"
+            assert summary["account_equity"] == "2251.9876543200"
+            assert summary["account_maint_margin"] == "0.000"
+            assert summary["account_status"] == "REDUCE_ONLY"
+            assert summary["ts_received"] > self.observations[-1]["portfolio_margin"]["ts_received"]
             assert account.balance_total(Currency.from_str("USDT")).as_decimal() == 0
             assert account.balance_total(Currency.from_str("BTC")).as_decimal() == 1
             assert [row["asset"] for row in info["wallet"]["asset_times"]] == ["USDT"]
@@ -283,9 +305,35 @@ class QueryStrategy(Strategy):
             self.submit_queries()
         elif self.stage == 3 and event.event_id != self.last_id:
             assert summary["actual_equity"] == "2236.1234567800"
+            assert summary["account_equity"] == "2251.9876543200"
+            assert summary["account_maint_margin"] == "0.000"
+            assert summary["account_status"] == "REDUCE_ONLY"
             assert self.venue.requests.count("/papi/v1/account") == self.query_count + 4
             self.observations.append(info)
+            self.last_id = event.event_id
             self.stage = 4
+            self.venue.summary_fields = {}
+            self.submit_queries()
+        elif self.stage in {4, 5} and event.event_id != self.last_id:
+            assert summary["actual_equity"] == "2236.1234567800"
+            for field in ("account_equity", "account_maint_margin", "account_status"):
+                assert field in summary, (field, summary)
+                assert summary[field] is None, (field, summary)
+            assert summary["ts_received"] > self.observations[-1]["portfolio_margin"]["ts_received"]
+            assert (
+                self.venue.requests.count("/papi/v1/account") == self.query_count + self.stage + 1
+            )
+            self.observations.append(info)
+            self.last_id = event.event_id
+            self.stage += 1
+            if self.stage == 5:
+                self.venue.summary_fields = {
+                    "accountEquity": "NaN",
+                    "accountMaintMargin": 123,
+                    "accountStatus": False,
+                }
+                self.submit_queries()
+                return
             self.shutdown_system("Account query verification passed")
 
 
@@ -356,7 +404,7 @@ def main() -> None:
 
         node.run()
         assert strategy.error is None, strategy.error
-        assert strategy.stage == 4, f"Incomplete stage {strategy.stage}"
+        assert strategy.stage == 6, f"Incomplete stage {strategy.stage}"
         print(  # noqa: T201 - standalone verification
             json.dumps(
                 {

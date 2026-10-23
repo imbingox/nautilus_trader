@@ -11,7 +11,7 @@ and copyright holder of the upstream project. Report fork-specific issues to the
 
 ## Supported wheel
 
-The `2.0.0rc14` release supports only:
+The `2.0.0rc15` release supports only:
 
 - CPython 3.14 with the GIL enabled
 - Linux x86_64 with a `manylinux_2_34` baseline
@@ -24,7 +24,7 @@ Install the exact binary release in a new virtual environment:
 
 ```bash
 python3.14 -m venv .venv
-.venv/bin/python -m pip install --only-binary=:all: nautilus-trader-papi==2.0.0rc14
+.venv/bin/python -m pip install --only-binary=:all: nautilus-trader-papi==2.0.0rc15
 ```
 
 Do not install `nautilus-trader` and `nautilus-trader-papi` together. Both distributions provide
@@ -35,17 +35,19 @@ The fork uses its own PEP 440 version sequence. `2.0.0rc7` is the first publishe
 future PAPI changes receive a new public version even when the tracked upstream version is
 unchanged. A matching number does not imply that the two distributions are interchangeable.
 
-## Standard account queries in 2.0.0rc14
+## Standard account queries in 2.0.0rc15
 
 Running strategies can call `self.query_account(account_id, client_id=BINANCE_PAPI_CLIENT_ID)`.
 Successful current-round collection publishes a standard `AccountState` with exact PM equity and
-margin ratio under `info["papi"]["portfolio_margin"]`. Each client admits one query task, coalescing
+margin ratio under `info["papi"]["portfolio_margin"]`. The summary also includes optional
+`account_equity` and `account_maint_margin` as exact USD decimal strings, plus raw `account_status`.
+Missing or invalid optional fields are `None`, without reusing prior values. Each client admits one query task, coalescing
 concurrent requests. Failure or a pending recovery/risk application checkpoint publishes no query
 event; applications own refresh scheduling, timeouts and per-source last-good values.
 
 The existing explicit execution instrument scope and wallet restrictions still apply. This does
 not enable strategy startup when node recovery is blocked or change trading authorization. See
-[the field and availability contract](https://github.com/imbingox/nautilus_trader/blob/papi-v2.0.0rc14/crates/adapters/binance-papi/README.md#standard-account-queries).
+[the field and availability contract](https://github.com/imbingox/nautilus_trader/blob/papi-v2.0.0rc15/crates/adapters/binance-papi/README.md#standard-account-queries).
 
 ## Account-wide current reports
 

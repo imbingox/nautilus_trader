@@ -796,12 +796,13 @@ mod tests {
     use nautilus_model::{identifiers::InstrumentId, types::Currency};
     use rstest::rstest;
     use rust_decimal_macros::dec;
+    use serde_json::{Value, json};
     use tempfile::TempDir;
 
     use super::*;
     use crate::{
         config::{BinancePapiInstrumentTradingConfig, BinancePapiTradingConfig},
-        testing::{self, MockServer},
+        testing::{self, MockServer, Reply},
     };
 
     fn trading_config(path: std::path::PathBuf) -> BinancePapiTradingConfig {
@@ -825,6 +826,44 @@ mod tests {
             market_order_price_buffer_bps: 100,
             fee_buffer_bps: 10,
         }
+    }
+
+    #[rstest]
+    #[case(None)]
+    #[case(Some(json!(null)))]
+    #[case(Some(json!(false)))]
+    #[case(Some(json!("REDUCE_ONLY")))]
+    #[case(Some(json!("FUTURE_STATUS")))]
+    #[tokio::test]
+    async fn queryable_summary_without_normal_status_cannot_authorize_trading(
+        #[case] status: Option<Value>,
+    ) {
+        let server = MockServer::new(move |request| {
+            if request.path == "/papi/v1/account" {
+                let mut summary = json!({"actualEquity": "1000", "uniMMR": "2"});
+
+                if let Some(status) = &status {
+                    summary["accountStatus"] = status.clone();
+                }
+                return Reply::json(&summary);
+            }
+            testing::supported_trading(request)
+        })
+        .await;
+        let client = testing::client(&server, &["BTCUSDT"]);
+        let directory = TempDir::new().unwrap();
+        let config = trading_config(directory.path().join("commands.journal"));
+
+        client.query_account_state().await.unwrap();
+        let error = client
+            .collect_verified_risk_snapshot(&config)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("accountStatus") || error.contains("account status"),
+            "{error}"
+        );
     }
 
     #[rstest]

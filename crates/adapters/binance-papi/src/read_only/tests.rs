@@ -98,6 +98,98 @@ async fn account_query_requires_exact_summary_fields(
 }
 
 #[tokio::test]
+async fn account_query_preserves_optional_summary_fields() {
+    let server = MockServer::new(|request| {
+        if request.path == "/papi/v1/account" {
+            return Reply::json(&json!({
+                "actualEquity": "2234.1234567800",
+                "uniMMR": "51.12345678",
+                "accountEquity": "2250.9876543200",
+                "accountMaintMargin": "0.0000000000000000000000000001",
+                "accountStatus": "FUTURE_STATUS",
+                "updateTime": 1617939110373_u64,
+            }));
+        }
+        testing::supported_trading(request)
+    })
+    .await;
+    let client = testing::client(&server, &["BTCUSDT"]);
+    let state = client.query_account_state().await.unwrap();
+    let info = &state.info.as_ref().unwrap()["papi"];
+    let summary = &info["portfolio_margin"];
+    assert_eq!(summary["actual_equity"], "2234.1234567800");
+    assert_eq!(summary["account_equity"], "2250.9876543200");
+    assert_eq!(
+        summary["account_maint_margin"],
+        "0.0000000000000000000000000001"
+    );
+    assert_eq!(summary["account_status"], "FUTURE_STATUS");
+    assert_eq!(summary["units"]["account_equity"], "USD");
+    assert_eq!(summary["units"]["account_maint_margin"], "USD");
+    assert_eq!(summary["ts_source"], 1_617_939_110_373_000_000_u64);
+    let source = info["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["endpoint"] == "/papi/v1/account")
+        .unwrap();
+    assert_eq!(summary["ts_received"], source["ts_received"]);
+}
+
+#[rstest]
+#[case(json!({}))]
+#[case(json!({"accountEquity": null, "accountMaintMargin": null, "accountStatus": null}))]
+#[case(json!({"accountEquity": "", "accountMaintMargin": "", "accountStatus": ""}))]
+#[case(json!({"accountEquity": "NaN", "accountMaintMargin": "Infinity", "accountStatus": 1}))]
+#[case(json!({"accountEquity": 123, "accountMaintMargin": {}, "accountStatus": false}))]
+#[case(json!({"accountEquity": "79228162514264337593543950336", "accountMaintMargin": "0.00000000000000000000000000001", "accountStatus": []}))]
+#[tokio::test]
+async fn account_query_optional_fields_never_reuse_prior_values(#[case] optional: Value) {
+    let partial = Arc::new(AtomicBool::new(false));
+    let server_partial = Arc::clone(&partial);
+    let server = MockServer::new(move |request| {
+        if request.path == "/papi/v1/account" {
+            let mut summary = if server_partial.load(Ordering::Acquire) {
+                optional.clone()
+            } else {
+                json!({
+                    "accountEquity": "2250.9876543200",
+                    "accountMaintMargin": "0.000",
+                    "accountStatus": "REDUCE_ONLY",
+                })
+            };
+            summary["actualEquity"] = json!("2234.1234567800");
+            summary["uniMMR"] = json!("51.12345678");
+            return Reply::json(&summary);
+        }
+        testing::supported_trading(request)
+    })
+    .await;
+    let client = testing::client(&server, &["BTCUSDT"]);
+    let first = client.query_account_state().await.unwrap();
+    let first_summary = &first.info.as_ref().unwrap()["papi"]["portfolio_margin"];
+    assert_eq!(first_summary["account_equity"], "2250.9876543200");
+    assert_eq!(first_summary["account_maint_margin"], "0.000");
+    assert_eq!(first_summary["account_status"], "REDUCE_ONLY");
+
+    partial.store(true, Ordering::Release);
+    client.inner.clock.set_time(ms(1_800_000_001_000));
+    let second = client.query_account_state().await.unwrap();
+    let summary = &second.info.as_ref().unwrap()["papi"]["portfolio_margin"];
+    assert_ne!(first.event_id, second.event_id);
+    assert_eq!(summary["actual_equity"], "2234.1234567800");
+    assert_eq!(summary["uni_mmr"], "51.12345678");
+
+    for field in ["account_equity", "account_maint_margin", "account_status"] {
+        assert_eq!(summary.get(field), Some(&Value::Null), "{field}");
+    }
+    assert!(summary["ts_source"].is_null());
+    assert!(
+        summary["ts_received"].as_u64().unwrap() > first_summary["ts_received"].as_u64().unwrap()
+    );
+}
+
+#[tokio::test]
 async fn account_query_preserves_unknown_source_time_and_explicit_zero() {
     let server = MockServer::new(|request| match request.path.as_str() {
         "/papi/v1/account" => {
