@@ -11,7 +11,7 @@ and copyright holder of the upstream project. Report fork-specific issues to the
 
 ## Supported wheel
 
-The `2.0.0rc15` release supports only:
+The `2.0.0rc16` release supports only:
 
 - CPython 3.14 with the GIL enabled
 - Linux x86_64 with a `manylinux_2_34` baseline
@@ -24,7 +24,7 @@ Install the exact binary release in a new virtual environment:
 
 ```bash
 python3.14 -m venv .venv
-.venv/bin/python -m pip install --only-binary=:all: nautilus-trader-papi==2.0.0rc15
+.venv/bin/python -m pip install --only-binary=:all: nautilus-trader-papi==2.0.0rc16
 ```
 
 Do not install `nautilus-trader` and `nautilus-trader-papi` together. Both distributions provide
@@ -35,7 +35,7 @@ The fork uses its own PEP 440 version sequence. `2.0.0rc7` is the first publishe
 future PAPI changes receive a new public version even when the tracked upstream version is
 unchanged. A matching number does not imply that the two distributions are interchangeable.
 
-## Standard account queries in 2.0.0rc15
+## Standard account queries in 2.0.0rc16
 
 Running strategies can call `self.query_account(account_id, client_id=BINANCE_PAPI_CLIENT_ID)`.
 Successful current-round collection publishes a standard `AccountState` with exact PM equity and
@@ -45,9 +45,15 @@ Missing or invalid optional fields are `None`, without reusing prior values. Eac
 concurrent requests. Failure or a pending recovery/risk application checkpoint publishes no query
 event; applications own refresh scheduling, timeouts and per-source last-good values.
 
-The existing explicit execution instrument scope and wallet restrictions still apply. This does
-not enable strategy startup when node recovery is blocked or change trading authorization. See
-[the field and availability contract](https://github.com/imbingox/nautilus_trader/blob/papi-v2.0.0rc15/crates/adapters/binance-papi/README.md#standard-account-queries).
+Execution startup and recovery still require an explicit instrument scope. Wallet representation
+restrictions remain in force. Account queries do not unblock node startup or grant trading authority. See
+[the field and availability contract](https://github.com/imbingox/nautilus_trader/blob/papi-v2.0.0rc16/crates/adapters/binance-papi/README.md#standard-account-queries).
+
+Queries also expose `info["papi"]["position_metrics"]`: separate UM V1/V2 observations with exact
+position quantities, configured leverage, exchange unrealized PnL, metadata-derived currencies,
+and original source/receipt times. Missing fields and metadata remain explicit. Positions and
+orders outside the configured instruments no longer block account query publication; recovery and
+trading scope checks remain in force.
 
 ## Account-wide current reports
 

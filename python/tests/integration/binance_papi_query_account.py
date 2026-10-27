@@ -70,6 +70,7 @@ class Venue:
         self.fail = False
         self.block_recovery = False
         self.requests = []
+        self.positions = []
         fixture = (
             Path(__file__).resolve().parents[3]
             / "crates/adapters/binance/test_data"
@@ -106,7 +107,9 @@ class Venue:
                 for asset, amount in assets
             ]
         if path in {"/papi/v1/um/account", "/papi/v2/um/account"}:
-            return {"assets": [], "positions": []}
+            return self.position_response(path)
+        if path in {"/papi/v1/um/openOrders", "/papi/v1/um/algo/openAlgoOrders"}:
+            return [{"symbol": "ETHUSDT"}] if self.positions else []
         if path == "/papi/v1/um/positionSide/dual":
             return {"dualSidePosition": False}
         allowed = {
@@ -124,6 +127,32 @@ class Venue:
         if path in allowed:
             return []
         raise AssertionError(f"Unexpected endpoint {path}")
+
+    def position_response(self, path: str) -> dict:
+        """
+        Keep V2 leverage absent independently of V1's observed fields.
+        """
+        positions = [dict(row) for row in self.positions]
+        if path == "/papi/v2/um/account":
+            for row in positions:
+                row.pop("leverage", None)
+        return {"assets": [], "positions": positions}
+
+    def remove_position_metrics(self) -> None:
+        """
+        Omit optional fields from the next venue observation.
+        """
+        for row in self.positions:
+            row.pop("leverage")
+            row.pop("unrealizedProfit")
+
+    def invalidate_position_metrics(self) -> None:
+        """
+        Replace valid metrics with explicit invalid venue values.
+        """
+        for row in self.positions:
+            row["leverage"] = "0"
+            row["unrealizedProfit"] = "NaN"
 
 
 def serve_websocket(handler: BaseHTTPRequestHandler) -> None:
@@ -221,6 +250,24 @@ class QueryStrategy(Strategy):
         self.started = True
         self.deadline = time.monotonic() + 60
         self.query_count = self.venue.requests.count("/papi/v1/account")
+        self.request_counts = {
+            path: self.venue.requests.count(path) for path in set(self.venue.requests)
+        }
+
+        for symbol, side, amount in [
+            ("BTCUSDT", "BOTH", "0.001"),
+            ("ETHUSDT", "SHORT", "-2.500"),
+        ]:
+            self.venue.positions.append(
+                {
+                    "symbol": symbol,
+                    "positionSide": side,
+                    "positionAmt": amount,
+                    "leverage": "10",
+                    "unrealizedProfit": "0.11000000",
+                    "updateTime": SOURCE_MS,
+                },
+            )
         self.submit_queries()
         self.clock.set_timer_ns("account-query-check", 100_000_000, callback=self.check)
 
@@ -240,6 +287,55 @@ class QueryStrategy(Strategy):
         except Exception as e:
             self.error = repr(e)
             self.shutdown_system("Account query verification failed")
+
+    def check_position_metrics(self, info: dict) -> None:
+        """
+        Verify source identity, exact amounts, and known versus missing metadata.
+        """
+        metrics = info["position_metrics"]
+        assert [source["source"] for source in metrics] == [
+            "/papi/v1/um/account",
+            "/papi/v2/um/account",
+        ]
+
+        for source in metrics:
+            assert source["coverage"] == "returned_positions"
+            receipt = next(row for row in info["sources"] if row["endpoint"] == source["source"])
+            assert source["ts_received"] == receipt["ts_received"]
+            assert source["generation"] == receipt["generation"]
+            btc, eth = source["positions"]
+            assert btc["instrument_id"] == str(INSTRUMENT)
+            assert btc["unrealized_pnl_currency"] == "USDT"
+            assert btc["metadata_status"] == "available"
+            assert eth["symbol"] == "ETHUSDT"
+            assert eth["instrument_id"] is None
+            assert eth["unrealized_pnl_currency"] is None
+            assert eth["metadata_status"] == "missing"
+            assert eth["position_side"] == "SHORT"
+            assert eth["position_side_recognized"]
+            assert eth["position_amount"] == {"state": "value", "value": "-2.500"}
+            assert eth["ts_source"] == SOURCE_MS * 1_000_000
+        assert metrics[1]["positions"][0]["leverage"] == {"state": "missing"}
+
+    def check_unavailable_position_metrics(self, metrics: list, expected_state: str) -> None:
+        """
+        Verify each optional metric is explicitly unavailable in the new response.
+        """
+        for row in metrics[0]["positions"]:
+            assert row["leverage"]["state"] == expected_state
+            assert row["unrealized_pnl"]["state"] == expected_state
+
+    def check_request_counts(self, info: dict) -> None:
+        """
+        Require the existing endpoint count without extra metadata discovery.
+        """
+        for source in info["sources"]:
+            path = source["endpoint"]
+            assert self.venue.requests.count(path) == self.request_counts.get(path, 0) + 6
+        assert (
+            self.venue.requests.count("/fapi/v1/exchangeInfo")
+            == self.request_counts["/fapi/v1/exchangeInfo"]
+        )
 
     def check_result(self) -> None:
         """
@@ -262,12 +358,19 @@ class QueryStrategy(Strategy):
         assert summary["ts_source"] == SOURCE_MS * 1_000_000
         assert summary["ts_received"] > summary["ts_source"]
         assert len(info["sources"]) == 9
+        metrics = info["position_metrics"]
+        self.check_position_metrics(info)
 
         if self.stage == 0:
             assert summary["actual_equity"] == "2234.1234567800"
             assert summary["account_equity"] == "2250.9876543200"
             assert summary["account_maint_margin"] == "0.0000000000000000000000000001"
             assert summary["account_status"] == "NORMAL"
+            assert metrics[0]["positions"][0]["leverage"] == {"state": "value", "value": "10"}
+            assert metrics[0]["positions"][0]["unrealized_pnl"] == {
+                "state": "value",
+                "value": "0.11000000",
+            }
             self.observations.append(info)
             self.last_id = event.event_id
             self.stage = 1
@@ -278,6 +381,8 @@ class QueryStrategy(Strategy):
                 "accountStatus": "REDUCE_ONLY",
             }
             self.venue.zero = True
+            self.venue.positions[0]["positionAmt"] = "0.002"
+            self.venue.positions[0]["unrealizedProfit"] = "-0.22000000"
             self.submit_queries()
         elif self.stage == 1 and event.event_id != self.last_id:
             assert summary["actual_equity"] == "2235.1234567800"
@@ -288,6 +393,12 @@ class QueryStrategy(Strategy):
             assert account.balance_total(Currency.from_str("USDT")).as_decimal() == 0
             assert account.balance_total(Currency.from_str("BTC")).as_decimal() == 1
             assert [row["asset"] for row in info["wallet"]["asset_times"]] == ["USDT"]
+            assert metrics[0]["positions"][0]["position_amount"]["value"] == "0.002"
+            assert metrics[0]["positions"][0]["unrealized_pnl"]["value"] == "-0.22000000"
+            assert (
+                metrics[0]["ts_received"]
+                > self.observations[-1]["position_metrics"][0]["ts_received"]
+            )
             self.observations.append(info)
             self.last_id = event.event_id
             self.stage = 2
@@ -313,8 +424,11 @@ class QueryStrategy(Strategy):
             self.last_id = event.event_id
             self.stage = 4
             self.venue.summary_fields = {}
+            self.venue.remove_position_metrics()
             self.submit_queries()
         elif self.stage in {4, 5} and event.event_id != self.last_id:
+            expected_state = "missing" if self.stage == 4 else "invalid"
+            self.check_unavailable_position_metrics(metrics, expected_state)
             assert summary["actual_equity"] == "2236.1234567800"
             for field in ("account_equity", "account_maint_margin", "account_status"):
                 assert field in summary, (field, summary)
@@ -332,8 +446,10 @@ class QueryStrategy(Strategy):
                     "accountMaintMargin": 123,
                     "accountStatus": False,
                 }
+                self.venue.invalidate_position_metrics()
                 self.submit_queries()
                 return
+            self.check_request_counts(info)
             self.shutdown_system("Account query verification passed")
 
 

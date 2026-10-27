@@ -545,8 +545,11 @@ requests must succeed in the current generation: `/papi/v1/balance`, `/papi/v1/a
 `/papi/v1/um/algo/openAlgoOrders`, `/papi/v1/cm/positionRisk`, `/papi/v1/cm/openOrders`, and
 `/papi/v1/margin/openOrders`. This includes the reader's UM V1 observation even though wallet
 projection uses V2. Receipt age and combined collection span must fit `operation_timeout`.
-The existing wallet validation still requires exact representable totals, zero unsupported
-borrowing/interest, scoped UM exposure/orders, no CM exposure/orders, and no margin orders.
+Query wallet validation requires exactly representable totals and zero unsupported borrowing/interest.
+Starting with `2.0.0rc16`, account queries do not apply recovery's instrument or product-scope
+admission checks. Nonzero UM positions and open orders outside the configured instrument scope
+no longer prevent publication. Recovery and risk projections retain their existing checks;
+query success does not establish recovery readiness or extend the trading allowlist.
 PM `actualEquity` and `uniMMR` must both be valid exact decimal strings. A failure publishes no
 query event; the account ID and failing endpoint or projection reason are logged. Retained reader
 values cannot turn that failure into a successful query.
@@ -584,9 +587,9 @@ The local `info["papi"]` schema is specific to this fork, not a promised officia
 The example abbreviates `sources`; actual events include all nine endpoint receipts. Times are
 integer Unix nanoseconds. `ts_source` is the venue's validated `updateTime`, or `null` when
 unavailable; zero remains zero. The summary and each returned wallet asset retain separate source
-times. Other validation sources carry receipt times only; no venue timestamp is inferred for them.
-`ts_published` and `AccountState.ts_init` mark event construction for publication; `ts_event` remains
-the wallet projection's latest receipt time. None of these client times renew venue source times.
+times. UM positions carry their own source times as described below; no venue timestamp is inferred.
+`ts_published` and `AccountState.ts_init` mark event construction for publication; `ts_event` is
+the `/papi/v1/balance` receipt time. None of these client times renew venue source times.
 USD equity is never relabeled as a USDT balance, and no free/locked amounts are invented.
 
 Starting with `2.0.0rc15`, the summary also includes `account_equity`, `account_maint_margin`, and
@@ -616,7 +619,7 @@ read-only execution. Empty scope is unsupported. Read-only connected execution s
 A started execution client can also query before connection, but this does not make a LiveNode
 whose startup recovery is blocked ready to run strategies. With an already running node, pending
 recovery/risk application rejects publication. Retain downstream fallback collection where the
-node cannot start or the account is outside the existing wallet scope.
+node cannot start or wallet amounts cannot be represented safely.
 
 Offline validation includes real factory/engine checkpoint interleavings and the installed-wheel
 script `python/tests/integration/binance_papi_query_account.py`. It exercises a read-only LiveNode,
@@ -624,6 +627,81 @@ standard strategy queries, two quiet-account updates, exact summary fields, coal
 zero and missing asset semantics, optional summary updates and missing/invalid fields, failed
 publication and subsequent recovery. It submits no orders
 and is not live venue acceptance.
+
+### UM position metrics
+
+Starting with `2.0.0rc16`, `info["papi"]["position_metrics"]` contains two independent observations,
+from `/papi/v1/um/account` and `/papi/v2/um/account`, collected by the existing nine-request refresh.
+It adds no HTTP calls, polling, metadata discovery, or changes to `PositionStatusReport`.
+Each entry has the following shape (the example abbreviates the list to one source):
+
+```json
+[
+  {
+    "source": "/papi/v1/um/account",
+    "generation": 1,
+    "ts_received": 1800000000000000000,
+    "coverage": "returned_positions",
+    "positions": [
+      {
+        "symbol": "BTCUSDT",
+        "instrument_id": "BTCUSDT-PERP.BINANCE",
+        "position_side": "BOTH",
+        "position_side_recognized": true,
+        "position_amount": {"state": "value", "value": "0.010"},
+        "leverage": {"state": "value", "value": "10"},
+        "unrealized_pnl": {"state": "value", "value": "0.11000000"},
+        "unrealized_pnl_currency": "USDT",
+        "metadata_status": "available",
+        "ts_source": 1617939110373000000
+      }
+    ]
+  }
+]
+```
+
+The account identity is the enclosing `AccountState.account_id`. Rows are not filtered by the
+execution scope. Symbol matching uses the validated instrument metadata's exact Binance raw
+symbol; `instrument_id` is that instrument's native ID and `unrealized_pnl_currency` is its settlement
+currency. Only preloaded metadata in this client's configured scope is used. Without a match,
+`metadata_status` is `missing`, and both ID and currency are `null`; the source symbol and raw
+metrics remain available. No currency or instrument ID is guessed from symbol spelling. A PnL
+with unknown currency must not be displayed as a monetary value in an assumed currency.
+
+`position_amount` is the signed exchange `positionAmt`, with no quantity rounding. `leverage` is
+the contract's configured leverage, validated as a positive integer, not account effective leverage
+or a leverage-bracket limit. `unrealized_pnl` is the exchange's `unrealizedProfit` at observation
+time, not local Portfolio PnL and not a promise to update on each quote. Valid numeric values retain
+exact decimal strings, including trailing zeros. Fields have states `value`, `missing`, `null`,
+`empty`, or `invalid`. Only `value` is usable; an `invalid` field may include raw rejected input in
+`value` for diagnostics. Missing or invalid fields never become 1x or zero. `position_side` retains
+the exchange string; `position_side_recognized` accepts `BOTH`, `LONG`, and `SHORT`. Observing hedge
+sides does not enable hedge-mode trading. Unknown sides must not be associated with an engine
+position by guessing.
+
+V1 and V2 are separate observations even when they share a refresh generation. The adapter never
+selects individual fields across them, replaces a missing V2 field with V1, or reconciles conflicting
+quantities/PnL. Consumers can prefer a complete, fresh V2 row; if it lacks required fields such as
+leverage, they can instead select a complete, fresh V1 row. Select the entire row with its own
+endpoint, quantity, and times. If sources disagree, retain that disagreement rather than claiming
+a single consistent snapshot. Check account, symbol/instrument, side, observed quantity, and age
+before associating a row with an independently received `PositionStatusReport`; quantities can
+change between requests. Duplicate symbol/side rows within one response are rejected during parsing and prevent publication.
+
+`ts_received` is the actual endpoint response receipt, and `ts_source` is the row's validated
+`updateTime` in Unix nanoseconds, or `null` when unavailable. Zero remains zero. Source update time
+does not guarantee that every field, including mark-dependent PnL, changed at that instant.
+`generation` is local to the reader, not a globally unique account version. The two endpoints'
+receipt times remain distinct; event construction, a later query, or a balance delta cannot renew
+the times of previously retained metrics.
+
+`returned_positions` covers only rows present in that response. Explicit zero amounts are retained;
+absent symbols or empty arrays do not prove that previously observed positions closed. HTTP or
+response parsing failure still prevents the entire query event. Missing/invalid individual numeric
+metrics remain classified in a successful event and never reuse prior values. Later account events
+without `position_metrics` do not update this observation. Consumers retain last-good observations
+with their original times and independently expire them; the cache's `last_event` does not merge
+these extensions across events.
 
 ## Execution recovery observations
 

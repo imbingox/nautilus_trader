@@ -27,6 +27,8 @@ mod current_tests;
 #[cfg(test)]
 mod engine_tests;
 #[cfg(test)]
+mod query_tests;
+#[cfg(test)]
 mod tests;
 
 use std::{borrow::Cow, fmt::Debug, sync::Arc, time::Duration};

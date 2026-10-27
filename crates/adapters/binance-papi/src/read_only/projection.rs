@@ -21,17 +21,19 @@ use nautilus_model::{
     enums::AccountType,
     events::AccountState,
     identifiers::AccountId,
+    instruments::Instrument,
     types::{Currency, Money},
 };
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::StoredObservation;
 use crate::{
     http::BinancePapiResponseMetadata,
     observations::{
         ObservationData, ObservationFailure, ObservationSource, ObservationTiming, ReceiptStatus,
-        models::AccountSummary,
+        fields::Field,
+        models::{AccountSummary, UmPosition},
     },
     reports::InstrumentScope,
 };
@@ -190,17 +192,21 @@ pub(super) fn project_query_account(
         "{}",
         validation.issues.join("; ")
     );
-    let snapshot = project_account_snapshot(sources, context);
-    let state = snapshot.wallet.value.ok_or_else(|| {
-        anyhow::anyhow!(
-            "PAPI wallet projection: {}",
-            snapshot.wallet.issues.join("; ")
-        )
-    })?;
-    let risk = snapshot.portfolio_margin_risk.value.ok_or_else(|| {
+    let state = project_query_wallet(sources, context)?;
+    let account = find_source(sources, |source| {
+        matches!(source, ObservationSource::Account)
+    });
+    let risk = project_risk(
+        account,
+        context.now,
+        context.max_receipt_age,
+        context.max_collection_span,
+        context.canceled,
+    );
+    let risk = risk.value.ok_or_else(|| {
         anyhow::anyhow!(
             "PAPI /papi/v1/account projection: {}",
-            snapshot.portfolio_margin_risk.issues.join("; ")
+            risk.issues.join("; ")
         )
     })?;
     let summary = risk.account_summary;
@@ -211,6 +217,7 @@ pub(super) fn project_query_account(
     let mut receipts = Vec::new();
     let mut balance_times = Vec::new();
     let mut summary_received = None;
+    let mut position_metrics = Vec::new();
 
     for source in sources {
         let observation = source
@@ -232,6 +239,20 @@ pub(super) fn project_query_account(
                         "ts_source": row.update_time.require("updateTime").ok().map(|time| time.nanoseconds),
                     }));
                 }
+            }
+            ObservationData::UmAccount(account) => {
+                let positions: Vec<_> = account
+                    .positions
+                    .iter()
+                    .map(|position| project_position_metrics(position, context.scope))
+                    .collect();
+                position_metrics.push(json!({
+                    "source": observation.source.endpoint(),
+                    "generation": observation.generation,
+                    "ts_received": observation.ts_received,
+                    "coverage": "returned_positions",
+                    "positions": positions,
+                }));
             }
             _ => {}
         }
@@ -259,10 +280,68 @@ pub(super) fn project_query_account(
             "coverage": "returned_assets",
             "asset_times": balance_times,
         },
+        "position_metrics": position_metrics,
         "sources": receipts,
         "ts_published": context.ts_init,
     }));
     Ok(state.with_info(Some(info)))
+}
+
+// Query publication validates wallet representation without granting recovery or trading admission
+fn project_query_wallet(
+    sources: &[StoredObservation],
+    context: &AccountProjectionContext<'_>,
+) -> anyhow::Result<AccountState> {
+    let balance = find_source(sources, |source| {
+        matches!(source, ObservationSource::Balance { asset: None })
+    })
+    .and_then(|source| source.slot.last_response())
+    .ok_or_else(|| anyhow::anyhow!("PAPI /papi/v1/balance observation is unavailable"))?;
+
+    let ObservationData::Balances(rows) = &balance.data else {
+        anyhow::bail!("PAPI /papi/v1/balance contained unexpected data");
+    };
+    let totals = rows
+        .iter()
+        .map(validate_wallet_row)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(AccountState::new(
+        context.account_id,
+        AccountType::Margin,
+        Vec::new(),
+        Vec::new(),
+        true,
+        UUID4::new(),
+        balance.ts_received,
+        context.ts_init,
+        None,
+    )
+    .with_total_only_balances(totals)?)
+}
+
+fn project_position_metrics(position: &UmPosition, scope: &InstrumentScope) -> Value {
+    let instrument = scope.instrument(&position.symbol).ok();
+    let leverage = match &position.leverage {
+        Field::Value(amount)
+            if amount.value() <= rust_decimal::Decimal::ZERO
+                || !amount.value().fract().is_zero() =>
+        {
+            json!({"state": "invalid"})
+        }
+        field => json!(field),
+    };
+    json!({
+        "symbol": position.symbol,
+        "instrument_id": instrument.map(Instrument::id),
+        "position_side": position.position_side,
+        "position_side_recognized": matches!(position.position_side.as_str(), "BOTH" | "LONG" | "SHORT"),
+        "position_amount": position.position_amt,
+        "leverage": leverage,
+        "unrealized_pnl": position.unrealized_profit,
+        "unrealized_pnl_currency": instrument.map(Instrument::settlement_currency),
+        "metadata_status": if instrument.is_some() { "available" } else { "missing" },
+        "ts_source": position.update_time.require("updateTime").ok().map(|time| time.nanoseconds),
+    })
 }
 
 fn project_wallet<'a>(
