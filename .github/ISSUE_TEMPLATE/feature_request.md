@@ -7,6 +7,10 @@ labels:
 
 # Feature Request
 
+This template is retained from upstream. Cairn PAPI is a temporary personal fork; upstream
+process links below are references, not a promise of upstream support or feature delivery.
+Discuss fork-specific requests in [this repository](https://github.com/imbingox/nautilus_trader/issues).
+
 Check the [open-source scope](https://github.com/nautechsystems/nautilus_trader/blob/develop/ROADMAP.md#open-source-scope)
 before opening this request. Broad changes, major refactorings, and process changes belong in an
 RFC instead. New venue integrations always start as an RFC, see

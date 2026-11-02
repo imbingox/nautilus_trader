@@ -1,0 +1,2 @@
+# Follow shared helpers when a hook checks only the staged shell scripts.
+external-sources=true

@@ -62,7 +62,7 @@ def main() -> None:
     for name in ("analysis", "backtest", "betfair", "binance", "blockchain", "live", "model"):
         assert hasattr(_libnautilus, name), f"Full wheel is missing {name}"
     assert _libnautilus.model.HIGH_PRECISION
-    distribution = importlib.metadata.distribution("nautilus-trader-papi")
+    distribution = importlib.metadata.distribution("cairn-papi")
     assert distribution.version == nautilus_trader.__version__
     direct_url = distribution.read_text("direct_url.json")
     assert direct_url is None or "editable" not in direct_url

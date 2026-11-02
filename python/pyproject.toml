@@ -1,7 +1,7 @@
 [project]
-name = "nautilus-trader-papi"
+name = "cairn-papi"
 version = "2.0.0rc16"
-description = "Unofficial NautilusTrader distribution with guarded Binance Portfolio Margin support"
+description = "Independent third-party fork of NautilusTrader with Binance PAPI support"
 authors = [{ name = "Nautech Systems", email = "info@nautechsystems.io" }]
 maintainers = [{ name = "imbingox" }]
 classifiers = [
@@ -77,7 +77,7 @@ exclude-newer-package = { ruff = "2026-09-16T16:00:00Z" }
 # unexpected loss of wheel publishing fails `uv lock` instead of silently
 # building from source. Kept in sync with python/uv.lock by
 # scripts/check-no-build-packages.sh (also a pre-commit hook). The local
-# nautilus-trader-papi package is intentionally absent because it must be built
+# cairn-papi package is intentionally absent because it must be built
 # by maturin.
 no-build-package = [
   "accessible-pygments",

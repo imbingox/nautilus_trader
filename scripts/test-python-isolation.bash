@@ -41,14 +41,14 @@ shutil.copytree(package, site_packages / package.name,
 dependencies = dict.fromkeys(sysconfig.get_path(key) for key in ("purelib", "platlib"))
 (site_packages / "dependencies.pth").write_text("\n".join(dependencies) + "\n", encoding="utf-8")
 
-distribution = importlib.metadata.distribution("nautilus-trader-papi")
+distribution = importlib.metadata.distribution("cairn-papi")
 for entry in distribution.files or ():
     if entry.name == "METADATA" and entry.parent.name.endswith(".dist-info"):
         metadata = Path(distribution.locate_file(entry)).parent
         shutil.copytree(metadata, site_packages / metadata.name)
         break
 else:
-    sys.exit("Installed nautilus-trader-papi distribution metadata is missing")
+    sys.exit("Installed cairn-papi distribution metadata is missing")
 PY
 
 bash "$pkg_dir/../scripts/ci/check-python-isolation.bash" "$project_dir" "$pkg_dir" "$@"

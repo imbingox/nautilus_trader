@@ -524,7 +524,7 @@ def main() -> None:
         print(  # noqa: T201 - standalone verification
             json.dumps(
                 {
-                    "version": importlib.metadata.version("nautilus-trader-papi"),
+                    "version": importlib.metadata.version("cairn-papi"),
                     "result": "passed",
                     "observations": strategy.observations,
                 },

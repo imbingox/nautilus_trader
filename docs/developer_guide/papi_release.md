@@ -1,14 +1,23 @@
-# PAPI wheel release
+# Cairn PAPI wheel release
 
-This fork publishes `nautilus-trader-papi` independently from the upstream NautilusTrader release
+This fork prepares `cairn-papi` independently from the upstream NautilusTrader release
 pipeline. The package intentionally preserves the `nautilus_trader` import path and therefore
 conflicts with the official `nautilus-trader` distribution.
 
-## Frozen release contract
+Version `2.0.0rc16` is the first independently named release target. Check the
+[release workflow](https://github.com/imbingox/nautilus_trader/actions/workflows/papi-release.yml)
+and [PyPI](https://pypi.org/project/cairn-papi/) for actual publication status. Earlier versioned
+changes below belong to the old `nautilus-trader-papi` distribution. Existing tags and published
+artifacts remain unchanged; the `cairn-papi-v2.0.0rc16` tag is distinct from old package tags.
+
+See [third-party status and migration](../../python/README_PAPI.md). This is a temporary personal
+fork with an intended future migration to upstream once its PAPI support meets these needs.
+
+## Candidate release contract
 
 | Field               | Value                                                       |
 | ------------------- | ----------------------------------------------------------- |
-| Distribution        | `nautilus-trader-papi`                                      |
+| Distribution        | `cairn-papi`                                                |
 | Version             | `2.0.0rc16`                                                 |
 | Python              | CPython 3.14, GIL build                                     |
 | ABI                 | `cp314`                                                     |
@@ -17,7 +26,7 @@ conflicts with the official `nautilus-trader` distribution.
 | Build profile       | Cargo `release`                                             |
 | Python extension    | Full `nautilus-pyo3` extension with high precision and PAPI |
 | Source distribution | Not published                                               |
-| Release tag         | `papi-v2.0.0rc16`                                           |
+| Release tag         | `cairn-papi-v2.0.0rc16`                                     |
 
 The upstream baseline is
 `46a5658a2f66cf0a798d414dc1b63d98cf10fcc1`. The PAPI feature head before upstream integration is
@@ -119,10 +128,10 @@ declared dependency.
 
 For every downstream environment:
 
-1. Resolve its direct and transitive `nautilus-trader` requirements.
-2. Create a new environment and install exactly one of the two distributions.
+1. Resolve direct and transitive `nautilus-trader` and `nautilus-trader-papi` requirements.
+2. Create a new environment and install exactly one of the three distributions.
 3. Run `pip check` or `uv pip check` after all downstream dependencies are installed.
-4. Confirm `importlib.metadata.distribution("nautilus-trader")` is absent in a PAPI environment.
+4. Confirm both `nautilus-trader` and `nautilus-trader-papi` distribution metadata are absent.
 
 ## Build and verification
 
@@ -139,7 +148,7 @@ bash scripts/papi-release/verify-wheel.bash dist/papi
 python3 scripts/papi-release/generate-manifest.py \
   --wheel-dir dist/papi \
   --source-ref <release-commit-or-tag> \
-  --tag papi-v2.0.0rc16 \
+  --tag cairn-papi-v2.0.0rc16 \
   --output dist/papi/release-manifest.json
 ```
 
@@ -178,7 +187,7 @@ orders or account changes.
 
 The manually dispatched `.github/workflows/papi-build.yml` builds and verifies the selected commit
 using the same release builder and Linux/Python baseline. It uploads the wheel, verification report,
-and source commit as `papi-build-candidate`, without publishing permissions. Candidate verification
+and source commit as `cairn-papi-build-candidate`, without publishing permissions. Candidate verification
 does not replace the signed-tag and index verification requirements for a published release.
 
 ## Trusted Publishing and promotion
@@ -188,15 +197,17 @@ The workflow template is stored outside `.github` at
 at `.github/workflows/papi-release.yml`, because repository policy reserves that path for
 maintainers.
 
-Configure separate pending publishers or projects on TestPyPI and PyPI with owner `imbingox`,
+Configure separate `cairn-papi` pending publishers or projects on TestPyPI and PyPI with owner `imbingox`,
 repository `nautilus_trader`, the exact adopted workflow filename, and environments `testpypi` and
 `pypi`. Only publish jobs receive `id-token: write`; the production environment must restrict the
 release tag and require approval where the GitHub plan supports it.
 
+The following steps require a separate release decision; none are performed by the rename:
+
 The promotion sequence is:
 
 1. Merge the validated release branch into `main` without changing the candidate tree.
-2. Create signed tag `papi-v2.0.0rc16` at that exact commit.
+2. Create signed tag `cairn-papi-v2.0.0rc16` at that exact commit.
 3. Build and verify the wheel once, then freeze its SHA-256 manifest.
 4. Upload the frozen wheel to TestPyPI through the protected OIDC job.
 5. Run `verify-index.bash testpypi ...`; it downloads the file, compares SHA-256, and repeats the
@@ -212,7 +223,7 @@ hash mismatch blocks promotion.
 
 Before installation, stop the existing process, capture its package version and account state, and
 back up the command journal and related persistence. Install into a fresh environment, verify only
-`nautilus-trader-papi` owns the `nautilus_trader` package, then start through recovery and venue
+`cairn-papi` owns the `nautilus_trader` package, then start through recovery and venue
 reconciliation.
 
 Do not delete or rewrite a journal to clear an unknown command. Before rollback, confirm the older

@@ -29,7 +29,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = REPO_ROOT / "scripts/papi-release/verify_wheel.py"
 MANIFEST_SCRIPT = REPO_ROOT / "scripts/papi-release/generate-manifest.py"
-WHEEL_NAME = "nautilus_trader_papi-2.0.0rc16-cp314-cp314-manylinux_2_34_x86_64.whl"
+WHEEL_NAME = "cairn_papi-2.0.0rc16-cp314-cp314-manylinux_2_34_x86_64.whl"
 
 
 def _load_script(path: Path, name: str) -> ModuleType:
@@ -58,25 +58,26 @@ def _wheel(
     os_classifier: str = "Operating System :: POSIX :: Linux",
     requires_python: str = ">=3.14, <3.15",
     include_stub: bool = True,
+    disclaimer: str = "Cairn PAPI is not affiliated with, endorsed by, or supported by Nautech Systems Pty Ltd.",
 ) -> Path:
     """
     Create the smallest archive that satisfies the PAPI wheel content contract.
     """
     path = tmp_path / filename
-    dist_info = "nautilus_trader_papi-2.0.0rc16.dist-info"
+    dist_info = "cairn_papi-2.0.0rc16.dist-info"
     metadata = "\n".join(
         [
             "Metadata-Version: 2.4",
-            "Name: nautilus-trader-papi",
+            "Name: cairn-papi",
             "Version: 2.0.0rc16",
-            "Summary: Unofficial NautilusTrader PAPI distribution",
+            "Summary: Independent third-party fork of NautilusTrader with Binance PAPI support",
             f"Home-Page: {homepage}",
             f"Requires-Python: {requires_python}",
             f"Classifier: {os_classifier}",
             "Provides-Extra: visualization",
             *([] if requirement is None else [f"Requires-Dist: {requirement}"]),
             "",
-            "# Test package",
+            disclaimer,
         ],
     )
     wheel_metadata = (
@@ -110,7 +111,7 @@ def test_verify_wheel_accepts_frozen_release_contract(tmp_path: Path) -> None:
     """
     report = _load_verifier().validate_wheel(_wheel(tmp_path))
 
-    assert report["distribution"] == "nautilus-trader-papi"
+    assert report["distribution"] == "cairn-papi"
     assert report["version"] == "2.0.0rc16"
     assert report["platform_tag"] == "manylinux_2_34_x86_64"
     assert report["archive_checks"] == "passed"
@@ -134,9 +135,11 @@ def test_verify_wheel_requires_generated_extension_stub(tmp_path: Path) -> None:
         "nautilus-trader==2.0.0rc16",
         "nautilus_trader[visualization]>=2; python_version >= '3.14'",
         "Nautilus.Trader @ https://example.invalid/nautilus-trader.whl",
+        "nautilus-trader-papi==2.0.0rc16",
+        "Nautilus.Trader_Papi[visualization]>=2",
     ],
 )
-def test_verify_wheel_rejects_official_distribution_dependency(
+def test_verify_wheel_rejects_conflicting_distribution_dependency(
     tmp_path: Path,
     requirement: str,
 ) -> None:
@@ -145,7 +148,7 @@ def test_verify_wheel_rejects_official_distribution_dependency(
     """
     path = _wheel(tmp_path, requirement=requirement)
 
-    with pytest.raises(ValueError, match="conflicting official distribution"):
+    with pytest.raises(ValueError, match="conflicting distribution"):
         _load_verifier().validate_wheel(path)
 
 
@@ -232,3 +235,11 @@ def test_manifest_cleanliness_allows_only_untracked_wheel_artifacts(tmp_path: Pa
         "tracked: source.txt",
         "unexpected.txt",
     ]
+
+
+def test_verify_wheel_requires_third_party_disclaimer(tmp_path: Path) -> None:
+    """
+    Reject package descriptions that omit the support and affiliation boundary.
+    """
+    with pytest.raises(ValueError, match="third-party disclaimer"):
+        _load_verifier().validate_wheel(_wheel(tmp_path, disclaimer="Based on NautilusTrader"))

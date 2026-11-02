@@ -52,12 +52,13 @@ wheel_python="${environment}/bin/python"
   "$wheel_python" -I - << 'PY'
 import importlib.metadata
 
-try:
-    importlib.metadata.distribution("nautilus-trader")
-except importlib.metadata.PackageNotFoundError:
-    pass
-else:
-    raise SystemExit("Official nautilus-trader distribution is installed beside the PAPI fork")
+for name in ("nautilus-trader", "nautilus-trader-papi"):
+    try:
+        importlib.metadata.distribution(name)
+    except importlib.metadata.PackageNotFoundError:
+        pass
+    else:
+        raise SystemExit(f"Conflicting distribution {name} is installed beside Cairn PAPI")
 PY
 )
 

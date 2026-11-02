@@ -1,5 +1,16 @@
 # Installation
 
+For Cairn PAPI, follow the [fork installation and migration guide](../../python/README_PAPI.md).
+Check [PyPI](https://pypi.org/project/cairn-papi/) for publication status. The release target is
+CPython 3.14 (GIL enabled), Linux x86_64, `manylinux_2_34`. Never co-install it with
+`nautilus-trader-papi` or `nautilus-trader`; they share `nautilus_trader`.
+
+## Upstream installation reference
+
+The remainder of this page is retained upstream documentation for **NautilusTrader**. Its PyPI
+packages, package index, containers, and platform support statements do not describe Cairn PAPI.
+Installing those upstream packages does not install this fork.
+
 NautilusTrader is officially supported for Python 3.12-3.14 on the following 64-bit platforms:
 
 | Operating System | Supported Versions | CPU Architecture |

@@ -1,4 +1,7 @@
-# NautilusTrader Python package
+# Cairn PAPI Python package
+
+See [the package description](README_PAPI.md) for third-party status, installation, and migration.
+The distribution is `cairn-papi`; the import namespace is unchanged.
 
 This directory contains the `nautilus_trader` Python package. Rust core bindings are exposed
 through PyO3.
@@ -81,34 +84,18 @@ UUID4()
 ### From source
 
 ```bash
-git clone https://github.com/nautechsystems/nautilus_trader.git
+git clone --branch main https://github.com/imbingox/nautilus_trader.git
 cd nautilus_trader
 make build
 ```
 
-### Development wheels (pre-release)
+### Candidate wheels
 
-CI publishes development wheels on successful `develop` and `nightly` builds.
+See [the package guide](README_PAPI.md) for the current publication status and local wheel
+installation. Cairn PAPI does not publish through the upstream package index. Its candidate
+workflow is manual; upstream nightly builds and platform guarantees do not apply to this fork.
 
-```bash
-uv pip install --pre --index-url=https://packages.nautechsystems.io/simple/ nautilus-trader
-```
-
-| Platform           | Python    | Develop | Nightly |
-| :----------------- | :-------- | :------ | :------ |
-| `Linux (x86_64)`   | 3.12-3.14 | ✓       | ✓       |
-| `Linux (ARM64)`    | 3.12-3.14 | -       | ✓       |
-| `macOS (ARM64)`    | 3.12-3.14 | -       | ✓       |
-| `Windows (x86_64)` | 3.12-3.14 | -       | ✓       |
-
-The nightly merge builds and tests wheels on every listed platform.
-
-The `--pre` flag is required because wheels are tagged as pre-release builds. Run this command
-outside the NautilusTrader source checkout so the repository's `exclude-newer` uv policy does not
-filter out newly published wheels. The installed package imports as `nautilus_trader`.
-
-Build from source inside a checkout, when a wheel is not available for your platform, or when you
-need local Rust changes:
+For local development, build from source:
 
 ```bash
 make build-debug

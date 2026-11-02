@@ -1,5 +1,9 @@
 # Environment Setup
 
+For this temporary fork, the distribution name is `cairn-papi` and the import name remains
+`nautilus_trader`. See the [fork package guide](../../python/README_PAPI.md) for third-party status
+and release limitations. The tooling guidance below is inherited from upstream.
+
 Use an editor with current Rust and Python language support, such as PyCharm or Visual Studio Code.
 
 [uv](https://docs.astral.sh/uv) is the preferred tool for handling all Python virtual environments and dependencies.
@@ -42,7 +46,7 @@ xcode-select --install
 Then clone the repository and install the pinned project tools:
 
 ```bash
-git clone --branch develop https://github.com/nautechsystems/nautilus_trader
+git clone --branch main https://github.com/imbingox/nautilus_trader
 cd nautilus_trader
 
 curl https://sh.rustup.rs -sSf | sh

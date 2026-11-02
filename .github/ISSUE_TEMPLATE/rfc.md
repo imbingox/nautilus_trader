@@ -7,6 +7,10 @@ labels:
 
 # RFC
 
+This template is retained from upstream. Cairn PAPI is a temporary personal fork; upstream
+process links below are references, not a promise of upstream support or feature delivery.
+Discuss fork-specific requests in [this repository](https://github.com/imbingox/nautilus_trader/issues).
+
 ## What is an RFC?
 
 An RFC (Request for Comments) is a proposal for significant changes or additions to the project,

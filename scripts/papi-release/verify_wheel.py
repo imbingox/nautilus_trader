@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 
-EXPECTED_NAME = "nautilus-trader-papi"
+EXPECTED_NAME = "cairn-papi"
 EXPECTED_VERSION = "2.0.0rc16"
 EXPECTED_REQUIRES_PYTHON = ">=3.14,<3.15"
 EXPECTED_HOMEPAGE = "https://github.com/imbingox/nautilus_trader"
@@ -40,7 +40,7 @@ EXPECTED_OS_CLASSIFIER = "Operating System :: POSIX :: Linux"
 MAX_PYPI_FILE_SIZE = 100 * 1024 * 1024
 MAX_ARCHIVE_CONTENT_SIZE = 1024 * 1024 * 1024
 WHEEL_PATTERN = re.compile(
-    rf"^nautilus_trader_papi-(?P<version>[A-Za-z0-9._]+)-"
+    rf"^cairn_papi-(?P<version>[A-Za-z0-9._]+)-"
     rf"(?P<python>cp314)-(?P<abi>cp314)-(?P<platform>{EXPECTED_PLATFORM})\.whl$",
 )
 TEXT_SUFFIXES = {".json", ".md", ".py", ".pyi", ".toml", ".txt"}
@@ -159,8 +159,15 @@ def validate_wheel(path: Path) -> dict[str, Any]:
             "METADATA Home-Page does not identify the fork",
         )
         _require(
-            metadata["Summary"] is not None and "Unofficial" in metadata["Summary"],
-            "METADATA must identify the distribution as unofficial",
+            metadata["Summary"] is not None
+            and "Independent third-party fork" in metadata["Summary"],
+            "METADATA must identify the distribution as an independent third-party fork",
+        )
+        description = " ".join(metadata.get_payload().split())
+        _require(
+            "not affiliated with, endorsed by, or supported by Nautech Systems Pty Ltd."
+            in description,
+            "METADATA description must contain the third-party disclaimer",
         )
         classifiers = metadata.get_all("Classifier", [])
         _require(
@@ -170,8 +177,12 @@ def validate_wheel(path: Path) -> dict[str, Any]:
         )
         requirements = metadata.get_all("Requires-Dist", [])
         _require(
-            all(_normalized_requirement_name(value) != "nautilus-trader" for value in requirements),
-            "Wheel must not depend on the conflicting official distribution",
+            all(
+                _normalized_requirement_name(value)
+                not in {"nautilus-trader", "nautilus-trader-papi"}
+                for value in requirements
+            ),
+            "Wheel must not depend on the conflicting distribution",
         )
         _require(
             wheel_metadata.get_all("Tag", []) == [f"cp314-cp314-{EXPECTED_PLATFORM}"],

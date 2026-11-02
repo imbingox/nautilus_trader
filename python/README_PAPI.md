@@ -1,39 +1,70 @@
-# NautilusTrader PAPI
+# Cairn PAPI
 
-`nautilus-trader-papi` is an unofficial, full NautilusTrader distribution maintained in the
-[`imbingox/nautilus_trader`](https://github.com/imbingox/nautilus_trader) fork. It adds guarded
-Binance Portfolio Margin (PAPI) account, reconciliation, and execution support while retaining the
-standard `nautilus_trader` import path and a single Rust extension.
+**Cairn PAPI is an independent third-party fork based on
+[NautilusTrader](https://github.com/nautechsystems/nautilus_trader). It is not affiliated with,
+endorsed by, or supported by Nautech Systems Pty Ltd.**
 
-This package is not published or supported by Nautech Systems. Nautech Systems remains the author
-and copyright holder of the upstream project. Report fork-specific issues to the
-[fork issue tracker](https://github.com/imbingox/nautilus_trader/issues).
+This is a temporary fork primarily for personal use, adding Binance Portfolio Margin (PAPI)
+support. It is not intended to become a long-term independent distribution. The intended direction
+is to migrate to upstream when its PAPI support meets these needs; this is not a claim that suitable
+upstream support is available today, and there is no migration date commitment.
 
-## Supported wheel
+Source and fork-specific support:
+[imbingox/nautilus_trader](https://github.com/imbingox/nautilus_trader).
+Report issues to the [fork issue tracker](https://github.com/imbingox/nautilus_trader/issues).
+Nautech Systems Pty Ltd remains the upstream author and copyright holder. Upstream copyright and
+attribution notices are retained, and the code remains licensed under
+[LGPL-3.0-only](https://github.com/imbingox/nautilus_trader/blob/main/LICENSE).
 
-The `2.0.0rc16` release supports only:
+## Distribution and installation status
 
-- CPython 3.14 with the GIL enabled
-- Linux x86_64 with a `manylinux_2_34` baseline
+The distribution name is `cairn-papi`; the Python import remains `nautilus_trader`, including
+its `_libnautilus` extension. Version `2.0.0rc16` is the first independently named release
+target. Check [PyPI](https://pypi.org/project/cairn-papi/) for published artifacts before installing.
+Earlier PAPI release history below belongs to the old `nautilus-trader-papi` distribution.
 
-No source distribution is published. Installations on other Python versions, operating systems,
-architectures, or free-threaded Python builds are unsupported and must not fall back to a local
-Rust build.
+The intended release target remains CPython 3.14 with the GIL enabled on Linux x86_64,
+with a `manylinux_2_34` baseline. No source distribution is planned. Other platforms and Python
+versions are not supported release targets; local developer builds do not change that scope.
 
-Install the exact binary release in a new virtual environment:
+Once the exact release is available on PyPI, install it in a fresh environment with
+`uv pip install --only-binary :all: cairn-papi==2.0.0rc16`. Do not interpret a version in this
+source document as proof of publication.
+
+Alternatively, install a locally built and verified wheel into a fresh
+environment. From the directory containing that wheel:
 
 ```bash
-python3.14 -m venv .venv
-.venv/bin/python -m pip install --only-binary=:all: nautilus-trader-papi==2.0.0rc16
+uv venv --python 3.14 cairn-env
+uv pip install --python cairn-env/bin/python --only-binary :all: ./cairn_papi-2.0.0rc16-cp314-cp314-manylinux_2_34_x86_64.whl
+uv pip check --python cairn-env/bin/python
+cairn-env/bin/python -c "import nautilus_trader; print(nautilus_trader.__version__)"
 ```
 
-Do not install `nautilus-trader` and `nautilus-trader-papi` together. Both distributions provide
-the same `nautilus_trader` package and `_libnautilus` extension. Remove the official distribution,
-or preferably create a fresh environment, before installing this fork.
+**Do not install `cairn-papi`, `nautilus-trader-papi`, and `nautilus-trader` together.** All three
+provide the same import namespace and can overwrite each other's files. Use exactly one per
+environment. A different distribution name does not satisfy dependencies on the old name.
 
-The fork uses its own PEP 440 version sequence. `2.0.0rc7` is the first published PAPI candidate;
-future PAPI changes receive a new public version even when the tracked upstream version is
-unchanged. A matching number does not imply that the two distributions are interchangeable.
+## Migration from the old distribution
+
+After a Cairn PAPI release has been published and verified, update downstream dependency names,
+version pins, artifact hashes, and lockfiles. This includes the `nacre_trader` worker extra and any
+transitive dependency that still requires `nautilus-trader-papi` or `nautilus-trader`.
+Do not use a compatibility shim or permanent `--no-deps` installation to conceal conflicts.
+
+Keep `import nautilus_trader` and existing API calls unchanged. Change distribution metadata
+queries to `importlib.metadata.version("cairn-papi")`. Use a fresh environment and run `pip check`
+or `uv pip check` after installing the downstream application. Follow the upgrade and rollback
+procedure below before moving a live process. Renaming does not change PAPI interfaces, trading
+logic, risk controls, or broker attribution.
+
+A future return to upstream also requires a fresh environment, dependency updates, and explicit
+API, behavior, and persisted-state compatibility checks. It is not an automatic package swap.
+
+## Earlier PAPI release history
+
+The following versioned notes describe the old distribution. Matching version numbers do not imply
+that independently built artifacts are interchangeable.
 
 ## Standard account queries in 2.0.0rc16
 

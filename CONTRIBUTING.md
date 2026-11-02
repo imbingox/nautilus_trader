@@ -1,14 +1,13 @@
-# Contributing to NautilusTrader
+# Contributing to Cairn PAPI
 
-Thank you for helping improve NautilusTrader. High-quality contributions from the trading
-community are welcome. This guide explains how to prepare a complete, review-ready pull request.
-For questions, ask in
-[GitHub Discussions](https://github.com/nautechsystems/nautilus_trader/discussions) or on
-[Discord](https://discord.gg/NautilusTrader).
+This is a temporary personal fork based on NautilusTrader. For fork-specific questions, use
+[this repository](https://github.com/imbingox/nautilus_trader/issues). Nautech Systems Pty Ltd
+does not support this fork. See [README.md](README.md) for scope and migration plans.
 
-> [!IMPORTANT]
->
-> Never report a security vulnerability as a public issue. Follow [SECURITY.md](SECURITY.md) instead.
+Never report security vulnerabilities publicly; see [SECURITY.md](SECURITY.md).
+
+The development standards below are retained from upstream. Upstream contribution procedures
+apply when submitting changes to upstream, not as a promise of maintenance for this fork.
 
 ## Review standard
 

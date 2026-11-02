@@ -30,7 +30,7 @@ import nautilus_trader
 
 
 # -- Project information -----------------------------------------------------
-project = "NautilusTrader"
+project = "Cairn PAPI"
 author = "Nautech Systems Pty Ltd."
 copyright = "2015-2026 Nautech Systems Pty Ltd"
 version = nautilus_trader.__version__
@@ -45,8 +45,7 @@ extensions = [
 ]
 
 html_theme = "furo"
-html_title = "NautilusTrader Python API"
-html_favicon = "https://nautilustrader.io/docs/img/shell.ico"
+html_title = "Cairn PAPI Python API"
 
 html_theme_options = {
     "dark_css_variables": {
@@ -66,8 +65,8 @@ html_theme_options = {
         "color-brand-content": "#007e68",
     },
     "footer_icons": [],
-    "source_repository": "https://github.com/nautechsystems/nautilus_trader",
-    "source_branch": "master",
+    "source_repository": "https://github.com/imbingox/nautilus_trader",
+    "source_branch": "main",
     "source_directory": "docs/api_reference/",
 }
 
