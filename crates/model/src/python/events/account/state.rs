@@ -21,20 +21,17 @@ use nautilus_core::{
         IntoPyObjectNautilusExt,
         params::params_to_pydict,
         parsing::{get_required, get_required_list, get_required_parsed, get_required_string},
+        serialization::{from_pyobject_pyo3, to_pyobject_pyo3},
         to_pyvalue_err,
     },
 };
-use pyo3::{
-    basic::CompareOp,
-    prelude::*,
-    types::{PyDict, PyList},
-};
+use pyo3::{basic::CompareOp, prelude::*, types::PyDict};
 
 use crate::{
     enums::AccountType,
     events::AccountState,
     identifiers::AccountId,
-    types::{AccountBalance, Currency, MarginBalance, Money},
+    types::{AccountBalance, Currency, MarginBalance, Money, balance::StoredWalletTotal},
 };
 
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -190,13 +187,9 @@ impl AccountState {
             .collect::<PyResult<Vec<AccountBalance>>>()?;
         let margins_list = get_required_list(values, "margins")?;
         let total_only_balances = match values.get_item("total_only_balances")? {
-            Some(item) => item
-                .cast::<PyList>()?
-                .iter()
-                .map(|item| {
-                    let value = item.extract::<String>()?;
-                    Money::from_str(&value).map_err(to_pyvalue_err)
-                })
+            Some(item) => from_pyobject_pyo3::<Vec<StoredWalletTotal>>(values.py(), &item)?
+                .into_iter()
+                .map(|total| total.into_money().map_err(to_pyvalue_err))
                 .collect::<PyResult<Vec<_>>>()?,
             None => Vec::new(),
         };
@@ -260,10 +253,7 @@ impl AccountState {
         dict.set_item("balances", balances_dict?)?;
         dict.set_item(
             "total_only_balances",
-            self.total_only_balances
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
+            to_pyobject_pyo3(py, &self.stored_totals().map_err(to_pyvalue_err)?)?,
         )?;
         dict.set_item("margins", margins_dict?)?;
         dict.set_item("reported", self.is_reported)?;

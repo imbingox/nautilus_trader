@@ -1134,15 +1134,16 @@ impl DatabaseQueries {
 
         sqlx::query(r#"
             INSERT INTO "account_event" (
-                id, kind, account_id, base_currency, balances, margins, is_reported, ts_event, ts_init, created_at, updated_at
+                id, kind, account_id, base_currency, balances, margins, is_reported, ts_event, ts_init,
+                info, total_only_balances, created_at, updated_at
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
             )
             ON CONFLICT (id)
             DO UPDATE
             SET
                 kind = $2, account_id = $3, base_currency = $4, balances = $5, margins = $6, is_reported = $7,
-                ts_event = $8, ts_init = $9, updated_at = CURRENT_TIMESTAMP
+                ts_event = $8, ts_init = $9, info = $10, total_only_balances = $11, updated_at = CURRENT_TIMESTAMP
         "#)
             .bind(account_event.event_id.to_string())
             .bind(account_event.account_type.to_string())
@@ -1153,6 +1154,8 @@ impl DatabaseQueries {
             .bind(account_event.is_reported)
             .bind(account_event.ts_event.to_string())
             .bind(account_event.ts_init.to_string())
+            .bind(event.get("info"))
+            .bind(&event["total_only_balances"])
             .execute(&mut *transaction)
             .await
             .map(|_| ())

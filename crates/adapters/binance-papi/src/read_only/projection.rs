@@ -18,11 +18,11 @@ use std::time::Duration;
 use nautilus_common::live::dst::time::Instant;
 use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::{
-    enums::AccountType,
+    enums::{AccountType, CurrencyType},
     events::AccountState,
     identifiers::AccountId,
     instruments::Instrument,
-    types::{Currency, Money},
+    types::{Currency, Money, fixed::FIXED_PRECISION},
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -33,7 +33,7 @@ use crate::{
     observations::{
         ObservationData, ObservationFailure, ObservationSource, ObservationTiming, ReceiptStatus,
         fields::Field,
-        models::{AccountSummary, UmPosition},
+        models::{AccountSummary, AssetBalance, UmPosition},
     },
     reports::InstrumentScope,
 };
@@ -216,6 +216,7 @@ pub(super) fn project_query_account(
     let uni_mmr = summary.uni_mmr.require("/papi/v1/account uniMMR")?;
     let mut receipts = Vec::new();
     let mut balance_times = Vec::new();
+    let mut assets = Vec::new();
     let mut summary_received = None;
     let mut position_metrics = Vec::new();
 
@@ -234,6 +235,7 @@ pub(super) fn project_query_account(
             ObservationData::Account(_) => summary_received = Some(observation.ts_received),
             ObservationData::Balances(rows) => {
                 for row in rows {
+                    assets.push(wallet_asset_info(row));
                     balance_times.push(json!({
                         "asset": row.asset,
                         "ts_source": row.update_time.require("updateTime").ok().map(|time| time.nanoseconds),
@@ -257,7 +259,7 @@ pub(super) fn project_query_account(
             _ => {}
         }
     }
-    let mut info = Params::new();
+    let mut info = wallet_info(assets);
     info.insert("papi".to_string(), json!({
         "portfolio_margin": {
             "source": "/papi/v1/account",
@@ -358,6 +360,7 @@ fn project_wallet<'a>(
     let mut issues = validation.issues;
     let mut status = validation.status;
     let mut totals = Vec::new();
+    let mut assets = Vec::new();
 
     if issues.is_empty() {
         let Some(balance) = sources[0] else {
@@ -396,7 +399,10 @@ fn project_wallet<'a>(
 
         for row in rows {
             match validate_wallet_row(row) {
-                Ok(total) => totals.push(total),
+                Ok(total) => {
+                    totals.push(total);
+                    assets.push(wallet_asset_info(row));
+                }
                 Err(e) => issues.push(e.to_string()),
             }
         }
@@ -435,7 +441,7 @@ fn project_wallet<'a>(
         )
         .with_total_only_balances(totals)
         {
-            Ok(state) => Some(state),
+            Ok(state) => Some(state.with_info(Some(wallet_info(assets)))),
             Err(e) => {
                 issues.push(e.to_string());
                 status = ProjectionStatus::Unsupported;
@@ -783,7 +789,56 @@ fn update_status(current: &mut ProjectionStatus, candidate: ProjectionStatus) {
     }
 }
 
-fn validate_wallet_row(row: &crate::observations::models::AssetBalance) -> anyhow::Result<Money> {
+fn wallet_info(assets: Vec<Value>) -> Params {
+    let mut wallet = json!({"source": "/papi/v1/balance", "coverage": "returned_assets"});
+    wallet["assets"] = Value::Array(assets);
+    let mut info = Params::new();
+    info.insert("papi_wallet".to_string(), wallet);
+    info
+}
+
+fn wallet_asset_info(row: &AssetBalance) -> Value {
+    json!({
+        "asset": row.asset,
+        "total_wallet_balance": row.total_wallet_balance.require("totalWalletBalance").ok(),
+        "cross_margin_asset": row.cross_margin_asset.require("crossMarginAsset").ok(),
+        "cross_margin_free": row.cross_margin_free.require("crossMarginFree").ok(),
+        "cross_margin_locked": row.cross_margin_locked.require("crossMarginLocked").ok(),
+        "cross_margin_borrowed": row.cross_margin_borrowed.require("crossMarginBorrowed").ok(),
+        "cross_margin_interest": row.cross_margin_interest.require("crossMarginInterest").ok(),
+        "negative_balance": row.negative_balance.require("negativeBalance").ok(),
+        "um_wallet_balance": row.um_wallet_balance.require("umWalletBalance").ok(),
+        "cm_wallet_balance": row.cm_wallet_balance.require("cmWalletBalance").ok(),
+    })
+}
+
+// Compare exact signed mantissas at a common scale. Decimal arithmetic can round a
+// sum at its precision limit, which would hide a discrepancy in the venue response.
+fn amounts_balance(terms: &[(rust_decimal::Decimal, bool)]) -> bool {
+    let scale = terms
+        .iter()
+        .map(|(value, _)| value.scale())
+        .max()
+        .unwrap_or(0);
+    terms.iter().try_fold(0_i128, |sum, (value, add)| {
+        let amount = value
+            .mantissa()
+            .checked_mul(10_i128.pow(scale - value.scale()))?;
+
+        if *add {
+            sum.checked_add(amount)
+        } else {
+            sum.checked_sub(amount)
+        }
+    }) == Some(0)
+}
+
+fn validate_wallet_row(row: &AssetBalance) -> anyhow::Result<Money> {
+    project_wallet_amount(row)
+        .map_err(|e| anyhow::anyhow!("PAPI /papi/v1/balance asset {}: {e}", row.asset))
+}
+
+fn project_wallet_amount(row: &AssetBalance) -> anyhow::Result<Money> {
     let borrowed = row
         .cross_margin_borrowed
         .require("crossMarginBorrowed")?
@@ -793,16 +848,52 @@ fn validate_wallet_row(row: &crate::observations::models::AssetBalance) -> anyho
         .require("crossMarginInterest")?
         .value();
     anyhow::ensure!(
-        borrowed.is_zero() && interest.is_zero(),
-        "PAPI asset {} has unsupported nonzero borrowing or interest",
-        row.asset
+        borrowed >= rust_decimal::Decimal::ZERO && interest >= rust_decimal::Decimal::ZERO,
+        "Negative crossMarginBorrowed or crossMarginInterest"
     );
-    let currency = Currency::try_from_str(&row.asset)
-        .ok_or_else(|| anyhow::anyhow!("Unknown PAPI asset currency {}", row.asset))?;
     let amount = row
         .total_wallet_balance
         .require("totalWalletBalance")?
         .value();
+    if !borrowed.is_zero() || !interest.is_zero() {
+        let free = row.cross_margin_free.require("crossMarginFree")?.value();
+        let locked = row
+            .cross_margin_locked
+            .require("crossMarginLocked")?
+            .value();
+        let cross = row.cross_margin_asset.require("crossMarginAsset")?.value();
+        let um = row.um_wallet_balance.require("umWalletBalance")?.value();
+        let cm = row.cm_wallet_balance.require("cmWalletBalance")?.value();
+        anyhow::ensure!(
+            amounts_balance(&[
+                (free, true),
+                (locked, true),
+                (borrowed, false),
+                (interest, false),
+                (cross, false)
+            ]),
+            "crossMarginAsset does not reconcile with free, locked, borrowed and interest"
+        );
+        anyhow::ensure!(
+            amounts_balance(&[(cross, true), (um, true), (cm, true), (amount, false)]),
+            "totalWalletBalance does not reconcile with crossMarginAsset, umWalletBalance and cmWalletBalance"
+        );
+    }
+    let currency = match Currency::try_from_str(&row.asset) {
+        Some(currency) => currency,
+        None => {
+            let currency = Currency::new_checked(
+                &row.asset,
+                FIXED_PRECISION,
+                0,
+                &row.asset,
+                CurrencyType::Crypto,
+            )?;
+            Currency::register(currency, false)?;
+            Currency::try_from_str(&row.asset)
+                .ok_or_else(|| anyhow::anyhow!("Wallet currency registration failed"))?
+        }
+    };
     let money = Money::from_decimal(amount, currency)
         .map_err(|_| anyhow::anyhow!("PAPI asset {} cannot be represented as Money", row.asset))?;
     anyhow::ensure!(

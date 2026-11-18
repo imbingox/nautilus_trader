@@ -3028,7 +3028,10 @@ mod tests {
                 .last_event()
                 .unwrap()
                 .info
-                .is_none()
+                .as_ref()
+                .is_some_and(
+                    |info| !info.contains_key("papi") && info["papi_wallet"]["assets"].is_array()
+                )
         );
         harness.exec_engine().borrow_mut().stop_clients();
         websocket.abort();
@@ -3968,8 +3971,13 @@ mod tests {
         assert!(server.requests().is_empty());
     }
 
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
     #[tokio::test]
-    async fn private_recovery_publishes_account_through_runner_and_portfolio() {
+    async fn private_recovery_publishes_account_through_runner_and_portfolio(
+        #[case] liabilities: bool,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let websocket_url = format!("ws://{}/ws", listener.local_addr().unwrap());
         let websocket_task = tokio::spawn(async move {
@@ -3985,9 +3993,28 @@ mod tests {
                 }
             }
         });
-        let server = MockServer::new(|request| {
+        let server = MockServer::new(move |request| {
             if request.path == "/papi/v1/balance" {
-                Reply::json(&testing::supported_balances())
+                if liabilities {
+                    let rows = [
+                        ("BNB", "0", "0.01", "0.99", "1"),
+                        ("USDT", "2", "0", "-1", "1"),
+                        ("USDC", "0", "0.01", "0", "0.01"),
+                        ("WBETH", "0", "0", "0.000000001", "0.000000001"),
+                        ("NEWPAPIASSET", "1", "0.01", "0.99", "2"),
+                    ]
+                    .map(|(asset, borrowed, interest, net, free)| {
+                        json!({
+                            "asset": asset, "totalWalletBalance": net, "crossMarginAsset": net,
+                            "crossMarginFree": free, "crossMarginLocked": "0",
+                            "crossMarginBorrowed": borrowed, "crossMarginInterest": interest,
+                            "umWalletBalance": "0", "cmWalletBalance": "0",
+                        })
+                    });
+                    Reply::json(&json!(rows))
+                } else {
+                    Reply::json(&testing::supported_balances())
+                }
             } else {
                 testing::quiet(request)
             }
@@ -4029,6 +4056,17 @@ mod tests {
         AsyncRunner::handle_exec_event(event);
         let account = client.get_account().unwrap();
         assert!(!account.total_only_balances().is_empty());
+        if liabilities {
+            let event = account.last_event().unwrap();
+            let wallet = &event.info.as_ref().unwrap()["papi_wallet"];
+            assert_eq!(wallet["assets"][0]["cross_margin_interest"], "0.01");
+            assert_eq!(wallet["assets"][1]["cross_margin_borrowed"], "2");
+            assert_eq!(
+                account.total_only_balances()[&Currency::USDT()],
+                Money::from("-1 USDT")
+            );
+            assert_eq!(account.total_only_balances().len(), 5);
+        }
 
         client.stop().unwrap();
         client.disconnect().await.unwrap();

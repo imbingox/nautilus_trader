@@ -245,7 +245,7 @@ impl Serialize for WalletAccountBalance<'_> {
 }
 
 #[derive(Serialize, Deserialize)]
-struct CurrencyIdentity {
+pub(crate) struct CurrencyIdentity {
     code: String,
     precision: u8,
     iso4217: u16,
@@ -281,6 +281,73 @@ struct WalletAccountBalanceOwned {
     free_minor: String,
 }
 
+// Built-in totals retain the legacy Money string. Other currencies carry the same
+// identity and exact minor-unit representation as self-contained wallet balances.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum StoredWalletTotal {
+    Legacy(String),
+    Defined {
+        currency_identity: CurrencyIdentity,
+        total_minor: String,
+    },
+}
+
+impl TryFrom<&Money> for StoredWalletTotal {
+    type Error = String;
+
+    fn try_from(money: &Money) -> Result<Self, Self::Error> {
+        let currency = money.currency;
+        if Currency::builtin(currency.code.as_str())
+            .is_some_and(|c| has_same_currency_identity(c, currency))
+        {
+            Ok(Self::Legacy(money.to_string()))
+        } else {
+            Ok(Self::Defined {
+                currency_identity: currency.into(),
+                total_minor: minor_units(*money)?,
+            })
+        }
+    }
+}
+
+impl StoredWalletTotal {
+    pub(crate) fn into_money(self) -> Result<Money, String> {
+        match self {
+            Self::Legacy(text) => text.parse(),
+            Self::Defined {
+                currency_identity,
+                total_minor,
+            } => {
+                let currency = currency_identity.into_currency()?;
+                let total = money_from_minor_units(&total_minor, currency)?;
+                Currency::register(currency, false).map_err(|e| e.to_string())?;
+                if !Currency::try_from_str(currency.code.as_str())
+                    .is_some_and(|c| has_same_currency_identity(c, currency))
+                {
+                    return Err(format!(
+                        "Conflicting stored currency definition for {currency}"
+                    ));
+                }
+                Ok(total)
+            }
+        }
+    }
+}
+
+impl CurrencyIdentity {
+    fn into_currency(self) -> Result<Currency, String> {
+        Currency::new_checked(
+            self.code,
+            self.precision,
+            self.iso4217,
+            self.name,
+            self.currency_type,
+        )
+        .map_err(|e| e.to_string())
+    }
+}
+
 #[derive(Deserialize)]
 struct AccountBalanceLegacy {
     currency: Currency,
@@ -301,14 +368,10 @@ impl<'de> Deserialize<'de> for AccountBalance {
         {
             let balance =
                 WalletAccountBalanceOwned::deserialize(value).map_err(serde::de::Error::custom)?;
-            let currency = Currency::new_checked(
-                balance.currency_identity.code,
-                balance.currency_identity.precision,
-                balance.currency_identity.iso4217,
-                balance.currency_identity.name,
-                balance.currency_identity.currency_type,
-            )
-            .map_err(serde::de::Error::custom)?;
+            let currency = balance
+                .currency_identity
+                .into_currency()
+                .map_err(serde::de::Error::custom)?;
             let total = money_from_minor_units(&balance.total_minor, currency)
                 .map_err(serde::de::Error::custom)?;
             let locked = money_from_minor_units(&balance.locked_minor, currency)

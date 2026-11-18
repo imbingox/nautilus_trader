@@ -13,12 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::str::FromStr;
-
-use nautilus_core::{UUID4, UnixNanos};
-use nautilus_model::{
-    enums::AccountType, events::AccountState, identifiers::AccountId, types::Currency,
-};
+use nautilus_model::events::AccountState;
+use serde_json::{Value, json};
 use sqlx::{FromRow, Row, postgres::PgRow};
 
 #[derive(Debug)]
@@ -26,32 +22,26 @@ pub struct AccountEventRow(pub AccountState);
 
 impl<'r> FromRow<'r, PgRow> for AccountEventRow {
     fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
-        let event_id = row.try_get::<&str, _>("id").map(UUID4::from)?;
-        let account_id = row.try_get::<&str, _>("account_id").map(AccountId::from)?;
-        let account_type = AccountType::from_str(row.try_get::<&str, _>("kind")?).unwrap();
-        let is_reported = row.try_get::<bool, _>("is_reported")?;
-        let ts_event = row.try_get::<&str, _>("ts_event").map(UnixNanos::from)?;
-        let ts_init = row.try_get::<&str, _>("ts_init").map(UnixNanos::from)?;
-        let base_currency = row
-            .try_get::<Option<&str>, _>("base_currency")
-            .map(|res| res.map(Currency::from))?;
-        let balances: serde_json::Value = row.try_get("balances")?;
-        let margins: serde_json::Value = row.try_get("margins")?;
-        let balances =
-            serde_json::from_value(balances).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
-        let margins =
-            serde_json::from_value(margins).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
-        let account_event = AccountState::new(
-            account_id,
-            account_type,
-            balances,
-            margins,
-            is_reported,
-            event_id,
-            ts_event,
-            ts_init,
-            base_currency,
-        );
-        Ok(Self(account_event))
+        let nanos = |column: &str| -> Result<u64, sqlx::Error> {
+            row.try_get::<&str, _>(column)?
+                .parse()
+                .map_err(|e| sqlx::Error::Decode(Box::new(e)))
+        };
+        let event = json!({
+            "event_id": row.try_get::<&str, _>("id")?,
+            "account_id": row.try_get::<&str, _>("account_id")?,
+            "account_type": row.try_get::<&str, _>("kind")?,
+            "base_currency": row.try_get::<Option<&str>, _>("base_currency")?,
+            "balances": row.try_get::<Value, _>("balances")?,
+            "margins": row.try_get::<Value, _>("margins")?,
+            "is_reported": row.try_get::<bool, _>("is_reported")?,
+            "ts_event": nanos("ts_event")?,
+            "ts_init": nanos("ts_init")?,
+            "info": row.try_get::<Option<Value>, _>("info")?,
+            "total_only_balances": row.try_get::<Value, _>("total_only_balances")?,
+        });
+        serde_json::from_value(event)
+            .map(Self)
+            .map_err(|e| sqlx::Error::Decode(Box::new(e)))
     }
 }

@@ -153,7 +153,11 @@ impl BinancePapiReadOnlyClient {
                 && projection.risk_status == BinancePapiProjectionStatus::Available
                 && projection.wallet_issues.is_empty()
                 && projection.risk_issues.is_empty(),
-            "PAPI account observations are not valid for trading admission"
+            "PAPI account observations are not valid for trading admission: wallet {:?} ({}), risk {:?} ({})",
+            projection.wallet_status,
+            projection.wallet_issues.join("; "),
+            projection.risk_status,
+            projection.risk_issues.join("; ")
         );
         let account_state = projection
             .account_state

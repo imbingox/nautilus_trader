@@ -27,7 +27,10 @@ use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 use crate::{
     enums::AccountType,
     identifiers::{AccountId, InstrumentId},
-    types::{AccountBalance, Currency, MarginBalance, Money, balance::WalletAccountBalances},
+    types::{
+        AccountBalance, Currency, MarginBalance, Money,
+        balance::{StoredWalletTotal, WalletAccountBalances},
+    },
 };
 
 /// Represents an event which includes information on the state of the account.
@@ -72,8 +75,17 @@ pub struct AccountState {
     /// Reported totals whose free and locked components are unavailable.
     ///
     /// Supported only by margin accounts without local account-state calculation.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "decode_total_only_balances")]
     pub total_only_balances: Vec<Money>,
+}
+
+fn decode_total_only_balances<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<Money>, D::Error> {
+    Vec::<StoredWalletTotal>::deserialize(d)?
+        .into_iter()
+        .map(|total| total.into_money().map_err(serde::de::Error::custom))
+        .collect()
 }
 
 impl Serialize for AccountState {
@@ -100,12 +112,22 @@ impl Serialize for AccountState {
         if include_info {
             state.serialize_field("info", &self.info)?;
         }
-        state.serialize_field("total_only_balances", &self.total_only_balances)?;
+        state.serialize_field(
+            "total_only_balances",
+            &self.stored_totals().map_err(serde::ser::Error::custom)?,
+        )?;
         state.end()
     }
 }
 
 impl AccountState {
+    pub(crate) fn stored_totals(&self) -> Result<Vec<StoredWalletTotal>, String> {
+        self.total_only_balances
+            .iter()
+            .map(StoredWalletTotal::try_from)
+            .collect()
+    }
+
     /// Creates a new [`AccountState`] instance.
     #[expect(clippy::too_many_arguments)]
     #[must_use]
@@ -372,6 +394,28 @@ mod tests {
             original
                 .to_string()
                 .contains("total_only_balances=[19.23 USD, 0.00000000 USDT]")
+        );
+    }
+
+    #[rstest]
+    fn totals_only_restore_unregistered_currency_and_reject_conflicts() {
+        let code = "RESTOREDWALLETTOTAL";
+        let currency = Currency::new(code, 9, 0, code, CurrencyType::Crypto);
+        let mut state = margin_account_state();
+        state.balances.clear();
+        let total = Money::from_mantissa_exponent(-123_456_789, -9, currency);
+        let state = state.with_total_only_balances(vec![total]).unwrap();
+        let mut wire = serde_json::to_value(&state).unwrap();
+        assert!(Currency::try_from_str(code).is_none());
+        let restored: AccountState = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(total.raw(), restored.total_only_balances[0].raw());
+        assert_eq!(Currency::try_from_str(code).unwrap().precision, 9);
+        wire["total_only_balances"][0]["currency_identity"]["precision"] = json!(8);
+        let error = serde_json::from_value::<AccountState>(wire).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Conflicting stored currency definition")
         );
     }
 

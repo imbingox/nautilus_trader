@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 import unittest
+from decimal import Decimal
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -95,13 +96,26 @@ class Venue:
                 "updateTime": SOURCE_MS,
             }
         if path == "/papi/v1/balance":
-            assets = [("USDT", "0")] if self.zero else [("USDT", "1000"), ("BTC", "1")]
+            assets = (
+                [("USDT", "0")]
+                if self.zero
+                else [
+                    ("USDT", "1000"),
+                    ("BTC", "1"),
+                    ("WBETH", "0.000000001"),
+                ]
+            )
             return [
                 {
                     "asset": asset,
                     "totalWalletBalance": amount,
-                    "crossMarginBorrowed": "1" if self.block_recovery else "0",
-                    "crossMarginInterest": "0",
+                    "crossMarginBorrowed": "2" if asset == "USDT" else "0",
+                    "crossMarginInterest": "0.01" if asset == "USDT" else "0",
+                    "crossMarginFree": "2.01" if asset == "USDT" else "0",
+                    "crossMarginLocked": "0",
+                    "crossMarginAsset": "1" if self.block_recovery else "0",
+                    "umWalletBalance": amount,
+                    "cmWalletBalance": "0",
                     "updateTime": SOURCE_MS,
                 }
                 for asset, amount in assets
@@ -362,6 +376,12 @@ class QueryStrategy(Strategy):
         self.check_position_metrics(info)
 
         if self.stage == 0:
+            assert account.balance_total(Currency.from_str("WBETH")).as_decimal() == Decimal(
+                "0.000000001",
+            )
+            wallet = event.info["papi_wallet"]["assets"][0]
+            assert wallet["cross_margin_borrowed"] == "2"
+            assert wallet["cross_margin_interest"] == "0.01"
             assert summary["actual_equity"] == "2234.1234567800"
             assert summary["account_equity"] == "2250.9876543200"
             assert summary["account_maint_margin"] == "0.0000000000000000000000000001"

@@ -42,7 +42,8 @@ mod serial_tests {
         events::{
             OrderEventAny, OrderFilled, OrderSnapshot,
             account::stubs::{
-                cash_account_state_million_usd, wallet_account_state, wallet_account_state_changed,
+                cash_account_state_million_usd, margin_account_state, wallet_account_state,
+                wallet_account_state_changed,
             },
             order::spec::OrderFillVoidedSpec,
         },
@@ -1345,6 +1346,38 @@ mod serial_tests {
         .await;
         let account_result = pg_cache.load_account(&account.id()).await.unwrap();
         assert_entirely_equal(account_result.unwrap(), account);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_total_only_account_preserves_currency_and_liability_info() {
+        let options = get_postgres_connect_options(None, None, None, None, None);
+        let pool = connect_test_pg(options.into()).await.unwrap();
+        let mut state = margin_account_state();
+        state.account_id = AccountId::from("TEST-WALLETTOTAL");
+        state.base_currency = None;
+        state.balances.clear();
+        state.margins.clear();
+        let currency = Currency::new("SQLWALLETTOKEN", 9, 0, "SQL wallet", CurrencyType::Crypto);
+        let total = Money::from_mantissa_exponent(-1, -9, currency);
+        let mut info = Params::new();
+        info.insert("principal".to_string(), serde_json::json!("1.000000001"));
+        let state = state
+            .with_total_only_balances(vec![total])
+            .unwrap()
+            .with_info(Some(info));
+        DatabaseQueries::add_account(&pool, false, state.clone())
+            .await
+            .unwrap();
+        let events = DatabaseQueries::load_account_events(&pool, &state.account_id)
+            .await
+            .unwrap();
+        let restored = events
+            .iter()
+            .find(|event| event.event_id == state.event_id)
+            .unwrap();
+        assert_eq!(restored.info, state.info);
+        assert_eq!(restored.total_only_balances[0].raw(), total.raw());
+        assert_eq!(restored.total_only_balances[0].currency.precision, 9);
     }
 
     #[tokio::test(flavor = "multi_thread")]

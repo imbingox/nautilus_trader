@@ -447,7 +447,10 @@ async fn test_account_snapshot_separates_wallet_and_pm_risk_validity() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|issue| issue.as_str().unwrap().contains("borrowing or interest"))
+            .any(|issue| issue
+                .as_str()
+                .unwrap()
+                .contains("USDT: Null PAPI field crossMarginFree"))
     );
     let risk = &snapshot["portfolio_margin_risk"];
     assert_eq!(risk["status"], "available");
@@ -592,7 +595,9 @@ async fn test_account_snapshot_rejects_unsupported_product_scope(
 #[case("total_missing", "Missing PAPI field totalWalletBalance")]
 #[case("total_null", "Null PAPI field totalWalletBalance")]
 #[case("total_invalid", "Invalid PAPI field totalWalletBalance")]
-#[case("unknown_currency", "Unknown PAPI asset currency")]
+#[case("negative_borrowed", "Negative crossMarginBorrowed")]
+#[case("inconsistent_liability", "crossMarginAsset does not reconcile")]
+#[case("inconsistent_total", "totalWalletBalance does not reconcile")]
 #[case("inexact_total", "loses precision")]
 #[tokio::test]
 async fn test_account_snapshot_rejects_unavailable_or_inexact_wallet_fields(
@@ -618,7 +623,13 @@ async fn test_account_snapshot_rejects_unavailable_or_inexact_wallet_fields(
             }
             "total_null" => row["totalWalletBalance"] = Value::Null,
             "total_invalid" => row["totalWalletBalance"] = json!(1),
-            "unknown_currency" => row["asset"] = json!("NOT_REGISTERED_ASSET"),
+            "negative_borrowed" => row["crossMarginBorrowed"] = json!("-1"),
+            "inconsistent_liability" => row["crossMarginInterest"] = json!("0.01"),
+            "inconsistent_total" => {
+                row["crossMarginBorrowed"] = json!("1");
+                row["crossMarginFree"] = json!("1.75");
+                row["totalWalletBalance"] = json!("0");
+            }
             "inexact_total" => row["totalWalletBalance"] = json!("1.000000001"),
             _ => unreachable!(),
         }

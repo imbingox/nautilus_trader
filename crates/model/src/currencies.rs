@@ -52,6 +52,13 @@ macro_rules! currency_constants {
         $currency_type:ident;
     )+) => {
         impl Currency {
+            pub(crate) fn builtin(code: &str) -> Option<Self> {
+                match code {
+                    $($code => Some(Self::$accessor()),)+
+                    _ => None,
+                }
+            }
+
             $(
                 #[doc = concat!("Returns the ", $name, " (`", $code, "`) currency.")]
                 #[allow(non_snake_case)]

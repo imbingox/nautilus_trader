@@ -28,7 +28,7 @@ with a `manylinux_2_34` baseline. No source distribution is planned. Other platf
 versions are not supported release targets; local developer builds do not change that scope.
 
 Once the exact release is available on PyPI, install it in a fresh environment with
-`uv pip install --only-binary :all: cairn-papi==2.0.0rc16`. Do not interpret a version in this
+`uv pip install --only-binary :all: cairn-papi==2.0.0rc17`. Do not interpret a version in this
 source document as proof of publication.
 
 Alternatively, install a locally built and verified wheel into a fresh
@@ -36,7 +36,7 @@ environment. From the directory containing that wheel:
 
 ```bash
 uv venv --python 3.14 cairn-env
-uv pip install --python cairn-env/bin/python --only-binary :all: ./cairn_papi-2.0.0rc16-cp314-cp314-manylinux_2_34_x86_64.whl
+uv pip install --python cairn-env/bin/python --only-binary :all: ./cairn_papi-2.0.0rc17-cp314-cp314-manylinux_2_34_x86_64.whl
 uv pip check --python cairn-env/bin/python
 cairn-env/bin/python -c "import nautilus_trader; print(nautilus_trader.__version__)"
 ```
@@ -62,6 +62,13 @@ A future return to upstream also requires a fresh environment, dependency update
 API, behavior, and persisted-state compatibility checks. It is not an automatic package swap.
 
 ## Earlier PAPI release history
+
+## Wallet assets in 2.0.0rc17
+
+Wallet initialization and recovery support borrowing and interest when the exchange's wallet
+components reconcile. Account events expose principal and interest by asset. Wallet-only assets
+such as WBETH can be discovered from the balance response and restored from account events.
+Apply the updated table definitions before using PostgreSQL persistence.
 
 The following versioned notes describe the old distribution. Matching version numbers do not imply
 that independently built artifacts are interchangeable.

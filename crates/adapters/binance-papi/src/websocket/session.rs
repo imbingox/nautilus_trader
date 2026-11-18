@@ -1544,11 +1544,15 @@ enum RecoveryOutcome {
 fn validate_projection(projection: &BinancePapiAccountProjection) -> anyhow::Result<()> {
     anyhow::ensure!(
         projection.wallet_status == BinancePapiProjectionStatus::Available,
-        "PAPI wallet projection is unavailable"
+        "PAPI wallet projection is unavailable: {:?}: {}",
+        projection.wallet_status,
+        projection.wallet_issues.join("; ")
     );
     anyhow::ensure!(
         projection.risk_status == BinancePapiProjectionStatus::Available,
-        "PAPI risk projection is unavailable"
+        "PAPI risk projection is unavailable: {:?}: {}",
+        projection.risk_status,
+        projection.risk_issues.join("; ")
     );
     anyhow::ensure!(
         !projection.trading_authorized,
