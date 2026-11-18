@@ -165,8 +165,11 @@ def validate_wheel(path: Path) -> dict[str, Any]:
         )
         description = " ".join(metadata.get_payload().split())
         _require(
-            "not affiliated with, endorsed by, or supported by Nautech Systems Pty Ltd."
-            in description,
+            re.search(
+                r"not affiliated with, endorsed by, or supported by Nautech Systems Pty Ltd"
+                r"(?: or the NautilusTrader project)?\.",
+                description,
+            ),
             "METADATA description must contain the third-party disclaimer",
         )
         classifiers = metadata.get_all("Classifier", [])

@@ -243,3 +243,11 @@ def test_verify_wheel_requires_third_party_disclaimer(tmp_path: Path) -> None:
     """
     with pytest.raises(ValueError, match="third-party disclaimer"):
         _load_verifier().validate_wheel(_wheel(tmp_path, disclaimer="Based on NautilusTrader"))
+
+
+def test_verify_wheel_accepts_package_readme(tmp_path: Path) -> None:
+    """
+    Verify the published project description satisfies the disclaimer check.
+    """
+    description = (REPO_ROOT / "python/README_PAPI.md").read_text(encoding="utf-8")
+    _load_verifier().validate_wheel(_wheel(tmp_path, disclaimer=description))
