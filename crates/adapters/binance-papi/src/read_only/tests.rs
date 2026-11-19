@@ -522,6 +522,37 @@ async fn test_account_snapshot_publishes_complete_totals_only_state() {
 }
 
 #[tokio::test]
+async fn wallet_differences_preserve_mixed_scales_at_decimal_limits() {
+    let server = MockServer::new(|request| {
+        if request.path != "/papi/v1/balance" {
+            return testing::quiet(request);
+        }
+        let mut rows = testing::supported_balances();
+        rows[0]["crossMarginFree"] = json!("79228162514264337593543950335");
+        rows[0]["crossMarginBorrowed"] = rows[0]["crossMarginFree"].clone();
+        rows[0]["crossMarginLocked"] = json!("1");
+        rows[0]["crossMarginInterest"] = json!("0.0000000000000000000000000001");
+        Reply::json(&rows)
+    })
+    .await;
+    let client = testing::client(&server, &["BTCUSDT"]);
+    client.refresh_account_observations().await.unwrap();
+    let snapshot: Value = serde_json::from_str(
+        &client
+            .account_snapshot_json(Duration::from_secs(30), Duration::from_secs(30))
+            .unwrap(),
+    )
+    .unwrap();
+    let assets = &snapshot["wallet"]["value"]["info"]["papi_wallet"]["assets"];
+    assert_eq!(
+        assets[0]["cross_margin_asset_delta"],
+        "0.0000000000000000000000000001"
+    );
+    assert_eq!(assets[0]["total_wallet_balance_delta"], "0");
+    assert_eq!(assets[1]["cross_margin_asset_delta"], Value::Null);
+}
+
+#[tokio::test]
 async fn test_account_snapshot_supports_united_stables_balance() {
     let server = MockServer::new(|request| {
         if request.path == "/papi/v1/balance" {
@@ -596,8 +627,7 @@ async fn test_account_snapshot_rejects_unsupported_product_scope(
 #[case("total_null", "Null PAPI field totalWalletBalance")]
 #[case("total_invalid", "Invalid PAPI field totalWalletBalance")]
 #[case("negative_borrowed", "Negative crossMarginBorrowed")]
-#[case("inconsistent_liability", "crossMarginAsset does not reconcile")]
-#[case("inconsistent_total", "totalWalletBalance does not reconcile")]
+#[case("missing_liability_component", "Missing PAPI field crossMarginFree")]
 #[case("inexact_total", "loses precision")]
 #[tokio::test]
 async fn test_account_snapshot_rejects_unavailable_or_inexact_wallet_fields(
@@ -624,11 +654,9 @@ async fn test_account_snapshot_rejects_unavailable_or_inexact_wallet_fields(
             "total_null" => row["totalWalletBalance"] = Value::Null,
             "total_invalid" => row["totalWalletBalance"] = json!(1),
             "negative_borrowed" => row["crossMarginBorrowed"] = json!("-1"),
-            "inconsistent_liability" => row["crossMarginInterest"] = json!("0.01"),
-            "inconsistent_total" => {
+            "missing_liability_component" => {
                 row["crossMarginBorrowed"] = json!("1");
-                row["crossMarginFree"] = json!("1.75");
-                row["totalWalletBalance"] = json!("0");
+                row.as_object_mut().unwrap().remove("crossMarginFree");
             }
             "inexact_total" => row["totalWalletBalance"] = json!("1.000000001"),
             _ => unreachable!(),

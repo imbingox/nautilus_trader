@@ -15,6 +15,7 @@
 
 use std::time::Duration;
 
+use bigdecimal::BigDecimal;
 use nautilus_common::live::dst::time::Instant;
 use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::{
@@ -32,7 +33,7 @@ use crate::{
     http::BinancePapiResponseMetadata,
     observations::{
         ObservationData, ObservationFailure, ObservationSource, ObservationTiming, ReceiptStatus,
-        fields::Field,
+        fields::{Amount, Field},
         models::{AccountSummary, AssetBalance, UmPosition},
     },
     reports::InstrumentScope,
@@ -192,7 +193,7 @@ pub(super) fn project_query_account(
         "{}",
         validation.issues.join("; ")
     );
-    let state = project_query_wallet(sources, context)?;
+    let (state, assets) = project_query_wallet(sources, context)?;
     let account = find_source(sources, |source| {
         matches!(source, ObservationSource::Account)
     });
@@ -216,7 +217,6 @@ pub(super) fn project_query_account(
     let uni_mmr = summary.uni_mmr.require("/papi/v1/account uniMMR")?;
     let mut receipts = Vec::new();
     let mut balance_times = Vec::new();
-    let mut assets = Vec::new();
     let mut summary_received = None;
     let mut position_metrics = Vec::new();
 
@@ -235,7 +235,6 @@ pub(super) fn project_query_account(
             ObservationData::Account(_) => summary_received = Some(observation.ts_received),
             ObservationData::Balances(rows) => {
                 for row in rows {
-                    assets.push(wallet_asset_info(row));
                     balance_times.push(json!({
                         "asset": row.asset,
                         "ts_source": row.update_time.require("updateTime").ok().map(|time| time.nanoseconds),
@@ -293,7 +292,7 @@ pub(super) fn project_query_account(
 fn project_query_wallet(
     sources: &[StoredObservation],
     context: &AccountProjectionContext<'_>,
-) -> anyhow::Result<AccountState> {
+) -> anyhow::Result<(AccountState, Vec<Value>)> {
     let balance = find_source(sources, |source| {
         matches!(source, ObservationSource::Balance { asset: None })
     })
@@ -303,11 +302,14 @@ fn project_query_wallet(
     let ObservationData::Balances(rows) = &balance.data else {
         anyhow::bail!("PAPI /papi/v1/balance contained unexpected data");
     };
-    let totals = rows
-        .iter()
-        .map(validate_wallet_row)
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(AccountState::new(
+    let mut totals = Vec::with_capacity(rows.len());
+    let mut assets = Vec::with_capacity(rows.len());
+    for row in rows {
+        let (total, asset) = project_wallet_row(row)?;
+        totals.push(total);
+        assets.push(asset);
+    }
+    let state = AccountState::new(
         context.account_id,
         AccountType::Margin,
         Vec::new(),
@@ -318,7 +320,8 @@ fn project_query_wallet(
         context.ts_init,
         None,
     )
-    .with_total_only_balances(totals)?)
+    .with_total_only_balances(totals)?;
+    Ok((state, assets))
 }
 
 fn project_position_metrics(position: &UmPosition, scope: &InstrumentScope) -> Value {
@@ -398,10 +401,10 @@ fn project_wallet<'a>(
         };
 
         for row in rows {
-            match validate_wallet_row(row) {
-                Ok(total) => {
+            match project_wallet_row(row) {
+                Ok((total, asset)) => {
                     totals.push(total);
-                    assets.push(wallet_asset_info(row));
+                    assets.push(asset);
                 }
                 Err(e) => issues.push(e.to_string()),
             }
@@ -797,7 +800,11 @@ fn wallet_info(assets: Vec<Value>) -> Params {
     info
 }
 
-fn wallet_asset_info(row: &AssetBalance) -> Value {
+fn wallet_asset_info(
+    row: &AssetBalance,
+    cross_delta: Option<&str>,
+    total_delta: Option<&str>,
+) -> Value {
     json!({
         "asset": row.asset,
         "total_wallet_balance": row.total_wallet_balance.require("totalWalletBalance").ok(),
@@ -809,36 +816,22 @@ fn wallet_asset_info(row: &AssetBalance) -> Value {
         "negative_balance": row.negative_balance.require("negativeBalance").ok(),
         "um_wallet_balance": row.um_wallet_balance.require("umWalletBalance").ok(),
         "cm_wallet_balance": row.cm_wallet_balance.require("cmWalletBalance").ok(),
+        "cross_margin_asset_delta": cross_delta,
+        "total_wallet_balance_delta": total_delta,
     })
 }
 
-// Compare exact signed mantissas at a common scale. Decimal arithmetic can round a
-// sum at its precision limit, which would hide a discrepancy in the venue response.
-fn amounts_balance(terms: &[(rust_decimal::Decimal, bool)]) -> bool {
-    let scale = terms
-        .iter()
-        .map(|(value, _)| value.scale())
-        .max()
-        .unwrap_or(0);
-    terms.iter().try_fold(0_i128, |sum, (value, add)| {
-        let amount = value
-            .mantissa()
-            .checked_mul(10_i128.pow(scale - value.scale()))?;
-
-        if *add {
-            sum.checked_add(amount)
-        } else {
-            sum.checked_sub(amount)
-        }
-    }) == Some(0)
+// Aligning decimal scales can exceed even i128 for individually representable venue values
+fn exact_amount(amount: rust_decimal::Decimal) -> BigDecimal {
+    BigDecimal::from_bigint(amount.mantissa().into(), i64::from(amount.scale()))
 }
 
-fn validate_wallet_row(row: &AssetBalance) -> anyhow::Result<Money> {
+fn project_wallet_row(row: &AssetBalance) -> anyhow::Result<(Money, Value)> {
     project_wallet_amount(row)
         .map_err(|e| anyhow::anyhow!("PAPI /papi/v1/balance asset {}: {e}", row.asset))
 }
 
-fn project_wallet_amount(row: &AssetBalance) -> anyhow::Result<Money> {
+fn project_wallet_amount(row: &AssetBalance) -> anyhow::Result<(Money, Value)> {
     let borrowed = row
         .cross_margin_borrowed
         .require("crossMarginBorrowed")?
@@ -855,30 +848,32 @@ fn project_wallet_amount(row: &AssetBalance) -> anyhow::Result<Money> {
         .total_wallet_balance
         .require("totalWalletBalance")?
         .value();
-    if !borrowed.is_zero() || !interest.is_zero() {
-        let free = row.cross_margin_free.require("crossMarginFree")?.value();
-        let locked = row
-            .cross_margin_locked
-            .require("crossMarginLocked")?
-            .value();
-        let cross = row.cross_margin_asset.require("crossMarginAsset")?.value();
-        let um = row.um_wallet_balance.require("umWalletBalance")?.value();
-        let cm = row.cm_wallet_balance.require("cmWalletBalance")?.value();
-        anyhow::ensure!(
-            amounts_balance(&[
-                (free, true),
-                (locked, true),
-                (borrowed, false),
-                (interest, false),
-                (cross, false)
-            ]),
-            "crossMarginAsset does not reconcile with free, locked, borrowed and interest"
-        );
-        anyhow::ensure!(
-            amounts_balance(&[(cross, true), (um, true), (cm, true), (amount, false)]),
-            "totalWalletBalance does not reconcile with crossMarginAsset, umWalletBalance and cmWalletBalance"
-        );
-    }
+    let has_debt = !borrowed.is_zero() || !interest.is_zero();
+    let component = |field: &Field<Amount>, name: &str| -> anyhow::Result<Option<BigDecimal>> {
+        match field.require(name) {
+            Ok(value) => Ok(Some(exact_amount(value.value()))),
+            Err(e) if has_debt => Err(e),
+            Err(_) => Ok(None),
+        }
+    };
+    let free = component(&row.cross_margin_free, "crossMarginFree")?;
+    let locked = component(&row.cross_margin_locked, "crossMarginLocked")?;
+    let cross = component(&row.cross_margin_asset, "crossMarginAsset")?;
+    let um = component(&row.um_wallet_balance, "umWalletBalance")?;
+    let cm = component(&row.cm_wallet_balance, "cmWalletBalance")?;
+    let cross_delta = match (&cross, free, locked) {
+        (Some(cross), Some(free), Some(locked)) => Some(
+            (cross - free - locked + exact_amount(borrowed) + exact_amount(interest))
+                .to_plain_string(),
+        ),
+        _ => None,
+    };
+    let total_delta = match (cross, um, cm) {
+        (Some(cross), Some(um), Some(cm)) => {
+            Some((exact_amount(amount) - cross - um - cm).to_plain_string())
+        }
+        _ => None,
+    };
     let currency = match Currency::try_from_str(&row.asset) {
         Some(currency) => currency,
         None => {
@@ -901,7 +896,10 @@ fn project_wallet_amount(row: &AssetBalance) -> anyhow::Result<Money> {
         "PAPI asset {} loses precision when represented as Money",
         row.asset
     );
-    Ok(money)
+    Ok((
+        money,
+        wallet_asset_info(row, cross_delta.as_deref(), total_delta.as_deref()),
+    ))
 }
 
 fn find_source(

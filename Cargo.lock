@@ -5846,6 +5846,7 @@ dependencies = [
  "async-trait",
  "aws-lc-rs",
  "axum",
+ "bigdecimal",
  "binance-sdk",
  "blake3",
  "futures-util",

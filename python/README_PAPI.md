@@ -28,7 +28,7 @@ with a `manylinux_2_34` baseline. No source distribution is planned. Other platf
 versions are not supported release targets; local developer builds do not change that scope.
 
 Once the exact release is available on PyPI, install it in a fresh environment with
-`uv pip install --only-binary :all: cairn-papi==2.0.0rc17`. Do not interpret a version in this
+`uv pip install --only-binary :all: cairn-papi==2.0.0rc18`. Do not interpret a version in this
 source document as proof of publication.
 
 Alternatively, install a locally built and verified wheel into a fresh
@@ -36,7 +36,7 @@ environment. From the directory containing that wheel:
 
 ```bash
 uv venv --python 3.14 cairn-env
-uv pip install --python cairn-env/bin/python --only-binary :all: ./cairn_papi-2.0.0rc17-cp314-cp314-manylinux_2_34_x86_64.whl
+uv pip install --python cairn-env/bin/python --only-binary :all: ./cairn_papi-2.0.0rc18-cp314-cp314-manylinux_2_34_x86_64.whl
 uv pip check --python cairn-env/bin/python
 cairn-env/bin/python -c "import nautilus_trader; print(nautilus_trader.__version__)"
 ```
@@ -62,6 +62,13 @@ A future return to upstream also requires a fresh environment, dependency update
 API, behavior, and persisted-state compatibility checks. It is not an automatic package swap.
 
 ## Earlier PAPI release history
+
+## Wallet differences in 2.0.0rc18
+
+Wallet component differences are available per asset in `AccountState.info["papi_wallet"]["assets"]`.
+`cross_margin_asset_delta` and `total_wallet_balance_delta` express the reported amount minus
+its component sum in native currency. A nonzero difference permits account queries and order
+recovery. The strategy can use the signed decimal strings to apply its own policy.
 
 ## Wallet assets in 2.0.0rc17
 

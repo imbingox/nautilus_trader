@@ -3490,6 +3490,100 @@ mod tests {
         websocket.abort();
     }
 
+    #[tokio::test]
+    async fn wallet_discrepancy_allows_recovery_query_and_claimed_order_cancel() {
+        let id = ClientOrderId::from("WALLET-DELTA");
+        let now_ms = get_atomic_clock_realtime().get_time_ns().as_u64() / 1_000_000;
+        let server = MockServer::new(move |request| {
+            if request.path == "/papi/v1/balance" {
+                let mut rows = testing::supported_balances();
+                rows[0]["crossMarginInterest"] = json!("0.00000001");
+                return Reply::json(&rows);
+            }
+
+            if matches!(
+                request.path.as_str(),
+                "/papi/v1/um/openOrders" | "/papi/v1/um/allOrders" | "/papi/v1/um/order"
+            ) {
+                let mut order = testing::order();
+                order["clientOrderId"] = json!(id.as_str());
+                order["time"] = json!(now_ms - 1000);
+                order["updateTime"] = json!(now_ms);
+                order["status"] = json!(if request.method == "DELETE" {
+                    "CANCELED"
+                } else {
+                    "NEW"
+                });
+
+                if request.path == "/papi/v1/um/order" {
+                    return Reply::json(&order);
+                }
+                return Reply::json(&json!([order]));
+            }
+            current_trading_reply(request)
+        })
+        .await;
+        let directory = TempDir::new().unwrap();
+        let (url, _updates, websocket) = account_update_websocket().await;
+        let (mut harness, client) = connected_recovery_client(
+            &server,
+            url,
+            directory.path().join("commands.journal"),
+            60_000,
+        )
+        .await;
+        let strategy_id = StrategyId::from("TEST-001");
+        harness
+            .exec_engine()
+            .borrow_mut()
+            .register_external_order_claims(
+                strategy_id,
+                &std::collections::HashSet::from([harness.instrument_id()]),
+            )
+            .unwrap();
+        harness.register_client(Box::new(client)).unwrap();
+        assert!(
+            harness
+                .pump_until(Duration::from_secs(5), |cache| {
+                    cache.order(&id).is_some_and(|order| {
+                        order.strategy_id() == strategy_id
+                            && order.status() == OrderStatus::Accepted
+                    })
+                })
+                .await
+        );
+        let order = harness.cache().borrow().order(&id).unwrap().clone();
+        let mut strategy = harness.register_exec_tester(strategy_id, Quantity::from("0.001"));
+        strategy
+            .query_order(&order, Some(harness.client_id()), None)
+            .unwrap();
+        assert!(
+            harness
+                .pump_until(Duration::from_secs(3), |_| server
+                    .requests()
+                    .iter()
+                    .any(|r| { r.method == "GET" && r.path == "/papi/v1/um/order" }))
+                .await
+        );
+        strategy
+            .cancel_order(id, Some(harness.client_id()), None)
+            .unwrap();
+        assert!(
+            harness
+                .pump_until(Duration::from_secs(3), |cache| {
+                    cache
+                        .order(&id)
+                        .is_some_and(|order| order.status() == OrderStatus::Canceled)
+                })
+                .await
+        );
+        assert!(server.requests().iter().any(|r| r.method == "DELETE"
+            && r.path == "/papi/v1/um/order"
+            && r.params["orderId"] == "270093109"));
+        harness.exec_engine().borrow_mut().stop_clients();
+        websocket.abort();
+    }
+
     #[rstest]
     #[case("single")]
     #[case("batch")]

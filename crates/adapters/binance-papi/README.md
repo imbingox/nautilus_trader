@@ -367,29 +367,29 @@ GET start to the SDK's body receipt. Wall-clock request metadata describes the s
 attempt, not the logical start. Monotonic instants are not persisted or restored through replay.
 These timings do not verify economic freshness or cross-endpoint atomicity. The account snapshot
 requires one generation and a bounded combined span for each view. Its wallet uses
-`totalWalletBalance` as native-currency totals after validating liability reconciliation,
+`totalWalletBalance` as native-currency totals after validating required wallet fields,
 exact `Money` conversion, UM instrument scope, and the absence of unsupported positions
 or orders. Missing, failed, canceled, stale, inconsistent, and semantically
 unsupported results remain distinct and never return a partial `AccountState`.
 
-For a positive `crossMarginBorrowed` or `crossMarginInterest`, the adapter checks two
-identities on the same balance row with exact integer arithmetic:
+Queries and recovery expose the venue's decimal strings and two exact, signed differences
+under `AccountState.info["papi_wallet"]["assets"]`, in the row's native currency:
 
 ```text
-crossMarginAsset = crossMarginFree + crossMarginLocked - crossMarginBorrowed - crossMarginInterest
-totalWalletBalance = crossMarginAsset + umWalletBalance + cmWalletBalance
+cross_margin_asset_delta = crossMarginAsset - (crossMarginFree + crossMarginLocked - crossMarginBorrowed - crossMarginInterest)
+total_wallet_balance_delta = totalWalletBalance - (crossMarginAsset + umWalletBalance + cmWalletBalance)
 ```
 
-These checks establish liability inclusion for the specific row. The adapter publishes the
-reported total once. Queries and recovery events expose the native component amounts under
-`info["papi_wallet"]["assets"]`; principal, interest and negative balance retain their
-source values. The PM endpoint supplies account-wide equity, margin and capacity separately.
+Each difference is a decimal string. On debt-free rows a difference is null when an optional
+operand is unavailable. Rows with debt require all operands. The adapter publishes the
+reported total once and leaves discrepancy handling to the consumer. The PM endpoint
+supplies account-wide equity, margin and capacity separately.
 Private balance and liability notifications trigger a fresh baseline.
 
 The authenticated balance row identifies wallet assets independently of instrument listings.
 Existing currency definitions retain their precision. New assets use the model's fixed-point
 precision (16 decimals in the release wheel) as a storage precision. Each total must convert
-exactly. Missing components, inconsistent amounts or an inexact total identify the source and
+exactly. Missing required components or an inexact total identify the source and
 asset in the error. Dynamic totals persist their currency definition and signed minor units.
 PostgreSQL users must apply the updated account-event table schema before using this version.
 
@@ -566,7 +566,7 @@ requests must succeed in the current generation: `/papi/v1/balance`, `/papi/v1/a
 `/papi/v1/um/algo/openAlgoOrders`, `/papi/v1/cm/positionRisk`, `/papi/v1/cm/openOrders`, and
 `/papi/v1/margin/openOrders`. This includes the reader's UM V1 observation even though wallet
 projection uses V2. Receipt age and combined collection span must fit `operation_timeout`.
-Query wallet validation uses the same exact totals and liability reconciliation as recovery.
+Queries and recovery publish the same reported totals and wallet differences.
 Starting with `2.0.0rc16`, account queries do not apply recovery's instrument or product-scope
 admission checks. Nonzero UM positions and open orders outside the configured instrument scope
 no longer prevent publication. Recovery and risk projections retain their existing checks;

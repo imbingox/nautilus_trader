@@ -113,7 +113,7 @@ class Venue:
                     "crossMarginInterest": "0.01" if asset == "USDT" else "0",
                     "crossMarginFree": "2.01" if asset == "USDT" else "0",
                     "crossMarginLocked": "0",
-                    "crossMarginAsset": "1" if self.block_recovery else "0",
+                    "crossMarginAsset": None if self.block_recovery else "0.0000000100",
                     "umWalletBalance": amount,
                     "cmWalletBalance": "0",
                     "updateTime": SOURCE_MS,
@@ -382,6 +382,10 @@ class QueryStrategy(Strategy):
             wallet = event.info["papi_wallet"]["assets"][0]
             assert wallet["cross_margin_borrowed"] == "2"
             assert wallet["cross_margin_interest"] == "0.01"
+            assert wallet["cross_margin_asset"] == "0.0000000100"
+            assert wallet["total_wallet_balance"] == "1000"
+            assert wallet["cross_margin_asset_delta"] == "0.00000001"
+            assert wallet["total_wallet_balance_delta"] == "-0.00000001"
             assert summary["actual_equity"] == "2234.1234567800"
             assert summary["account_equity"] == "2250.9876543200"
             assert summary["account_maint_margin"] == "0.0000000000000000000000000001"
