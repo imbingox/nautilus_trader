@@ -64,6 +64,9 @@ use crate::{
     read_only::BinancePapiReadOnlySnapshot,
 };
 
+pub(crate) const KNOWN_HISTORY_LIMITATION: &str =
+    "Historical retention, time selection and algo linkage await authenticated validation";
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct InstrumentScope {
     instruments: BTreeMap<String, InstrumentAny>,
@@ -154,10 +157,7 @@ impl ReportCollector<'_> {
             books.insert(symbol.clone(), self.current_orders(symbol).await?);
         }
 
-        let mut issues = vec![
-            "Historical retention, time selection and algo linkage await authenticated validation"
-                .to_owned(),
-        ];
+        let mut issues = vec![KNOWN_HISTORY_LIMITATION.to_owned()];
 
         for (symbol, book) in &mut books {
             match self

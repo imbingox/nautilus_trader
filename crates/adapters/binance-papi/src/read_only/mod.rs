@@ -39,7 +39,7 @@ use nautilus_model::{
     events::AccountState,
     identifiers::{AccountId, ClientOrderId, InstrumentId, VenueOrderId},
     instruments::InstrumentAny,
-    reports::{ExecutionMassStatus, OrderStatusReport, PositionStatusReport},
+    reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
 };
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -56,7 +56,10 @@ use crate::{
         AccountObservation, ObservationFailure, ObservationSlot, ObservationSource,
         ObservationTiming, ReceiptStatus,
     },
-    reports::{InstrumentScope, ReportCollector, history::HistoryWindow},
+    reports::{
+        InstrumentScope, KNOWN_HISTORY_LIMITATION, ReportCollector, history::HistoryWindow,
+        parse::decode_order_id,
+    },
     trading::coordinator::{
         CoordinatorDispatchError, PapiCommandCoordinator, dispatch_cancel_shared,
         dispatch_submit_shared,
@@ -698,6 +701,46 @@ impl BinancePapiReadOnlyClient {
             "PAPI history end is in the future"
         );
         self.collector()?.mass_status(window).await
+    }
+
+    pub(crate) async fn scoped_fill_reports(
+        &self,
+        instrument_id: InstrumentId,
+        venue_order_id: Option<VenueOrderId>,
+        start: UnixNanos,
+        end: UnixNanos,
+    ) -> anyhow::Result<Vec<FillReport>> {
+        let window = HistoryWindow::new(start, end)?;
+        let now = self.now();
+        anyhow::ensure!(end <= now, "PAPI fill query end is in the future");
+        let mut collector = self.collector()?;
+        let symbols = collector.scope.symbols(Some(instrument_id))?;
+        let symbol = &symbols[0];
+        if let Some(id) = venue_order_id {
+            decode_order_id(id, symbol)?;
+        }
+        let instrument = collector.scope.instrument(symbol)?.clone();
+        collector.scope = Cow::Owned(InstrumentScope::new(vec![instrument])?);
+        let snapshot = collector.mass_status(window).await?;
+        anyhow::ensure!(
+            snapshot.issues.as_slice() == [KNOWN_HISTORY_LIMITATION],
+            "PAPI fill query has unresolved source failures: {:?}",
+            snapshot.issues
+        );
+        let mut fills: Vec<_> = snapshot
+            .mass_status
+            .fill_reports()
+            .into_iter()
+            .filter(|(id, _)| venue_order_id.is_none_or(|expected| expected == *id))
+            .flat_map(|(_, fills)| fills)
+            .collect();
+        // Until retention is verified, absence is not evidence of a fill-free interval
+        anyhow::ensure!(
+            !fills.is_empty(),
+            "PAPI cannot confirm absence of fills in the requested window"
+        );
+        fills.sort_by_key(|fill| (fill.ts_event, fill.trade_id));
+        Ok(fills)
     }
 
     /// Returns current order reports, optionally filtered by instrument.

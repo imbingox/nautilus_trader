@@ -9,8 +9,10 @@ The documented scope limits and trading gate remain in place.
 
 The execution factory supports configuration, factory extraction and `LiveNode` construction.
 Factory-created Rust clients can generate scoped reports after `start()` when configured with
-`read_only` and explicit, preloaded instrument IDs. Standalone historical order/fill vectors
-remain unavailable because their interface cannot express incomplete coverage. The factory's
+`read_only` and explicit, preloaded instrument IDs. A fill query requires an instrument and
+an inclusive start time. It returns observed trades with their original order identities and
+commissions. Failed historical legs and unverified absence return an error. Standalone historical
+order vectors remain unavailable. The factory's
 mass status defaults to a sixty-minute lookback and preserves the configured client identity.
 Position reports support current observations only; historical position filters fail explicitly.
 `QueryOrder` runs as a managed GET-only task and emits one authoritative `OrderStatusReport` when
@@ -40,9 +42,16 @@ account facts to be applied in advance. The matching risk report must still be a
 engine before its risk generation is installed, and a newer fact invalidates an older collection.
 The recovery view reports the latest received fact version and includes session `issues`.
 Waiting for a prior application checkpoint is bounded by `max_risk_age_ms`, checked on each retry;
-waiting for a delivered risk report acknowledgement uses the same timeout. Either timeout latches
-the session as `restricted` with a diagnostic issue and stops the risk worker. The host must handle
-this state and recreate the execution client; a late acknowledgement cannot restore authority.
+waiting for a delivered risk report acknowledgement uses the same timeout. Either timeout blocks
+new risk for the lifetime of the connection and requests a fresh REST baseline. Order and fill
+delivery continues after account recovery. Recreate the execution client to restore trading.
+
+`recovery_state_json(client_id)` exposes `risk_application_failure` for these timeouts and
+`restriction_cause` for the first error that stopped account delivery. Hosts should suspend
+position-dependent decisions, including dry-run previews, when `account_state_current` is false.
+This field compares locally observed and applied versions. Configure the LiveNode execution
+engine's `position_check_interval_secs` for independent checks against venue positions when a
+stream message is missed. A hard session restriction logs an error and requires client recovery.
 
 The independent factory name and default client ID are `BINANCE_PAPI`. Instrument venue
 remains `BINANCE`. The default account ID is `BINANCE-PAPI-001`, keeping its issuer

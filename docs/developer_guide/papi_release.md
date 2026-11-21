@@ -18,7 +18,7 @@ fork with an intended future migration to upstream once its PAPI support meets t
 | Field               | Value                                                       |
 | ------------------- | ----------------------------------------------------------- |
 | Distribution        | `cairn-papi`                                                |
-| Version             | `2.0.0rc18`                                                 |
+| Version             | `2.0.0rc19`                                                 |
 | Python              | CPython 3.14, GIL build                                     |
 | ABI                 | `cp314`                                                     |
 | Platform            | Linux x86_64                                                |
@@ -26,7 +26,7 @@ fork with an intended future migration to upstream once its PAPI support meets t
 | Build profile       | Cargo `release`                                             |
 | Python extension    | Full `nautilus-pyo3` extension with high precision and PAPI |
 | Source distribution | Not published                                               |
-| Release tag         | `cairn-papi-v2.0.0rc18`                                     |
+| Release tag         | `cairn-papi-v2.0.0rc19`                                     |
 
 The upstream baseline is
 `46a5658a2f66cf0a798d414dc1b63d98cf10fcc1`. The PAPI feature head before upstream integration is
@@ -38,6 +38,13 @@ commit and tag.
 The version belongs to this distribution. Increment it for every changed PAPI release candidate,
 even when the upstream Python version remains unchanged. PyPI files are immutable, so never rebuild
 different bytes under an uploaded version.
+
+## Changes in 2.0.0rc19
+
+Risk application timeouts request a new account baseline and keep new risk blocked. The execution
+client supports scoped, bounded fill queries for the LiveNode position check. Recovery diagnostics
+expose account application progress and the first restriction cause. See the adapter README for
+the host decision gate and periodic reconciliation configuration.
 
 ## Changes in 2.0.0rc18
 
@@ -162,7 +169,7 @@ bash scripts/papi-release/verify-wheel.bash dist/papi
 python3 scripts/papi-release/generate-manifest.py \
   --wheel-dir dist/papi \
   --source-ref <release-commit-or-tag> \
-  --tag cairn-papi-v2.0.0rc18 \
+  --tag cairn-papi-v2.0.0rc19 \
   --output dist/papi/release-manifest.json
 ```
 
@@ -221,7 +228,7 @@ The following steps require a separate release decision; none are performed by t
 The promotion sequence is:
 
 1. Merge the validated release branch into `main` without changing the candidate tree.
-2. Create signed tag `cairn-papi-v2.0.0rc18` at that exact commit.
+2. Create signed tag `cairn-papi-v2.0.0rc19` at that exact commit.
 3. Build and verify the wheel once, then freeze its SHA-256 manifest.
 4. Upload the frozen wheel to TestPyPI through the protected OIDC job.
 5. Run `verify-index.bash testpypi ...`; it downloads the file, compares SHA-256, and repeats the

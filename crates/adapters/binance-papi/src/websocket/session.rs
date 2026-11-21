@@ -53,13 +53,12 @@ use crate::{
         BinancePapiAccountProjection, BinancePapiProjectionStatus, BinancePapiReadOnlyClient,
         BinancePapiReadOnlyConfig, BinancePapiReadOnlySnapshot,
     },
+    reports::KNOWN_HISTORY_LIMITATION,
 };
 
 const MAX_RECOVERY_ROUNDS: u32 = 3;
 const SHUTDOWN_GRACE_SECS: u64 = 3;
 const SHUTDOWN_ABORT_SECS: u64 = 2;
-const KNOWN_HISTORY_LIMITATION: &str =
-    "Historical retention, time selection and algo linkage await authenticated validation";
 
 /// Private account-session lifecycle. Transport availability and synchronization stay distinct.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -97,6 +96,10 @@ pub struct BinancePapiRecoveryEvidence {
     pub synchronized: bool,
     /// Always false in issue #4; issue #5 owns trade admission.
     pub trading_authorized: bool,
+    /// Latched trading restriction after the risk worker failed to confirm engine application.
+    pub risk_application_failure: Option<String>,
+    /// First error that stopped delivery on this account session.
+    pub restriction_cause: Option<String>,
     /// Lifecycle generation, incremented on every explicit start.
     pub session_generation: u64,
     /// Listen-key owner generation, incremented on replacement.
@@ -159,6 +162,8 @@ impl BinancePapiRecoveryEvidence {
             transport_connected: false,
             synchronized: false,
             trading_authorized: false,
+            risk_application_failure: None,
+            restriction_cause: None,
             session_generation: 0,
             listen_key_generation: 0,
             recovery_generation: 0,
@@ -234,6 +239,16 @@ impl Debug for PapiApplicationAcknowledger {
 }
 
 impl PapiApplicationAcknowledger {
+    pub(crate) fn restrict_risk_application(&self, reason: &str) {
+        let mut evidence = self.shared.evidence.lock();
+        evidence.trading_authorized = false;
+        evidence.risk_application_failure = Some(reason.to_owned());
+        drop(evidence);
+        self.shared.set_recovering();
+        self.shared.request_baseline.notify_one();
+        log::error!("PAPI risk application failed; new risk is restricted: {reason}");
+    }
+
     pub(crate) fn restrict_recovery(&self, reason: &str) {
         self.shared.restrict(reason.to_string());
     }
@@ -278,6 +293,7 @@ impl PapiApplicationAcknowledger {
         anyhow::ensure!(
             evidence.synchronized
                 && evidence.transport_connected
+                && evidence.risk_application_failure.is_none()
                 && evidence.session_generation == checkpoint.session_generation
                 && evidence.recovery_generation == checkpoint.recovery_generation
                 && self.shared.transport_revision.load(Ordering::Acquire)
@@ -477,6 +493,7 @@ impl BinancePapiAccountSession {
                 queued_bytes: AtomicUsize::new(0),
                 overflowed: AtomicBool::new(false),
                 restricted: AtomicBool::new(false),
+                request_baseline: tokio::sync::Notify::new(),
                 next_owner: AtomicU64::new(0),
                 current_owner: AtomicU64::new(0),
                 pending_owner: AtomicU64::new(0),
@@ -589,6 +606,8 @@ impl BinancePapiAccountSession {
             evidence.risk_collection_span_ns = None;
             evidence.recovery_elapsed_ms = None;
             evidence.issues.clear();
+            evidence.risk_application_failure = None;
+            evidence.restriction_cause = None;
             evidence.received_fact_version = 0;
             evidence.delivered_fact_version = 0;
             evidence.applied_fact_version = 0;
@@ -788,6 +807,7 @@ struct SessionShared {
     queued_bytes: AtomicUsize,
     overflowed: AtomicBool,
     restricted: AtomicBool,
+    request_baseline: tokio::sync::Notify,
     next_owner: AtomicU64,
     current_owner: AtomicU64,
     pending_owner: AtomicU64,
@@ -813,11 +833,12 @@ impl SessionShared {
     }
 
     fn set_recovering(&self) {
+        let mut evidence = self.evidence.lock();
+
         if self.restricted.load(Ordering::Acquire) {
             return;
         }
 
-        let mut evidence = self.evidence.lock();
         evidence.state = BinancePapiSessionState::Recovering;
         evidence.synchronized = false;
         evidence.trading_authorized = false;
@@ -830,8 +851,13 @@ impl SessionShared {
     }
 
     fn restrict(&self, issue: String) {
-        self.restricted.store(true, Ordering::Release);
         let mut evidence = self.evidence.lock();
+        self.restricted.store(true, Ordering::Release);
+
+        if evidence.restriction_cause.is_none() {
+            log::error!("PAPI account updates stopped; cached positions may be stale: {issue}");
+            evidence.restriction_cause = Some(issue.clone());
+        }
         evidence.state = BinancePapiSessionState::Restricted;
         evidence.synchronized = false;
         evidence.trading_authorized = false;
@@ -993,20 +1019,23 @@ async fn run_driver(
     cancel: CancellationToken,
 ) {
     loop {
-        let inbound = tokio::select! {
+        let action = tokio::select! {
             biased;
             () = cancel.cancelled() => break,
-            inbound = rx.recv() => inbound,
-        };
-        let Some(inbound) = inbound else {
-            break;
+            () = context.shared.request_baseline.notified() => Ok(InboundAction::Recover),
+            inbound = rx.recv() => {
+                let Some(inbound) = inbound else { break };
+                process_inbound(&context.shared, &context.symbols, inbound)
+            }
         };
 
-        match process_inbound(&context.shared, &context.symbols, inbound) {
+        match action {
             Ok(InboundAction::Ignore) => continue,
             Ok(InboundAction::RefreshRisk { signal })
-                if context.shared.evidence.lock().synchronized
-                    && context.risk_refresh_handler.is_some() =>
+                if context.risk_refresh_handler.is_some() && {
+                    let evidence = context.shared.evidence.lock();
+                    evidence.synchronized && evidence.risk_application_failure.is_none()
+                } =>
             {
                 if let Err(e) =
                     context

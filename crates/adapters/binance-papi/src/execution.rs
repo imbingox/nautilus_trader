@@ -301,7 +301,7 @@ async fn run_risk_refresh_worker(
                     let reason = format!("PAPI risk refresh application checkpoint timed out: {e}");
 
                     if let Some(acknowledger) = acknowledger.lock().as_ref() {
-                        acknowledger.restrict_recovery(&reason);
+                        acknowledger.restrict_risk_application(&reason);
                     }
                     anyhow::bail!(reason);
                 }
@@ -387,7 +387,7 @@ async fn run_risk_refresh_worker(
             let reason = "PAPI risk refresh application acknowledgement timed out";
 
             if let Some(acknowledger) = acknowledger.lock().as_ref() {
-                acknowledger.restrict_recovery(reason);
+                acknowledger.restrict_risk_application(reason);
             }
             anyhow::bail!(reason);
         } else if control.dirty_generation.load(Ordering::Acquire)
@@ -522,6 +522,7 @@ impl BinancePapiExecutionClient {
                     revision == current
                         && first.session_generation == second.session_generation
                         && first.recovery_generation == second.recovery_generation
+                        && first.received_fact_version == second.received_fact_version
                         && first.delivered_fact_version == second.delivered_fact_version
                         && first.applied_fact_version == second.applied_fact_version
                 }
@@ -543,6 +544,14 @@ impl BinancePapiExecutionClient {
                     && value.applied_fact_version == value.delivered_fact_version
                     && value.pending_application_fact_version.is_none()
             });
+            let account_state_current = stable
+                && scope_complete
+                && applied
+                && handoff_failure.is_none()
+                && evidence.as_ref().is_some_and(|value| {
+                    value.transport_connected
+                        && value.received_fact_version == value.applied_fact_version
+                });
             let session_authorized = evidence.as_ref().is_some_and(|value| {
                 value.transport_connected && value.synchronized && value.trading_authorized
             });
@@ -586,6 +595,11 @@ impl BinancePapiExecutionClient {
                 value.state == crate::websocket::BinancePapiSessionState::Restricted
             }) {
                 ("restricted", "session_restricted")
+            } else if evidence
+                .as_ref()
+                .is_some_and(|value| value.risk_application_failure.is_some())
+            {
+                ("restricted", "risk_application_timeout")
             } else if !trading_connected {
                 ("recovering", "client_not_connected")
             } else if !stable || !scope_complete {
@@ -614,10 +628,13 @@ impl BinancePapiExecutionClient {
                 "schema_version": 1, "client_id": client_id, "account_id": account_id,
                 "instrument_ids": instrument_ids, "sampled_at_ns": sampled_at_ns,
                 "valid_for_ms": valid_for_ms, "status": status, "reason": reason,
+                "account_state_current": account_state_current,
                 "session_generation": evidence.as_ref().map_or(0, |value| value.session_generation),
                 "recovery_generation": evidence.as_ref().map_or(0, |value| value.recovery_generation),
                 "transport_revision": transport_revision,
                 "issues": evidence.as_ref().map(|value| &value.issues),
+                "restriction_cause": evidence.as_ref().and_then(|value| value.restriction_cause.as_ref()),
+                "risk_application_failure": evidence.as_ref().and_then(|value| value.risk_application_failure.as_ref()),
                 "received_fact_version": evidence.as_ref().map_or(0, |value| value.received_fact_version),
                 "delivered_fact_version": evidence.as_ref().map_or(0, |value| value.delivered_fact_version),
                 "applied_fact_version": evidence.as_ref().map_or(0, |value| value.applied_fact_version),
@@ -2160,9 +2177,25 @@ impl ExecutionClient for BinancePapiExecutionClient {
 
     async fn generate_fill_reports(
         &self,
-        _cmd: GenerateFillReports,
+        cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        anyhow::bail!("PAPI fill history is incomplete; use the bounded mass status report")
+        let instrument_id = cmd
+            .instrument_id
+            .ok_or_else(|| anyhow::anyhow!("PAPI fill queries require an instrument ID"))?;
+        let start = cmd
+            .start
+            .ok_or_else(|| anyhow::anyhow!("PAPI fill queries require a lower time bound"))?;
+        let reader = self.reader()?;
+        let fills = reader
+            .scoped_fill_reports(
+                instrument_id,
+                cmd.venue_order_id,
+                start,
+                cmd.end.unwrap_or_else(|| reader.now()),
+            )
+            .await?;
+        Self::log_report_receipt(fills.len(), "fill", cmd.log_receipt_level);
+        Ok(fills)
     }
 
     async fn generate_position_status_reports(
@@ -2852,28 +2885,49 @@ mod tests {
         reply
     }
 
+    fn external_fill_event() -> String {
+        json!({
+            "e": "ORDER_TRADE_UPDATE",
+            "E": 1_700_000_000_003_i64,
+            "T": 1_700_000_000_002_i64,
+            "fs": "UM",
+            "o": {
+                "s": "BTCUSDT", "c": "client-1", "i": 42,
+                "S": "BUY", "o": "LIMIT", "ot": "LIMIT", "f": "GTC",
+                "q": "0.010", "p": "42000.10", "ap": "42000.10",
+                "R": false, "ps": "BOTH", "x": "TRADE",
+                "X": "PARTIALLY_FILLED", "z": "0.001", "l": "0.001",
+                "L": "42000.10", "N": "BNB", "n": "-0.00000123",
+                "m": false, "T": 1_700_000_000_002_i64, "t": 7
+            }
+        })
+        .to_string()
+    }
+
+    fn funding_event() -> String {
+        json!({
+            "e": "ACCOUNT_UPDATE", "E": TRADE_TIME, "T": TRADE_TIME,
+            "fs": "UM", "a": {"m": "FUNDING_FEE", "B": [], "P": []},
+        })
+        .to_string()
+    }
+
     async fn account_update_websocket() -> (
         String,
-        tokio::sync::mpsc::UnboundedSender<()>,
+        tokio::sync::mpsc::UnboundedSender<String>,
         tokio::task::JoinHandle<()>,
     ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/ws", listener.local_addr().unwrap());
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
 
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
 
-            while receiver.recv().await.is_some() {
-                let event = json!({
-                    "e": "ACCOUNT_UPDATE", "E": TRADE_TIME, "T": TRADE_TIME,
-                    "fs": "UM", "a": {"m": "FUNDING_FEE", "B": [], "P": []},
-                });
+            while let Some(event) = receiver.recv().await {
                 websocket
-                    .send(tokio_tungstenite::tungstenite::Message::Text(
-                        event.to_string().into(),
-                    ))
+                    .send(tokio_tungstenite::tungstenite::Message::Text(event.into()))
                     .await
                     .unwrap();
             }
@@ -3072,7 +3126,7 @@ mod tests {
         let baseline_requests = server.requests().len();
 
         // An account-only event must produce a report without waiting for a later order event
-        updates.send(()).unwrap();
+        updates.send(funding_event()).unwrap();
         tokio::time::timeout(Duration::from_secs(8), async {
             while control.state.lock().pending.is_none() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3093,7 +3147,7 @@ mod tests {
         );
 
         if superseded {
-            updates.send(()).unwrap();
+            updates.send(funding_event()).unwrap();
             tokio::time::timeout(Duration::from_secs(2), async {
                 while recovery_reader.snapshot()["received_fact_version"]
                     == pending["received_fact_version"]
@@ -3146,7 +3200,7 @@ mod tests {
         );
 
         // A later account event must start another refresh after the previous rebaseline completed
-        updates.send(()).unwrap();
+        updates.send(funding_event()).unwrap();
         assert!(
             harness
                 .pump_until(Duration::from_secs(8), |_| {
@@ -3212,11 +3266,11 @@ mod tests {
             );
         }
         let before = recovery_reader.snapshot();
-        updates.send(()).unwrap();
+        updates.send(funding_event()).unwrap();
 
         // Leave the runner paused so neither the baseline nor the new risk report can be confirmed
         tokio::time::timeout(Duration::from_secs(22), async {
-            while recovery_reader.snapshot()["reason"] != "session_restricted" {
+            while recovery_reader.snapshot()["reason"] != "risk_application_timeout" {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -3228,22 +3282,60 @@ mod tests {
         } else {
             "PAPI risk refresh application acknowledgement timed out"
         };
-        assert!(failed["issues"].as_array().unwrap().iter().any(|issue| {
-            issue
+        assert!(
+            failed["risk_application_failure"]
                 .as_str()
-                .is_some_and(|issue| issue.starts_with(expected_reason))
-        }));
+                .unwrap()
+                .starts_with(expected_reason)
+        );
         assert_eq!(failed["status"], "restricted");
         assert_eq!(failed["permissions"]["increase_risk"], false);
         assert_eq!(failed["risk_generation"], before["risk_generation"]);
         assert!(control.state.lock().pending.is_none());
 
-        // Late engine delivery cannot revive a restricted session or install the timed-out snapshot
-        harness.pump_for(Duration::from_millis(100)).await;
+        // The worker's timeout schedules a new account baseline even on a quiet stream
+        assert!(
+            harness
+                .pump_until(Duration::from_secs(10), |_| {
+                    let current = recovery_reader.snapshot();
+                    current["account_state_current"] == true
+                        && current["recovery_generation"].as_u64()
+                            > before["recovery_generation"].as_u64()
+                })
+                .await
+        );
         let late = recovery_reader.snapshot();
-        assert_eq!(late["reason"], "session_restricted");
+        assert_eq!(late["reason"], "risk_application_timeout");
         assert_eq!(late["permissions"]["increase_risk"], false);
         assert_eq!(late["risk_generation"], before["risk_generation"]);
+        let fill = external_fill_event();
+        updates.send(fill.clone()).unwrap();
+        let net_position = |cache: &Cache| -> Decimal {
+            cache
+                .positions_open(
+                    None,
+                    Some(&InstrumentId::from("BTCUSDT-PERP.BINANCE")),
+                    None,
+                    Some(&AccountId::from("BINANCE-PAPI-001")),
+                    None,
+                )
+                .iter()
+                .map(|position| position.signed_decimal_qty())
+                .sum()
+        };
+        assert!(
+            harness
+                .pump_until(Duration::from_secs(5), |cache| net_position(cache)
+                    == dec!(0.001))
+                .await
+        );
+        updates.send(fill).unwrap();
+        harness.pump_for(Duration::from_millis(150)).await;
+        assert_eq!(net_position(&harness.cache().borrow()), dec!(0.001));
+        assert_eq!(
+            recovery_reader.snapshot()["permissions"]["increase_risk"],
+            false
+        );
         harness.exec_engine().borrow_mut().stop_clients();
         websocket.abort();
     }
@@ -4259,22 +4351,7 @@ mod tests {
         ));
         AsyncRunner::handle_exec_event(baseline);
         let baseline_requests = server.requests().len();
-        let order_event = json!({
-            "e": "ORDER_TRADE_UPDATE",
-            "E": 1_700_000_000_003_i64,
-            "T": 1_700_000_000_002_i64,
-            "fs": "UM",
-            "o": {
-                "s": "BTCUSDT", "c": "client-1", "i": 42,
-                "S": "BUY", "o": "LIMIT", "ot": "LIMIT", "f": "GTC",
-                "q": "0.010", "p": "42000.10", "ap": "42000.10",
-                "R": false, "ps": "BOTH", "x": "TRADE",
-                "X": "PARTIALLY_FILLED", "z": "0.001", "l": "0.001",
-                "L": "42000.10", "N": "BNB", "n": "-0.00000123",
-                "m": false, "T": 1_700_000_000_002_i64, "t": 7
-            }
-        })
-        .to_string();
+        let order_event = external_fill_event();
         websocket_tx.send(order_event.clone()).unwrap();
         let event = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
             .await
@@ -4315,6 +4392,51 @@ mod tests {
         client.stop().unwrap();
         client.disconnect().await.unwrap();
         websocket_task.abort();
+    }
+
+    #[tokio::test]
+    async fn scoped_fill_query_preserves_trade_identity_and_rejects_partial_history() {
+        let fail = Arc::new(AtomicBool::new(false));
+        let fault = Arc::clone(&fail);
+        let server = MockServer::new(move |request| match request.path.as_str() {
+            "/papi/v1/um/allOrders" => Reply::json(&json!([testing::filled_order()])),
+            "/papi/v1/um/userTrades" => Reply::json(&json!([testing::trade()])),
+            "/papi/v1/um/algo/allAlgoOrders" if fault.load(Ordering::Acquire) => {
+                Reply::raw(400, r#"{"code":-1100}"#)
+            }
+            _ => testing::quiet(request),
+        })
+        .await;
+        let mut client = configured_client(&server, &["BTCUSDT", "ETHUSDT"], true);
+        client.start().unwrap();
+        let instrument = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+        let query = GenerateFillReportsBuilder::default()
+            .ts_init(ms(TRADE_TIME))
+            .instrument_id(Some(instrument))
+            .start(Some(ms(TRADE_TIME - 2_000)))
+            .end(Some(ms(TRADE_TIME)))
+            .build()
+            .unwrap();
+        let fills = client.generate_fill_reports(query.clone()).await.unwrap();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].instrument_id, instrument);
+        assert_eq!(fills[0].ts_event, ms(TRADE_TIME));
+        assert_eq!(
+            fills[0].venue_order_id.to_string(),
+            "PAPI:O:BTCUSDT:270093109"
+        );
+        assert_eq!(
+            fills[0].trade_id.to_string(),
+            testing::trade()["id"].to_string()
+        );
+        assert!(
+            !server
+                .requests()
+                .iter()
+                .any(|r| r.params.get("symbol").is_some_and(|s| s == "ETHUSDT"))
+        );
+        fail.store(true, Ordering::Release);
+        assert!(client.generate_fill_reports(query).await.is_err());
     }
 
     #[tokio::test]

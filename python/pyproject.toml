@@ -1,6 +1,6 @@
 [project]
 name = "cairn-papi"
-version = "2.0.0rc18"
+version = "2.0.0rc19"
 description = "Independent third-party fork of NautilusTrader with Binance PAPI support"
 authors = [{ name = "Nautech Systems", email = "info@nautechsystems.io" }]
 maintainers = [{ name = "imbingox" }]
