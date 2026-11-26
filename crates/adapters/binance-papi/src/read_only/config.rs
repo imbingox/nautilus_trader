@@ -68,12 +68,19 @@ pub struct BinancePapiReadOnlyConfig {
     pub recovery_lookback: Duration,
     /// Debounce applied while coalescing account-stream dirty sources.
     pub refresh_debounce: Duration,
+    /// Continuous account unavailability before the private session starts fallback recovery.
+    #[serde(default = "default_account_recovery_timeout")]
+    pub account_recovery_timeout: Duration,
     /// Maximum accepted WebSocket text or binary frame size.
     pub max_websocket_message_bytes: usize,
     /// Maximum number of account-stream events waiting for the serial recovery driver.
     pub max_websocket_buffer_messages: usize,
     /// Maximum aggregate bytes waiting for the serial recovery driver.
     pub max_websocket_buffer_bytes: usize,
+}
+
+const fn default_account_recovery_timeout() -> Duration {
+    Duration::from_mins(3)
 }
 
 impl BinancePapiReadOnlyConfig {
@@ -94,6 +101,7 @@ impl BinancePapiReadOnlyConfig {
             listen_key_keepalive_interval: Duration::from_mins(30),
             transport_rotation_interval: Duration::from_hours(23),
             recovery_lookback: Duration::from_hours(24),
+            account_recovery_timeout: default_account_recovery_timeout(),
             refresh_debounce: Duration::from_millis(250),
             max_websocket_message_bytes: 1_048_576,
             max_websocket_buffer_messages: 4_096,
@@ -185,7 +193,9 @@ impl BinancePapiReadOnlyConfig {
                 && (Duration::from_secs(1)..=Duration::from_hours(24 * 7))
                     .contains(&self.recovery_lookback)
                 && (Duration::from_millis(1)..=Duration::from_secs(30))
-                    .contains(&self.refresh_debounce),
+                    .contains(&self.refresh_debounce)
+                && (Duration::from_millis(1)..=Duration::from_hours(24 * 7))
+                    .contains(&self.account_recovery_timeout),
             "Invalid PAPI session timing"
         );
         anyhow::ensure!(
@@ -213,6 +223,22 @@ mod tests {
             SecretString::from("OfflinePapiKey"),
             SecretString::from("OfflinePapiSecret"),
         )
+    }
+
+    #[rstest]
+    fn existing_configs_use_the_default_fallback_deadline() {
+        let mut value = serde_json::to_value(config()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("account_recovery_timeout");
+        let mut restored: BinancePapiReadOnlyConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restored.account_recovery_timeout,
+            std::time::Duration::from_secs(180)
+        );
+        restored.account_recovery_timeout = std::time::Duration::ZERO;
+        assert!(restored.validate().is_err());
     }
 
     #[rstest]

@@ -102,6 +102,20 @@ impl PapiHttpError {
         }
     }
 
+    pub(crate) const fn recoverable_account_read(&self) -> bool {
+        matches!(
+            self,
+            Self::Timeout
+                | Self::Server(_)
+                | Self::Sdk
+                | Self::Clock
+                | Self::Rejected {
+                    status: Some(400),
+                    code: Some(-2013)
+                }
+        )
+    }
+
     pub(crate) const fn retryable(&self) -> bool {
         matches!(self, Self::Timeout | Self::Server(500 | 502 | 503 | 504))
     }

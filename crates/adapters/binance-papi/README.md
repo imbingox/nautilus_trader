@@ -22,7 +22,7 @@ With explicit credentials and preloaded instrument scope, the execution client s
 account stream before collecting its REST baseline. It publishes the reported totals-only account
 state, delivers deduplicated ordinary order/fill updates as typed execution reports, and uses
 coalesced current-state risk refreshes for account changes. Historical mass status recovery is
-reserved for startup and transport gaps. Connection, synchronization, delivery, application, and
+used at startup, after transport gaps, and to recover stalled account delivery. Connection, synchronization, delivery, application, and
 trading authorization remain separate. Trading is default-off. With explicit trading
 configuration, supported commands use durable admission and single-dispatch transport, but
 increase-risk submission remains fail-closed until authenticated PM risk evidence is installed.
@@ -51,7 +51,20 @@ delivery continues after account recovery. Recreate the execution client to rest
 position-dependent decisions, including dry-run previews, when `account_state_current` is false.
 This field compares locally observed and applied versions. Configure the LiveNode execution
 engine's `position_check_interval_secs` for independent checks against venue positions when a
-stream message is missed. A hard session restriction logs an error and requires client recovery.
+stream message is missed.
+
+After startup, continuous account unavailability triggers fallback reconciliation on the same
+worker. Set `BinancePapiReadOnlyConfig.account_recovery_timeout` in Rust or pass
+`account_recovery_timeout_ms=180_000` in the Python constructor to adjust the three-minute
+default. Receiving private events during the gap does not reset the deadline. A connected stream
+can recover through REST alone. A disconnected stream or failed listen-key renewal triggers
+transport replacement. Each failed fallback retries after 1, 2, 4 and then progressively longer
+delays up to 60 seconds. The serial session driver owns all reconciliation attempts.
+
+The `fallback_recovery` object includes the last failure, last attempt time, next attempt time,
+and whether manual intervention is required. Authentication failures, closed rate-limit gates,
+and conflicting facts require intervention. Strategies can resume position-dependent work once
+`account_state_current` is true. Trading admission continues to use the configured permissions.
 
 The independent factory name and default client ID are `BINANCE_PAPI`. Instrument venue
 remains `BINANCE`. The default account ID is `BINANCE-PAPI-001`, keeping its issuer

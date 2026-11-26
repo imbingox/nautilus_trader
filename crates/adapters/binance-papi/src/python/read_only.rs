@@ -48,7 +48,7 @@ impl BinancePapiReadOnlyConfig {
         listen_key_keepalive_interval_ms=None, transport_rotation_interval_ms=None,
         recovery_lookback_ms=None, refresh_debounce_ms=None,
         max_websocket_message_bytes=None, max_websocket_buffer_messages=None,
-        max_websocket_buffer_bytes=None,
+        max_websocket_buffer_bytes=None, account_recovery_timeout_ms=None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -69,6 +69,7 @@ impl BinancePapiReadOnlyConfig {
         max_websocket_message_bytes: Option<usize>,
         max_websocket_buffer_messages: Option<usize>,
         max_websocket_buffer_bytes: Option<usize>,
+        account_recovery_timeout_ms: Option<u64>,
     ) -> PyResult<Self> {
         let mut config = Self::new(account_id, api_key.into(), api_secret.into());
 
@@ -110,6 +111,10 @@ impl BinancePapiReadOnlyConfig {
 
         if let Some(lookback) = recovery_lookback_ms {
             config.recovery_lookback = Duration::from_millis(lookback);
+        }
+
+        if let Some(timeout) = account_recovery_timeout_ms {
+            config.account_recovery_timeout = Duration::from_millis(timeout);
         }
 
         if let Some(debounce) = refresh_debounce_ms {
@@ -170,6 +175,11 @@ impl BinancePapiReadOnlyConfig {
     #[getter]
     fn recovery_lookback_ms(&self) -> u128 {
         self.recovery_lookback.as_millis()
+    }
+
+    #[getter]
+    fn account_recovery_timeout_ms(&self) -> u128 {
+        self.account_recovery_timeout.as_millis()
     }
 
     #[getter]

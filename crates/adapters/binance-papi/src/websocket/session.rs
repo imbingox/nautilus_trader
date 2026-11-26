@@ -25,7 +25,8 @@ use std::{
     time::Duration,
 };
 
-use nautilus_common::live::dst::time::Instant;
+use nautilus_common::live::dst::time::{self, Instant};
+use nautilus_core::UnixNanos;
 use nautilus_live::task::TaskGroup;
 use nautilus_model::{
     events::AccountState,
@@ -79,6 +80,36 @@ pub enum BinancePapiSessionState {
     Stopping,
 }
 
+/// Fallback recovery diagnostics for the current account session.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct BinancePapiFallbackRecovery {
+    /// A permanent protocol, application or data-integrity failure requires intervention.
+    pub manual_intervention_required: bool,
+    /// Number of fallback attempts in the current outage.
+    pub attempts: u32,
+    /// Wall-clock time of the most recent fallback attempt.
+    pub last_attempt_ns: Option<UnixNanos>,
+    /// Wall-clock time of the scheduled fallback attempt.
+    pub next_attempt_ns: Option<UnixNanos>,
+    /// Most recent failure, including its recovery stage.
+    pub last_failure: Option<String>,
+    #[serde(skip)]
+    unavailable_since: Option<Instant>,
+    #[serde(skip)]
+    retry_at: Option<Instant>,
+    #[serde(skip)]
+    replace_transport: bool,
+}
+
+impl BinancePapiFallbackRecovery {
+    fn mark_current(&mut self) {
+        self.unavailable_since = None;
+        self.retry_at = None;
+        self.next_attempt_ns = None;
+        self.attempts = 0;
+    }
+}
+
 /// Typed recovery evidence passed to issue #5 without collapsing it into mass status.
 #[derive(Clone, Debug, Serialize)]
 pub struct BinancePapiRecoveryEvidence {
@@ -100,6 +131,8 @@ pub struct BinancePapiRecoveryEvidence {
     pub risk_application_failure: Option<String>,
     /// First error that stopped delivery on this account session.
     pub restriction_cause: Option<String>,
+    /// Automatic fallback schedule and most recent failure.
+    pub fallback_recovery: BinancePapiFallbackRecovery,
     /// Lifecycle generation, incremented on every explicit start.
     pub session_generation: u64,
     /// Listen-key owner generation, incremented on replacement.
@@ -164,6 +197,7 @@ impl BinancePapiRecoveryEvidence {
             trading_authorized: false,
             risk_application_failure: None,
             restriction_cause: None,
+            fallback_recovery: BinancePapiFallbackRecovery::default(),
             session_generation: 0,
             listen_key_generation: 0,
             recovery_generation: 0,
@@ -363,6 +397,8 @@ impl PapiApplicationAcknowledger {
         {
             evidence.pending_application_fact_version = None;
         }
+        evidence.fallback_recovery.mark_current();
+        self.shared.availability_changed.notify_one();
         Ok(PapiRefreshAcknowledgement::Applied {
             fact_version: evidence.applied_fact_version,
         })
@@ -388,6 +424,7 @@ fn acknowledge_application(
     shared: &SessionShared,
     checkpoint: PapiApplicationCheckpoint,
 ) -> anyhow::Result<()> {
+    let facts = shared.facts.lock();
     let mut evidence = shared.evidence.lock();
     anyhow::ensure!(
         evidence.session_generation == checkpoint.session_generation
@@ -399,6 +436,13 @@ fn acknowledge_application(
     );
     evidence.applied_fact_version = checkpoint.fact_version;
     evidence.pending_application_fact_version = None;
+    if evidence.synchronized
+        && evidence.transport_connected
+        && checkpoint.fact_version == facts.fact_version
+    {
+        evidence.fallback_recovery.mark_current();
+    }
+    shared.availability_changed.notify_one();
     Ok(())
 }
 
@@ -415,6 +459,7 @@ pub struct BinancePapiAccountSession {
     handler: PapiRecoveryHandler,
     incremental_handler: PapiIncrementalHandler,
     risk_refresh_handler: Option<PapiRiskRefreshHandler>,
+    monitor_application: bool,
 }
 
 impl BinancePapiAccountSession {
@@ -427,15 +472,15 @@ impl BinancePapiAccountSession {
         config: &BinancePapiReadOnlyConfig,
         instruments: Vec<InstrumentAny>,
     ) -> anyhow::Result<Self> {
-        Self::with_handler(config, instruments, Arc::new(|_| Ok(())))
-    }
-
-    pub(crate) fn with_handler(
-        config: &BinancePapiReadOnlyConfig,
-        instruments: Vec<InstrumentAny>,
-        handler: PapiRecoveryHandler,
-    ) -> anyhow::Result<Self> {
-        Self::with_handlers(config, instruments, handler, Arc::new(|_| Ok(())), None)
+        let mut session = Self::with_handlers(
+            config,
+            instruments,
+            Arc::new(|_| Ok(())),
+            Arc::new(|_| Ok(())),
+            None,
+        )?;
+        session.monitor_application = false;
+        Ok(session)
     }
 
     pub(crate) fn with_handlers(
@@ -493,6 +538,7 @@ impl BinancePapiAccountSession {
                 queued_bytes: AtomicUsize::new(0),
                 overflowed: AtomicBool::new(false),
                 restricted: AtomicBool::new(false),
+                availability_changed: tokio::sync::Notify::new(),
                 request_baseline: tokio::sync::Notify::new(),
                 next_owner: AtomicU64::new(0),
                 current_owner: AtomicU64::new(0),
@@ -506,6 +552,7 @@ impl BinancePapiAccountSession {
             handler,
             incremental_handler,
             risk_refresh_handler,
+            monitor_application: true,
         })
     }
 
@@ -608,6 +655,7 @@ impl BinancePapiAccountSession {
             evidence.issues.clear();
             evidence.risk_application_failure = None;
             evidence.restriction_cause = None;
+            evidence.fallback_recovery = BinancePapiFallbackRecovery::default();
             evidence.received_fact_version = 0;
             evidence.delivered_fact_version = 0;
             evidence.applied_fact_version = 0;
@@ -649,6 +697,7 @@ impl BinancePapiAccountSession {
             listen_key: Arc::clone(&self.listen_key),
             handler: Arc::clone(&self.handler),
             incremental_handler: Arc::clone(&self.incremental_handler),
+            monitor_application: self.monitor_application,
             risk_refresh_handler: self.risk_refresh_handler.clone(),
             tx,
         };
@@ -788,6 +837,7 @@ impl Drop for BinancePapiAccountSession {
 
 #[derive(Clone)]
 struct DriverContext {
+    monitor_application: bool,
     config: BinancePapiReadOnlyConfig,
     reader: BinancePapiReadOnlyClient,
     symbols: Arc<BTreeSet<String>>,
@@ -807,6 +857,7 @@ struct SessionShared {
     queued_bytes: AtomicUsize,
     overflowed: AtomicBool,
     restricted: AtomicBool,
+    availability_changed: tokio::sync::Notify,
     request_baseline: tokio::sync::Notify,
     next_owner: AtomicU64,
     current_owner: AtomicU64,
@@ -839,6 +890,10 @@ impl SessionShared {
             return;
         }
 
+        evidence
+            .fallback_recovery
+            .unavailable_since
+            .get_or_insert_with(Instant::now);
         evidence.state = BinancePapiSessionState::Recovering;
         evidence.synchronized = false;
         evidence.trading_authorized = false;
@@ -851,6 +906,17 @@ impl SessionShared {
     }
 
     fn restrict(&self, issue: String) {
+        self.record_restriction(issue, false, false);
+    }
+
+    fn recovery_failed(&self, stage: &str, e: &anyhow::Error, replace_transport: bool) {
+        let retryable = e.is::<TransientRecoveryFailure>()
+            || e.downcast_ref::<PapiHttpError>()
+                .is_some_and(PapiHttpError::recoverable_account_read);
+        self.record_restriction(format!("{stage}: {e}"), retryable, replace_transport);
+    }
+
+    fn record_restriction(&self, issue: String, retryable: bool, replace_transport: bool) {
         let mut evidence = self.evidence.lock();
         self.restricted.store(true, Ordering::Release);
 
@@ -858,6 +924,16 @@ impl SessionShared {
             log::error!("PAPI account updates stopped; cached positions may be stale: {issue}");
             evidence.restriction_cause = Some(issue.clone());
         }
+        let fallback = &mut evidence.fallback_recovery;
+        fallback.unavailable_since.get_or_insert_with(Instant::now);
+        fallback.manual_intervention_required |= !retryable;
+
+        if fallback.manual_intervention_required {
+            fallback.next_attempt_ns = None;
+        }
+        fallback.replace_transport |= replace_transport;
+        fallback.last_failure = Some(issue.clone());
+        self.availability_changed.notify_one();
         evidence.state = BinancePapiSessionState::Restricted;
         evidence.synchronized = false;
         evidence.trading_authorized = false;
@@ -1010,7 +1086,73 @@ async fn build_websocket(
         .cancellation_token(cancel)
         .connect()
         .await
-        .map_err(|_| anyhow::anyhow!("Failed to connect PAPI private WebSocket"))
+        .map_err(|_| TransientRecoveryFailure("Failed to connect PAPI private WebSocket").into())
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct TransientRecoveryFailure(&'static str);
+
+impl DriverContext {
+    // Only the serial driver claims a deadline and runs the resulting recovery
+    fn fallback_deadline(&self, claim: bool) -> Option<Instant> {
+        let facts = self.shared.facts.lock();
+        let mut evidence = self.shared.evidence.lock();
+        let current = evidence.synchronized
+            && evidence.transport_connected
+            && (!self.monitor_application
+                || (evidence.pending_application_fact_version.is_none()
+                    && evidence.applied_fact_version == facts.fact_version));
+        let fallback = &mut evidence.fallback_recovery;
+        if current {
+            fallback.mark_current();
+            return None;
+        }
+
+        if fallback.manual_intervention_required {
+            fallback.next_attempt_ns = None;
+            return None;
+        }
+        let now = Instant::now();
+        let since = *fallback.unavailable_since.get_or_insert(now);
+        let deadline = fallback
+            .retry_at
+            .unwrap_or(since + self.config.account_recovery_timeout);
+        let wall_time = self.reader.now();
+        let delay = deadline.saturating_duration_since(now);
+        fallback.next_attempt_ns = Some(
+            wall_time
+                .as_u64()
+                .saturating_add(delay.as_nanos() as u64)
+                .into(),
+        );
+
+        if claim {
+            if !delay.is_zero() {
+                return None;
+            }
+            fallback.attempts = fallback.attempts.saturating_add(1);
+            fallback.last_attempt_ns = Some(wall_time);
+            fallback.next_attempt_ns = None;
+            self.shared.restricted.store(false, Ordering::Release);
+            evidence.synchronized = false;
+            evidence.trading_authorized = false;
+        }
+        Some(deadline)
+    }
+
+    fn schedule_retry(&self) {
+        let mut evidence = self.shared.evidence.lock();
+        let fallback = &mut evidence.fallback_recovery;
+        let backoff =
+            Duration::from_secs((1u64 << fallback.attempts.saturating_sub(1).min(6)).min(60));
+        let delay = if evidence.synchronized {
+            backoff.max(self.config.account_recovery_timeout)
+        } else {
+            backoff
+        };
+        evidence.fallback_recovery.retry_at = Some(Instant::now() + delay);
+    }
 }
 
 async fn run_driver(
@@ -1019,11 +1161,43 @@ async fn run_driver(
     cancel: CancellationToken,
 ) {
     loop {
+        let deadline = context.fallback_deadline(false);
+        // Keep later deltas from replacing a fallback mass-status checkpoint before engine application
+        let awaiting_baseline = {
+            let evidence = context.shared.evidence.lock();
+            context.monitor_application
+                && evidence.synchronized
+                && evidence.fallback_recovery.attempts > 0
+                && evidence.pending_application_fact_version.is_some()
+        };
         let action = tokio::select! {
             biased;
             () = cancel.cancelled() => break,
-            () = context.shared.request_baseline.notified() => Ok(InboundAction::Recover),
-            inbound = rx.recv() => {
+            () = context.shared.availability_changed.notified() => continue,
+            () = async {
+                if let Some(at) = deadline {
+                    time::sleep_until(at).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                if context.fallback_deadline(true).is_some() {
+                    let replace = {
+                        let evidence = context.shared.evidence.lock();
+                        !evidence.transport_connected || evidence.fallback_recovery.replace_transport
+                    };
+
+                    if replace && let Err(e) = replace_listen_key(&context, &cancel).await {
+                        context.shared.recovery_failed("listen-key replacement", &e, true);
+                    } else {
+                        recover_account(&context, &mut rx, &cancel).await;
+                    }
+                    context.schedule_retry();
+                }
+                continue;
+            }
+            () = context.shared.request_baseline.notified(), if !awaiting_baseline => Ok(InboundAction::Recover),
+            inbound = rx.recv(), if !awaiting_baseline => {
                 let Some(inbound) = inbound else { break };
                 process_inbound(&context.shared, &context.symbols, inbound)
             }
@@ -1047,9 +1221,22 @@ async fn run_driver(
                 }
                 continue;
             }
+            Ok(InboundAction::ReplaceListenKey)
+                if context.shared.restricted.load(Ordering::Acquire) =>
+            {
+                context
+                    .shared
+                    .evidence
+                    .lock()
+                    .fallback_recovery
+                    .replace_transport = true;
+                continue;
+            }
             Ok(InboundAction::ReplaceListenKey) => {
                 if let Err(e) = replace_listen_key(&context, &cancel).await {
-                    context.shared.restrict(e.to_string());
+                    context
+                        .shared
+                        .recovery_failed("listen-key replacement", &e, true);
                     continue;
                 }
             }
@@ -1128,38 +1315,52 @@ async fn run_driver(
 
         if replace_owner {
             if let Err(e) = replace_listen_key(&context, &cancel).await {
-                context.shared.restrict(e.to_string());
+                context
+                    .shared
+                    .recovery_failed("listen-key replacement", &e, true);
             }
             continue;
         }
 
-        let owner = context.shared.current_owner.load(Ordering::Acquire);
-        let result = recover(&context, &mut rx, &cancel, false, owner).await;
+        recover_account(&context, &mut rx, &cancel).await;
+    }
+}
 
-        match result {
-            Ok(RecoveryOutcome::Synchronized) => {}
-            Ok(RecoveryOutcome::Superseded) => {
-                if context.shared.evidence.lock().transport_connected
-                    && context
-                        .tx
-                        .try_send(Inbound::Transport {
-                            owner: context.shared.current_owner.load(Ordering::Acquire),
-                            state: SocketState::Connected,
-                        })
-                        .is_err()
-                {
-                    context
-                        .shared
-                        .restrict("PAPI recovery trigger queue overflow".to_string());
-                }
+async fn recover_account(
+    context: &DriverContext,
+    rx: &mut tokio::sync::mpsc::Receiver<Inbound>,
+    cancel: &CancellationToken,
+) {
+    let owner = context.shared.current_owner.load(Ordering::Acquire);
+    let result = recover(context, rx, cancel, false, owner).await;
+
+    match result {
+        Ok(RecoveryOutcome::Synchronized) => {}
+        Ok(RecoveryOutcome::Superseded) => {
+            if context.shared.evidence.lock().transport_connected
+                && context
+                    .tx
+                    .try_send(Inbound::Transport {
+                        owner: context.shared.current_owner.load(Ordering::Acquire),
+                        state: SocketState::Connected,
+                    })
+                    .is_err()
+            {
+                context
+                    .shared
+                    .restrict("PAPI recovery trigger queue overflow".to_string());
             }
-            Ok(RecoveryOutcome::ReplaceListenKey) => {
-                if let Err(e) = replace_listen_key(&context, &cancel).await {
-                    context.shared.restrict(e.to_string());
-                }
-            }
-            Err(e) => context.shared.restrict(e.to_string()),
         }
+        Ok(RecoveryOutcome::ReplaceListenKey) => {
+            if let Err(e) = replace_listen_key(context, cancel).await {
+                context
+                    .shared
+                    .recovery_failed("listen-key replacement", &e, true);
+            }
+        }
+        Err(e) => context
+            .shared
+            .recovery_failed("account reconciliation", &e, false),
     }
 }
 
@@ -1188,7 +1389,7 @@ async fn run_keepalive(context: DriverContext, cancel: CancellationToken) {
             } else {
                 context
                     .shared
-                    .restrict("PAPI listen-key keepalive failed".to_string());
+                    .recovery_failed("listen-key keepalive", &e, true);
             }
         }
     }
@@ -1212,9 +1413,11 @@ async fn run_rotation(context: DriverContext, cancel: CancellationToken) {
             .is_some_and(WebSocketClient::request_reconnect);
 
         if !accepted {
-            context
-                .shared
-                .restrict("PAPI planned transport rotation was not accepted".to_string());
+            context.shared.record_restriction(
+                "PAPI planned transport rotation was not accepted".to_string(),
+                true,
+                true,
+            );
         }
     }
 }
@@ -1273,7 +1476,11 @@ async fn replace_listen_key(
         generation: new_owner,
         _key: listen_key,
     });
-    context.shared.evidence.lock().listen_key_generation = new_owner;
+    {
+        let mut evidence = context.shared.evidence.lock();
+        evidence.listen_key_generation = new_owner;
+        evidence.fallback_recovery.replace_transport = false;
+    }
 
     if let Some(old_websocket) = old_websocket {
         old_websocket.disconnect().await;
@@ -1386,7 +1593,13 @@ async fn recover(
     let transport_revision = shared.transport_revision.load(Ordering::Acquire);
     let recovery_started = Instant::now();
     let window_end = reader.now();
-    let lookback_ns = u64::try_from(config.recovery_lookback.as_nanos())?;
+    let outage = shared
+        .evidence
+        .lock()
+        .fallback_recovery
+        .unavailable_since
+        .map_or(Duration::ZERO, |since| since.elapsed());
+    let lookback_ns = u64::try_from(config.recovery_lookback.max(outage).as_nanos())?;
     let window_start = window_end
         .as_u64()
         .checked_sub(lookback_ns)
@@ -1399,18 +1612,20 @@ async fn recover(
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("PAPI recovery generation overflow"))?;
         evidence.window_start = Some(window_start);
-        evidence.window_end = Some(window_end);
+
         evidence.recovery_generation
     };
     let mut stable_result = None;
 
     for round in 0..MAX_RECOVERY_ROUNDS {
         shared.facts.lock().clear_dirty_sources();
+        let window_end = reader.now();
+        shared.evidence.lock().window_end = Some(window_end);
         reader.refresh_account_observations().await?;
         let projection =
             reader.account_projection(config.operation_timeout, config.operation_timeout)?;
         let snapshot = reader
-            .generate_mass_status(window_start, window_end)
+            .collect_mass_status(window_start, window_end, true)
             .await?;
 
         while let Ok(inbound) = rx.try_recv() {
@@ -1437,12 +1652,19 @@ async fn recover(
         }
 
         if round + 1 == MAX_RECOVERY_ROUNDS {
-            anyhow::bail!("PAPI recovery did not converge within the recheck bound")
+            return Err(TransientRecoveryFailure(
+                "PAPI recovery did not converge within the recheck bound",
+            )
+            .into());
         }
     }
 
     let (projection, mut snapshot) =
         stable_result.ok_or_else(|| anyhow::anyhow!("PAPI recovery produced no stable result"))?;
+
+    if shared.evidence.lock().fallback_recovery.attempts > 0 {
+        validate_gap_fills(context, &snapshot)?;
+    }
     validate_projection(&projection)?;
     anyhow::ensure!(
         snapshot.issues.as_slice() == [KNOWN_HISTORY_LIMITATION],
@@ -1541,6 +1763,7 @@ async fn recover(
         anyhow::bail!("Stale PAPI recovery result")
     }
 
+    evidence.restriction_cause = None;
     evidence.state = BinancePapiSessionState::Synchronized;
     evidence.synchronized = true;
     evidence.trading_authorized = false;
@@ -1568,6 +1791,38 @@ enum RecoveryOutcome {
     Synchronized,
     Superseded,
     ReplaceListenKey,
+}
+
+fn validate_gap_fills(
+    context: &DriverContext,
+    snapshot: &BinancePapiReadOnlySnapshot,
+) -> anyhow::Result<()> {
+    let reports = snapshot.mass_status.fill_reports();
+    let fills: BTreeMap<_, _> = reports
+        .values()
+        .flatten()
+        .map(|fill| ((fill.instrument_id, fill.trade_id.to_string()), fill))
+        .collect();
+    let facts = context.shared.facts.lock();
+    let applied = context.shared.evidence.lock().applied_fact_version;
+    for (symbol, observed) in facts.fills_after(applied) {
+        let instrument = context
+            .instruments
+            .get(symbol)
+            .ok_or_else(|| anyhow::anyhow!("PAPI gap fill is outside the recovery scope"))?;
+        let key = (instrument.id(), observed.trade_id.to_string());
+        let report = fills.get(&key).ok_or(TransientRecoveryFailure(
+            "PAPI trade history is missing a private-stream fill",
+        ))?;
+        anyhow::ensure!(
+            report.last_qty.as_decimal() == observed.quantity
+                && report.last_px.as_decimal() == observed.price
+                && report.commission.as_decimal() == observed.commission
+                && report.commission.currency.code.as_str() == observed.commission_asset,
+            "PAPI trade history conflicts with a private-stream fill"
+        );
+    }
+    Ok(())
 }
 
 fn validate_projection(projection: &BinancePapiAccountProjection) -> anyhow::Result<()> {
@@ -1890,6 +2145,7 @@ mod tests {
         config.listen_key_keepalive_interval = Duration::from_secs(10);
         config.transport_rotation_interval = Duration::from_secs(10);
         config.refresh_debounce = Duration::from_millis(10);
+        config.account_recovery_timeout = Duration::from_millis(50);
         let callback_count = Arc::new(AtomicUsize::new(0));
         let callback_observed = Arc::clone(&callback_count);
         let delivered_checkpoint = Arc::new(Mutex::new(None));
@@ -1943,6 +2199,11 @@ mod tests {
             session.evidence().state,
             BinancePapiSessionState::Restricted
         );
+
+        let fallback = session.evidence().fallback_recovery;
+        assert!(fallback.manual_intervention_required);
+        assert!(fallback.next_attempt_ns.is_none());
+        assert_eq!(fallback.attempts, 0);
 
         session.stop().await.unwrap();
         assert_eq!(session.evidence().state, BinancePapiSessionState::Stopped);
@@ -2156,6 +2417,84 @@ mod tests {
             1
         );
         websocket_task.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_listen_key_replacement_recovers_on_a_quiet_stream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let (expire_tx, expire_rx) = tokio::sync::oneshot::channel();
+
+        let websocket = tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            let mut first = accept_async(first).await.unwrap();
+            expire_rx.await.unwrap();
+            first
+                .send(WsMessage::Text(
+                    json!({"e":"listenKeyExpired", "E":1_700_000_000_000_i64})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let (second, _) = listener.accept().await.unwrap();
+            let mut second = accept_async(second).await.unwrap();
+            while second.next().await.is_some_and(|event| event.is_ok()) {}
+        });
+        let creates = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::clone(&creates);
+        let server = MockServer::new(move |request| {
+            if request.path == "/papi/v1/listenKey"
+                && request.method == "POST"
+                && requests.fetch_add(1, Ordering::AcqRel) == 1
+            {
+                Reply::raw(400, r#"{"code":-2013}"#)
+            } else if request.path == "/papi/v1/balance" {
+                Reply::json(&testing::supported_balances())
+            } else {
+                testing::quiet(request)
+            }
+        })
+        .await;
+        let mut config = testing::config(&server.url);
+        config.websocket_url = url.into();
+        config.account_recovery_timeout = Duration::from_millis(200);
+        let checkpoint = Arc::new(Mutex::new(None));
+        let delivered = Arc::clone(&checkpoint);
+        let mut session = test_session(
+            &config,
+            Arc::new(move |bundle| {
+                *delivered.lock() = Some(bundle.checkpoint);
+                Ok(())
+            }),
+            Arc::new(|_| Ok(())),
+            None,
+        );
+        session.start().await.unwrap();
+        session
+            .acknowledge_application(checkpoint.lock().unwrap())
+            .unwrap();
+        expire_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let evidence = session.evidence();
+                if evidence.fallback_recovery.attempts == 1 && evidence.synchronized {
+                    assert!(evidence.pending_application_fact_version.is_some());
+                    assert_eq!(evidence.session_generation, 1);
+                    assert!(evidence.listen_key_generation > 1);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        session
+            .acknowledge_application(checkpoint.lock().unwrap())
+            .unwrap();
+        assert_eq!(creates.load(Ordering::Acquire), 3);
+        session.stop().await.unwrap();
+        websocket.abort();
     }
 
     #[rstest]

@@ -301,6 +301,8 @@ impl BinancePapiReadOnlyClient {
             completed: false,
         };
         let mut failures = Vec::new();
+        let mut transient = None;
+        let mut all_transient = true;
 
         for (index, source) in observation_sources().into_iter().enumerate() {
             let response = self
@@ -348,6 +350,13 @@ impl BinancePapiReadOnlyClient {
             };
 
             if let Err(e) = result {
+                if let Some(error) = e.downcast_ref::<PapiHttpError>()
+                    && error.recoverable_account_read()
+                {
+                    transient = Some(error.clone());
+                } else {
+                    all_transient = false;
+                }
                 failures.push(format!("{}: {e}", source.endpoint()));
             }
         }
@@ -368,6 +377,13 @@ impl BinancePapiReadOnlyClient {
         }
 
         refresh.completed = true;
+
+        if all_transient && let Some(error) = transient {
+            return Err(anyhow::Error::new(error).context(format!(
+                "PAPI observation refresh failed: {}",
+                failures.join("; ")
+            )));
+        }
         anyhow::ensure!(
             failures.is_empty(),
             "PAPI observation refresh failed: {}",
@@ -695,12 +711,21 @@ impl BinancePapiReadOnlyClient {
         start: UnixNanos,
         end: UnixNanos,
     ) -> anyhow::Result<BinancePapiReadOnlySnapshot> {
+        self.collect_mass_status(start, end, false).await
+    }
+
+    pub(crate) async fn collect_mass_status(
+        &self,
+        start: UnixNanos,
+        end: UnixNanos,
+        require_history: bool,
+    ) -> anyhow::Result<BinancePapiReadOnlySnapshot> {
         let window = HistoryWindow::new(start, end)?;
         anyhow::ensure!(
             end <= self.inner.clock.get_time_ns(),
             "PAPI history end is in the future"
         );
-        self.collector()?.mass_status(window).await
+        self.collector()?.mass_status(window, require_history).await
     }
 
     pub(crate) async fn scoped_fill_reports(
@@ -721,7 +746,7 @@ impl BinancePapiReadOnlyClient {
         }
         let instrument = collector.scope.instrument(symbol)?.clone();
         collector.scope = Cow::Owned(InstrumentScope::new(vec![instrument])?);
-        let snapshot = collector.mass_status(window).await?;
+        let snapshot = collector.mass_status(window, false).await?;
         anyhow::ensure!(
             snapshot.issues.as_slice() == [KNOWN_HISTORY_LIMITATION],
             "PAPI fill query has unresolved source failures: {:?}",

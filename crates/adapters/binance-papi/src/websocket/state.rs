@@ -37,7 +37,7 @@ pub(super) struct FactState {
     max_facts: usize,
     orders: BTreeMap<(String, i64), OrderFact>,
     algos: BTreeMap<(String, i64), AlgoFact>,
-    trades: BTreeMap<(String, i64, i64), super::messages::FillFact>,
+    trades: BTreeMap<(String, i64, i64), (u64, super::messages::FillFact)>,
     dirty: BTreeSet<DirtySourceKey>,
     pub fact_version: u64,
     pub duplicate_count: u64,
@@ -81,6 +81,17 @@ impl FactState {
         }
     }
 
+    pub(super) fn fills_after(
+        &self,
+        applied: u64,
+    ) -> impl Iterator<Item = (&str, &super::messages::FillFact)> {
+        self.trades
+            .iter()
+            .filter_map(move |((symbol, _, _), (version, fill))| {
+                (*version > applied).then_some((symbol.as_str(), fill))
+            })
+    }
+
     pub(super) fn has_dirty_sources(&self) -> bool {
         !self.dirty.is_empty()
     }
@@ -107,7 +118,7 @@ impl FactState {
             .map(|fill| ((order.symbol.clone(), order.order_id, fill.trade_id), fill));
         let insert_trade = match trade.as_ref() {
             Some((trade_key, fill)) => match self.trades.get(trade_key) {
-                Some(existing) if existing == *fill => false,
+                Some((_, existing)) if existing == *fill => false,
                 Some(_) => {
                     self.conflict_count = self.conflict_count.saturating_add(1);
                     return Err("Conflicting PAPI fill identity".to_string());
@@ -144,7 +155,10 @@ impl FactState {
         }
 
         let inserted_fill = if insert_trade && let Some((trade_key, fill)) = trade {
-            self.trades.insert(trade_key, fill.clone());
+            self.trades.insert(
+                trade_key,
+                (self.fact_version.saturating_add(1), fill.clone()),
+            );
             Some(fill.clone())
         } else {
             None

@@ -28,7 +28,7 @@ with a `manylinux_2_34` baseline. No source distribution is planned. Other platf
 versions are not supported release targets; local developer builds do not change that scope.
 
 Once the exact release is available on PyPI, install it in a fresh environment with
-`uv pip install --only-binary :all: cairn-papi==2.0.0rc19`. Do not interpret a version in this
+`uv pip install --only-binary :all: cairn-papi==2.0.0rc20`. Do not interpret a version in this
 source document as proof of publication.
 
 Alternatively, install a locally built and verified wheel into a fresh
@@ -36,7 +36,7 @@ environment. From the directory containing that wheel:
 
 ```bash
 uv venv --python 3.14 cairn-env
-uv pip install --python cairn-env/bin/python --only-binary :all: ./cairn_papi-2.0.0rc19-cp314-cp314-manylinux_2_34_x86_64.whl
+uv pip install --python cairn-env/bin/python --only-binary :all: ./cairn_papi-2.0.0rc20-cp314-cp314-manylinux_2_34_x86_64.whl
 uv pip check --python cairn-env/bin/python
 cairn-env/bin/python -c "import nautilus_trader; print(nautilus_trader.__version__)"
 ```

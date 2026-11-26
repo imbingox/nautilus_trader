@@ -142,6 +142,7 @@ impl ReportCollector<'_> {
     pub(crate) async fn mass_status(
         mut self,
         window: HistoryWindow,
+        require_history: bool,
     ) -> anyhow::Result<BinancePapiReadOnlySnapshot> {
         anyhow::ensure!(
             !self.scope.instruments.is_empty() && self.scope.instruments.len() <= 256,
@@ -169,6 +170,7 @@ impl ReportCollector<'_> {
                         insert_consistent(&mut book.orders, row.order_id, row)?;
                     }
                 }
+                Err(e) if require_history => return Err(e),
                 Err(e) => record_history_failure(&mut issues, symbol, HistoryEndpoint::Orders, e)?,
             }
 
@@ -181,6 +183,7 @@ impl ReportCollector<'_> {
                         insert_algo(&mut book.algos, row)?;
                     }
                 }
+                Err(e) if require_history => return Err(e),
                 Err(e) => record_history_failure(&mut issues, symbol, HistoryEndpoint::Algos, e)?,
             }
 
@@ -196,6 +199,7 @@ impl ReportCollector<'_> {
                         }
                     }
                 }
+                Err(e) if require_history => return Err(e),
                 Err(e) => record_history_failure(&mut issues, symbol, HistoryEndpoint::Trades, e)?,
             }
         }
@@ -601,7 +605,14 @@ impl ReportCollector<'_> {
     }
 
     pub(crate) async fn raw(&mut self, request: &PapiRequest) -> anyhow::Result<RawResponse> {
-        let response = self.http.get(request, &self.budget, self.cancel).await?;
+        let response = self
+            .http
+            .get(request, &self.budget, self.cancel)
+            .await
+            .map_err(|e| {
+                let detail = format!("{}: {e}", request.endpoint());
+                anyhow::Error::new(e).context(detail)
+            })?;
         self.responses.push(response.metadata.clone());
         Ok(response)
     }

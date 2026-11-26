@@ -52,11 +52,22 @@ fn test_python_read_only_constructors_registry_and_secret_boundaries() {
         read_only_kwargs
             .set_item("proxy_url", "http://proxy-user:proxy-secret@localhost:7897")
             .unwrap();
+        read_only_kwargs
+            .set_item("account_recovery_timeout_ms", 45_000)
+            .unwrap();
         let read_only = module
             .getattr("BinancePapiReadOnlyConfig")
             .unwrap()
             .call((), Some(&read_only_kwargs))
             .unwrap();
+        assert_eq!(
+            read_only
+                .getattr("account_recovery_timeout_ms")
+                .unwrap()
+                .extract::<u64>()
+                .unwrap(),
+            45_000
+        );
         let instruments = PyList::empty(py);
         instruments
             .append(instrument_any_to_pyobject(py, testing::instrument("BTCUSDT")).unwrap())

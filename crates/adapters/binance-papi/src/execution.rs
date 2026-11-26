@@ -633,6 +633,7 @@ impl BinancePapiExecutionClient {
                 "recovery_generation": evidence.as_ref().map_or(0, |value| value.recovery_generation),
                 "transport_revision": transport_revision,
                 "issues": evidence.as_ref().map(|value| &value.issues),
+                "fallback_recovery": evidence.as_ref().map(|value| &value.fallback_recovery),
                 "restriction_cause": evidence.as_ref().and_then(|value| value.restriction_cause.as_ref()),
                 "risk_application_failure": evidence.as_ref().and_then(|value| value.risk_application_failure.as_ref()),
                 "received_fact_version": evidence.as_ref().map_or(0, |value| value.received_fact_version),
@@ -2290,6 +2291,7 @@ mod tests {
             BinancePapiTradingConfig,
         },
         factories::BinancePapiExecutionClientFactory,
+        read_only::BinancePapiReadOnlyConfig,
         testing::{self, MockServer, Reply, TRADE_TIME, ms},
         trading::coordinator::{
             PapiAccountStatusEvidence, PapiMarginRuleEvidence, PapiPositionModeEvidence,
@@ -2941,21 +2943,28 @@ mod tests {
         journal_path: std::path::PathBuf,
         max_risk_age_ms: u64,
     ) -> (ExecutionHarness, BinancePapiExecutionClient) {
-        let harness = ExecutionHarness::new(
-            TraderId::from("TRADER-001"),
-            ClientId::from("PAPI-RECOVERY"),
-            AccountId::from("BINANCE-PAPI-001"),
-            testing::instrument("BTCUSDT"),
-        );
         let mut read_only = testing::config(&server.url);
         read_only.websocket_url = SecretString::from(websocket_url);
         read_only.request_timeout = Duration::from_secs(3);
         let mut trading = trading_config(journal_path);
         trading.max_risk_age_ms = max_risk_age_ms;
         trading.max_risk_collection_span_ms = 10_000;
+        connected_account_client(read_only, Some(trading)).await
+    }
+
+    async fn connected_account_client(
+        read_only: BinancePapiReadOnlyConfig,
+        trading: Option<BinancePapiTradingConfig>,
+    ) -> (ExecutionHarness, BinancePapiExecutionClient) {
+        let harness = ExecutionHarness::new(
+            TraderId::from("TRADER-001"),
+            ClientId::from("PAPI-RECOVERY"),
+            AccountId::from("BINANCE-PAPI-001"),
+            testing::instrument("BTCUSDT"),
+        );
         let config = BinancePapiExecutionClientConfig {
             read_only: Some(read_only),
-            trading: Some(trading),
+            trading,
             instrument_ids: vec![harness.instrument_id()],
             ..Default::default()
         };
@@ -2973,6 +2982,209 @@ mod tests {
         client.start().unwrap();
         client.connect().await.unwrap();
         (harness, client)
+    }
+
+    #[tokio::test]
+    async fn unavailable_account_recovers_external_fills_on_the_same_worker() {
+        let (url, updates, websocket) = account_update_websocket().await;
+        let now_ms = get_atomic_clock_realtime().get_time_ns().as_u64() / 1_000_000;
+        let mut fill: serde_json::Value = serde_json::from_str(&external_fill_event()).unwrap();
+        fill["E"] = json!(now_ms);
+        fill["T"] = json!(now_ms);
+        fill["o"]["T"] = json!(now_ms);
+        let mut second = fill.clone();
+        second["o"]["t"] = json!(8);
+        second["o"]["z"] = json!("0.002");
+        let phase = Arc::new(AtomicUsize::new(0));
+        let venue = Arc::clone(&phase);
+        let stream = updates.clone();
+        let server = MockServer::new(move |request| {
+            let phase = venue.load(Ordering::Acquire);
+            if phase == 1 && request.path == "/papi/v1/um/positionSide/dual" {
+                return Reply::raw(400, r#"{"code":-2013,"msg":"Order does not exist"}"#);
+            }
+
+            if phase >= 2 {
+                let qty = if phase == 2 { "0.001" } else { "0.002" };
+                let mut order = testing::order();
+                order["orderId"] = json!(42);
+                order["clientOrderId"] = json!("client-1");
+                order["side"] = json!("BUY");
+                order["status"] = json!("PARTIALLY_FILLED");
+                order["executedQty"] = json!(qty);
+                order["price"] = json!("42000.10");
+                order["avgPrice"] = json!("42000.10");
+                order["time"] = json!(now_ms);
+                order["updateTime"] = json!(now_ms);
+
+                match request.path.as_str() {
+                    "/papi/v1/um/positionRisk" => {
+                        let mut position = testing::position("BTCUSDT");
+                        position["positionAmt"] = json!(qty);
+                        position["entryPrice"] = json!("42000.10");
+                        return Reply::json(&json!([position]));
+                    }
+                    "/papi/v1/um/openOrders" | "/papi/v1/um/allOrders" => {
+                        return Reply::json(&json!([order]));
+                    }
+                    "/papi/v1/um/userTrades" => {
+                        let mut trade = testing::trade();
+                        trade["time"] = json!(now_ms);
+                        trade["id"] = json!(7);
+                        trade["orderId"] = json!(42);
+                        trade["side"] = json!("BUY");
+                        trade["buyer"] = json!(true);
+                        trade["price"] = json!("42000.10");
+                        trade["qty"] = json!("0.001");
+                        trade["commissionAsset"] = json!("BNB");
+                        trade["commission"] = json!("-0.00000123");
+
+                        if phase == 2 {
+                            venue.store(3, Ordering::Release);
+                            stream.send(second.to_string()).unwrap();
+                            let mut reply = Reply::json(&json!([trade]));
+                            reply.delay = Duration::from_millis(50);
+                            return reply;
+                        }
+                        let mut next_trade = trade.clone();
+                        next_trade["id"] = json!(8);
+                        return Reply::json(&json!([trade, next_trade]));
+                    }
+                    _ => {}
+                }
+            }
+            current_trading_reply(request)
+        })
+        .await;
+        let mut config = testing::config(&server.url);
+        config.websocket_url = SecretString::from(url);
+        config.account_recovery_timeout = Duration::from_millis(350);
+        config.refresh_debounce = Duration::from_millis(10);
+        let (mut harness, client) = connected_account_client(config, None).await;
+        let reader = client.recovery_reader();
+        harness.register_client(Box::new(client)).unwrap();
+        assert!(
+            harness
+                .pump_until(Duration::from_secs(30), |_| {
+                    reader.snapshot()["account_state_current"] == true
+                })
+                .await,
+            "{}",
+            reader.snapshot()
+        );
+
+        phase.store(1, Ordering::Release);
+        updates.send(funding_event()).unwrap();
+        assert!(
+            harness
+                .pump_until(Duration::from_secs(30), |_| {
+                    let snapshot = reader.snapshot();
+                    snapshot["reason"] == "session_restricted"
+                        && snapshot["fallback_recovery"]["next_attempt_ns"].is_number()
+                })
+                .await,
+            "{}",
+            reader.snapshot()
+        );
+        let failed = reader.snapshot();
+        assert_eq!(failed["account_state_current"], false);
+        assert!(
+            failed["restriction_cause"]
+                .as_str()
+                .unwrap()
+                .contains("/papi/v1/um/positionSide/dual")
+        );
+        updates.send(fill.to_string()).unwrap();
+        assert!(
+            harness
+                .pump_until(Duration::from_secs(30), |_| {
+                    let snapshot = reader.snapshot();
+                    snapshot["account_state_current"] == false
+                        && snapshot["fallback_recovery"]["attempts"] == 2
+                        && snapshot["fallback_recovery"]["next_attempt_ns"].is_number()
+                })
+                .await,
+            "{}",
+            reader.snapshot()
+        );
+        let retry = reader.snapshot();
+        let fallback = &retry["fallback_recovery"];
+        assert!(
+            fallback["next_attempt_ns"].as_u64().unwrap()
+                - fallback["last_attempt_ns"].as_u64().unwrap()
+                >= 2_000_000_000
+        );
+
+        phase.store(2, Ordering::Release);
+        // Pause the runner until the worker has delivered the reconciled account and both fills
+        tokio::time::timeout(Duration::from_secs(45), async {
+            loop {
+                let snapshot = reader.snapshot();
+                if phase.load(Ordering::Acquire) == 3 && snapshot["current_scope_complete"] == true
+                {
+                    assert_eq!(snapshot["account_state_current"], false);
+                    assert!(snapshot["pending_application_fact_version"].is_number());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("Recovery did not deliver: {}", reader.snapshot()));
+        let position = |cache: &Cache| -> Decimal {
+            cache
+                .positions_open(
+                    None,
+                    Some(&InstrumentId::from("BTCUSDT-PERP.BINANCE")),
+                    None,
+                    Some(&AccountId::from("BINANCE-PAPI-001")),
+                    None,
+                )
+                .iter()
+                .map(|position| position.signed_decimal_qty())
+                .sum()
+        };
+        assert!(
+            harness
+                .pump_until(Duration::from_secs(30), |cache| {
+                    reader.snapshot()["account_state_current"] == true
+                        && position(cache) == dec!(0.002)
+                })
+                .await,
+            "{}",
+            reader.snapshot()
+        );
+        let recovered = reader.snapshot();
+        assert_eq!(
+            recovered["session_generation"],
+            failed["session_generation"]
+        );
+        assert_eq!(recovered["permissions"]["increase_risk"], false);
+        let id = ClientOrderId::from("client-1");
+        {
+            let cache = harness.cache().borrow();
+            let order = cache.order(&id).unwrap();
+            assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+            assert_eq!(order.trade_ids().len(), 2);
+        }
+
+        updates.send(fill.to_string()).unwrap();
+        fill["o"]["t"] = json!(9);
+        fill["o"]["z"] = json!("0.003");
+        updates.send(fill.to_string()).unwrap();
+        assert!(
+            harness
+                .pump_until(Duration::from_secs(30), |cache| {
+                    reader.snapshot()["account_state_current"] == true
+                        && position(cache) == dec!(0.003)
+                        && cache.order(&id).unwrap().trade_ids().len() == 3
+                })
+                .await,
+            "{}",
+            reader.snapshot()
+        );
+        harness.exec_engine().borrow_mut().stop_clients();
+        websocket.abort();
     }
 
     #[rstest]
